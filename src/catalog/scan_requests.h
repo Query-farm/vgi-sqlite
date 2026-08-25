@@ -51,12 +51,20 @@ BindResponseResult ParseBindResponse(const std::shared_ptr<arrow::RecordBatch>& 
 // left at its default serializes as an explicit null, not an absence - a
 // worker that validates its parameter contract by Schema.Equal rejects a
 // batch with a missing column outright.
+// row_limit: plain fetch-limit hint (InitRequest.row_limit) - a worker may
+// stop producing rows after this many, or may ignore it entirely. Only
+// safe to pass from a caller that has independently confirmed early
+// termination can't drop rows the query still needs (see vgi_vtab.cpp's
+// xBestIndex comment on why that means "no other pushed WHERE constraint
+// and no ORDER BY requested of this scan" for this driver specifically -
+// this function itself has no way to enforce that, it just carries the
+// value through).
 std::shared_ptr<arrow::RecordBatch> BuildInitRequest(
     const std::vector<uint8_t>& bind_call_bytes, const std::vector<uint8_t>& output_schema_bytes,
     const std::optional<std::vector<uint8_t>>& bind_opaque_data = std::nullopt,
     const std::vector<int64_t>& projection_ids = {},
     const std::optional<std::string>& pushdown_filters = std::nullopt,
-    const std::vector<std::string>& join_keys = {});
+    const std::vector<std::string>& join_keys = {}, std::optional<int64_t> row_limit = std::nullopt);
 
 // The header batch init's producer stream returns before any data batch.
 struct GlobalInitResponseResult {

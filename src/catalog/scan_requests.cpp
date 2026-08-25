@@ -157,7 +157,8 @@ BindResponseResult ParseBindResponse(const std::shared_ptr<arrow::RecordBatch>& 
 std::shared_ptr<arrow::RecordBatch> BuildInitRequest(
     const std::vector<uint8_t>& bind_call_bytes, const std::vector<uint8_t>& output_schema_bytes,
     const std::optional<std::vector<uint8_t>>& bind_opaque_data, const std::vector<int64_t>& projection_ids,
-    const std::optional<std::string>& pushdown_filters, const std::vector<std::string>& join_keys) {
+    const std::optional<std::string>& pushdown_filters, const std::vector<std::string>& join_keys,
+    std::optional<int64_t> row_limit) {
     static const std::vector<std::string> phase_values = {"INPUT", "FINALIZE", "TABLE_BUFFERING",
                                                             "TABLE_BUFFERING_FINALIZE"};
     static const std::vector<std::string> direction_values = {"ASC", "DESC"};
@@ -242,7 +243,11 @@ std::shared_ptr<arrow::RecordBatch> BuildInitRequest(
     }
     {
         arrow::Int64Builder b;
-        check_ok(b.AppendNull(), "append null row_limit");
+        if (row_limit) {
+            check_ok(b.Append(*row_limit), "append row_limit");
+        } else {
+            check_ok(b.AppendNull(), "append null row_limit");
+        }
         arrays.push_back(finish(b, "row_limit"));
     }
     arrays.push_back(null_dictionary(phase_type, phase_values));           // phase

@@ -102,13 +102,15 @@ struct VgiCursor {
 
 // idxStr is xBestIndex's only channel to xFilter (SQLite frees it via
 // sqlite3_free per needToFreeIdxStr - built with sqlite3_mprintf for
-// exactly that reason), so it carries both pushdown decisions: the
-// projected column list, and the pushed-down WHERE constraints (in
-// argvIndex order, so position i here lines up with xFilter's argv[i]) -
-// format "P<cols>|C<col>:<op>,...", either half empty when there's
-// nothing to push for it.
+// exactly that reason), so it carries every pushdown decision: the
+// projected column list, the pushed-down WHERE constraints (in argvIndex
+// order, so position i here lines up with xFilter's argv[i]), and -
+// separately - whether a LIMIT constraint was also claimed and at which
+// argvIndex - format "P<cols>|C<col>:<op>,...|L<argvIndex>", the last
+// section empty when LIMIT wasn't pushed (see xBestIndex's comment on
+// when that's safe).
 std::string EncodeIdxStr(const std::vector<int>& projected_columns,
-                          const std::vector<PushableConstraint>& constraints) {
+                          const std::vector<PushableConstraint>& constraints, int limit_argv_index) {
     std::string out = "P";
     for (size_t i = 0; i < projected_columns.size(); ++i) {
         if (i) out += ',';
@@ -119,21 +121,28 @@ std::string EncodeIdxStr(const std::vector<int>& projected_columns,
         if (i) out += ',';
         out += std::to_string(constraints[i].column_index) + ':' + std::to_string(constraints[i].op);
     }
+    out += "|L";
+    if (limit_argv_index > 0) out += std::to_string(limit_argv_index);
     return out;
 }
 
 struct DecodedIdxStr {
     std::vector<int> projected_columns;
     std::vector<PushableConstraint> constraints;
+    int limit_argv_index = 0;  // 0 = LIMIT not pushed; else 1-based argv[] position
 };
 
 DecodedIdxStr DecodeIdxStr(const char* idxStr) {
     DecodedIdxStr decoded;
     if (!idxStr) return decoded;
     std::string s(idxStr);
-    auto bar = s.find('|');
-    std::string proj = (bar == std::string::npos) ? "" : s.substr(1, bar - 1);
-    std::string cons = (bar == std::string::npos) ? "" : s.substr(bar + 2);  // skip "|C"
+    auto bar1 = s.find('|');
+    auto bar2 = (bar1 == std::string::npos) ? std::string::npos : s.find('|', bar1 + 1);
+    std::string proj = (bar1 == std::string::npos) ? "" : s.substr(1, bar1 - 1);
+    std::string cons = (bar1 == std::string::npos) ? ""
+                        : (bar2 == std::string::npos) ? s.substr(bar1 + 2)  // skip "|C"
+                                                       : s.substr(bar1 + 2, bar2 - bar1 - 2);
+    std::string lim = (bar2 == std::string::npos) ? "" : s.substr(bar2 + 2);  // skip "|L"
 
     if (!proj.empty()) {
         std::istringstream iss(proj);
@@ -151,6 +160,7 @@ DecodedIdxStr DecodeIdxStr(const char* idxStr) {
                  static_cast<unsigned char>(std::stoi(token.substr(colon + 1)))});
         }
     }
+    if (!lim.empty()) decoded.limit_argv_index = std::stoi(lim);
     return decoded;
 }
 
@@ -243,9 +253,12 @@ int xDisconnect(sqlite3_vtab* vtab) {
 int xDestroy(sqlite3_vtab* vtab) { return xDisconnect(vtab); }
 
 int xBestIndex(sqlite3_vtab* base_vtab, sqlite3_index_info* info) {
-    // No ORDER BY/LIMIT pushdown yet - SQLite still sorts/limits itself,
-    // always correct just not as cheap as it could be (later Milestone-3
-    // follow-up).
+    // No ORDER BY pushdown yet - SQLite still sorts itself, always correct
+    // just not as cheap as it could be (later Milestone-3 follow-up: VGI's
+    // InitRequest.order_by_* hints are Top-N-shaped - column/direction/
+    // null-order plus their own row limit - genuinely distinct work from
+    // the plain row_limit pushdown just below, not a natural extension of
+    // it).
     //
     // Cost/row estimate: prefer the worker's own cardinality_estimate (or,
     // failing that, cardinality_max as a conservative upper bound) over a
@@ -301,7 +314,37 @@ int xBestIndex(sqlite3_vtab* base_vtab, sqlite3_index_info* info) {
     // each pushable constraint but never sets .omit, so SQLite always
     // re-checks correctness itself regardless of whether the worker
     // actually applies the filter.
-    auto encoded = EncodeIdxStr(projected, constraints);
+    //
+    // LIMIT pushdown (InitRequest.row_limit, a plain "stop after this many
+    // rows" hint - order_by_limit is the separate Top-N-hint field, not
+    // this): only claimed when `constraints` is empty AND info->nOrderBy
+    // is 0, i.e. this scan has no other pushed-down WHERE constraint and
+    // no requested sort order. Necessary because this driver never sets
+    // .omit on a WHERE constraint (see filter_pushdown.h's file comment) -
+    // SQLite always re-verifies every row itself afterward, and if a
+    // worker's early stop-after-N had already discarded rows that would
+    // have failed that re-check but left true matches unseen further into
+    // the table, the query could silently return fewer rows than the real
+    // LIMIT. With zero unpushed-and-unverified WHERE work left for this
+    // scan and no ordering requirement, "the worker's first N rows" and
+    // "the query's first N rows" coincide, so it's safe. Like the WHERE
+    // constraints above, .omit is still never set - SQLite applies its own
+    // LIMIT to whatever this scan actually returns either way, so an
+    // over-cautious worker that ignores the hint (or a worker that returns
+    // more than N anyway) can't produce wrong results, only a missed
+    // optimization.
+    int limit_argv_index = 0;
+    if (constraints.empty() && info->nOrderBy == 0) {
+        for (int i = 0; i < info->nConstraint; ++i) {
+            const auto& constraint = info->aConstraint[i];
+            if (constraint.usable && constraint.op == SQLITE_INDEX_CONSTRAINT_LIMIT) {
+                limit_argv_index = 1;
+                info->aConstraintUsage[i].argvIndex = limit_argv_index;
+                break;  // SQLite offers at most one LIMIT constraint per call
+            }
+        }
+    }
+    auto encoded = EncodeIdxStr(projected, constraints, limit_argv_index);
     info->idxStr = sqlite3_mprintf("%s", encoded.c_str());
     info->needToFreeIdxStr = 1;
     return SQLITE_OK;
@@ -344,6 +387,15 @@ int xFilter(sqlite3_vtab_cursor* base_cursor, int, const char* idxStr, int argc,
     if (!decoded.constraints.empty() && static_cast<int>(decoded.constraints.size()) <= argc) {
         pushdown_filters = EncodePushdownFilters(vtab->table.columns, decoded.constraints, argv);
     }
+    // Mutually exclusive with the constraints branch above (xBestIndex
+    // only claims LIMIT when `constraints` was empty), so argv[0] is never
+    // ambiguous between "the limit value" and "the first constraint's
+    // value" - see xBestIndex's comment on why LIMIT pushdown is scoped
+    // that way.
+    std::optional<int64_t> row_limit;
+    if (decoded.limit_argv_index > 0 && decoded.limit_argv_index <= argc) {
+        row_limit = sqlite3_value_int64(argv[decoded.limit_argv_index - 1]);
+    }
     try {
         // Checked out for this cursor's whole lifetime (released in
         // ~VgiCursor via `checkout`'s destructor, after `scanner`'s runs -
@@ -371,7 +423,7 @@ int xFilter(sqlite3_vtab_cursor* base_cursor, int, const char* idxStr, int argc,
         cursor->scanner->Bind(*vtab->table.scan_function);
         std::vector<int64_t> projection_ids(cursor->projected_columns.begin(),
                                              cursor->projected_columns.end());
-        cursor->scanner->Init(projection_ids, pushdown_filters);
+        cursor->scanner->Init(projection_ids, pushdown_filters, row_limit);
     } catch (const std::exception& e) {
         return SetVtabError(base_cursor->pVtab, e.what());
     }

@@ -32,7 +32,8 @@ convention) or the extension path with `VGI_SQLITE_EXTENSION`.
 | Projection pushdown (correct columns, incl. functions that ignore it) | ported | `test_pushdown.py` |
 | WHERE-constraint pushdown (verified actually reaches the worker, not just correct) | ported | `test_pushdown.py` |
 | Type mapping (per Arrow type -> SQLite storage class) | not yet ported | — |
-| ORDER BY / LIMIT pushdown | not yet implemented | — |
+| LIMIT pushdown (plain fetch limit, scoped to no-WHERE/no-ORDER-BY scans) | ported | `test_limit_pushdown.py` |
+| ORDER BY pushdown (VGI's Top-N order_by_* hints) | not yet implemented | — |
 | Protocol version mismatch | not yet ported | — |
 | Scalar functions (registration, repeated calls, mid-scan interleaving, NULL args) | ported | `test_scalar_functions.py` |
 | Writable tables, transactions, aggregates | not applicable yet (Milestone 4) | — |

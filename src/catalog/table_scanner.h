@@ -38,12 +38,18 @@ public:
     // init: opens the producer stream. projection_ids, if non-empty, asks
     // the worker to emit only those column indices (into output_schema());
     // pushdown_filters, if set, is an IPC-encoded WHERE-constraint batch
-    // in VGI's hybrid JSON+Arrow format (see vtab/filter_pushdown.h) -
-    // neither is a correctness guarantee, only a hint a function may
-    // ignore (see xColumn's width-check comment in vgi_vtab.cpp for what
-    // that means for projection in practice).
+    // in VGI's hybrid JSON+Arrow format (see vtab/filter_pushdown.h);
+    // row_limit, if set, is a plain "stop after this many rows" hint
+    // (InitRequest.row_limit). None of the three is a correctness
+    // guarantee, only a hint a function may ignore (see xColumn's
+    // width-check comment in vgi_vtab.cpp for what that means for
+    // projection in practice) - and row_limit specifically must only be
+    // passed by a caller that has independently confirmed early
+    // termination can't drop rows the query still needs (see
+    // vgi_vtab.cpp's xBestIndex comment).
     void Init(const std::vector<int64_t>& projection_ids = {},
-              const std::optional<std::string>& pushdown_filters = std::nullopt);
+              const std::optional<std::string>& pushdown_filters = std::nullopt,
+              std::optional<int64_t> row_limit = std::nullopt);
 
     // Pull the next output batch, or nullopt when the scan is exhausted.
     std::optional<std::shared_ptr<arrow::RecordBatch>> Next();
