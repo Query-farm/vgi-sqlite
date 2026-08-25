@@ -1,0 +1,25 @@
+{
+  "name": "vgi-sqlite",
+  "version": "0.1.0",
+  "dependencies": [
+    {
+      "name": "arrow",
+      "default-features": false,
+      "features": [
+        "compute"
+      ]
+    },
+    "libsodium",
+    "nlohmann-json",
+    {
+      "name": "cpp-httplib",
+      "features": [
+        "zstd",
+        "zlib",
+        "brotli",
+        "openssl"
+      ]
+    },
+    "catch2"
+  ]
+}
