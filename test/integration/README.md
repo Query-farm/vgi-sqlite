@@ -36,7 +36,9 @@ convention) or the extension path with `VGI_SQLITE_EXTENSION`.
 | ORDER BY pushdown (VGI's Top-N order_by_* hints) | not yet implemented | — |
 | Protocol version mismatch | not yet ported | — |
 | Scalar functions (registration, repeated calls, mid-scan interleaving, NULL args) | ported | `test_scalar_functions.py` |
-| Writable tables, transactions, aggregates | not applicable yet (Milestone 4) | — |
+| Writable tables: INSERT | ported | `test_writes.py` |
+| Writable tables: UPDATE, DELETE | not yet implemented (needs a real rowid<->VGI-is_row_id mapping design - see vgi_vtab.cpp's xUpdate) | `test_writes.py` (rejection only) |
+| Transactions, aggregates | not applicable yet (Milestone 4) | — |
 | Bearer/OAuth auth | not applicable yet (Milestone 3/4) | — |
 
 Known worker-side gap this suite works around, not fixes: several of

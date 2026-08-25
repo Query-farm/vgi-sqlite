@@ -144,6 +144,36 @@ ScanFunction VgiCatalogClient::TableScanFunctionGet(const std::string& attach_op
     return ParseScanFunction(result);
 }
 
+ScanFunction VgiCatalogClient::TableInsertFunctionGet(const std::string& attach_opaque_data,
+                                                       const std::string& schema_name,
+                                                       const std::string& table_name) {
+    auto params = gen::BuildCatalogTableInsertFunctionGetParams(
+        to_bytes(attach_opaque_data), schema_name, table_name,
+        /*transaction_opaque_data=*/std::nullopt, /*writable_branch_function_name=*/std::nullopt);
+    auto result = Call(connection_, "catalog_table_insert_function_get", params);
+    return ParseScanFunction(result);
+}
+
+ScanFunction VgiCatalogClient::TableUpdateFunctionGet(const std::string& attach_opaque_data,
+                                                       const std::string& schema_name,
+                                                       const std::string& table_name) {
+    auto params = gen::BuildCatalogTableUpdateFunctionGetParams(
+        to_bytes(attach_opaque_data), schema_name, table_name,
+        /*transaction_opaque_data=*/std::nullopt);
+    auto result = Call(connection_, "catalog_table_update_function_get", params);
+    return ParseScanFunction(result);
+}
+
+ScanFunction VgiCatalogClient::TableDeleteFunctionGet(const std::string& attach_opaque_data,
+                                                       const std::string& schema_name,
+                                                       const std::string& table_name) {
+    auto params = gen::BuildCatalogTableDeleteFunctionGetParams(
+        to_bytes(attach_opaque_data), schema_name, table_name,
+        /*transaction_opaque_data=*/std::nullopt);
+    auto result = Call(connection_, "catalog_table_delete_function_get", params);
+    return ParseScanFunction(result);
+}
+
 std::vector<CatalogFunction> VgiCatalogClient::SchemaContentsScalarFunctions(
     const std::string& attach_opaque_data, const std::string& schema_name) {
     auto params = gen::BuildCatalogSchemaContentsFunctionsParams(

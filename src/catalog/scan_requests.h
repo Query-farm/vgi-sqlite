@@ -59,12 +59,18 @@ BindResponseResult ParseBindResponse(const std::shared_ptr<arrow::RecordBatch>& 
 // and no ORDER BY requested of this scan" for this driver specifically -
 // this function itself has no way to enforce that, it just carries the
 // value through).
+// phase: table-in-out functions' init phase ("INPUT" or "FINALIZE" - the
+// two this driver drives; "TABLE_BUFFERING"/"TABLE_BUFFERING_FINALIZE" are
+// unused here). std::nullopt for every non-table-in-out call this driver
+// makes (plain table scans, scalar functions) - InitRequest.phase is
+// "None for other function types" (vgi-python's own doc comment).
 std::shared_ptr<arrow::RecordBatch> BuildInitRequest(
     const std::vector<uint8_t>& bind_call_bytes, const std::vector<uint8_t>& output_schema_bytes,
     const std::optional<std::vector<uint8_t>>& bind_opaque_data = std::nullopt,
     const std::vector<int64_t>& projection_ids = {},
     const std::optional<std::string>& pushdown_filters = std::nullopt,
-    const std::vector<std::string>& join_keys = {}, std::optional<int64_t> row_limit = std::nullopt);
+    const std::vector<std::string>& join_keys = {}, std::optional<int64_t> row_limit = std::nullopt,
+    const std::optional<std::string>& phase = std::nullopt);
 
 // The header batch init's producer stream returns before any data batch.
 struct GlobalInitResponseResult {

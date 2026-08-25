@@ -23,3 +23,9 @@ target_link_libraries(vgi-scan-probe PRIVATE vgi_sqlite::driver)
 # the Milestone-3 proof of the scalar-function bind/exchange data path.
 add_executable(vgi-scalar-probe scalar_probe.cpp)
 target_link_libraries(vgi-scalar-probe PRIVATE vgi_sqlite::driver)
+
+# write_probe: resolves a table's insert function and inserts one row -
+# the Milestone-4 proof of the write-path bind/init(phase=INPUT)/exchange
+# data path, independent of xUpdate.
+add_executable(vgi-write-probe write_probe.cpp)
+target_link_libraries(vgi-write-probe PRIVATE vgi_sqlite::driver)

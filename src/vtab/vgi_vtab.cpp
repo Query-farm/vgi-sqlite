@@ -22,6 +22,7 @@ SQLITE_EXTENSION_INIT3
 
 #include "catalog/catalog_client.h"
 #include "catalog/table_scanner.h"
+#include "catalog/table_writer.h"
 #include "types/type_mapping.h"
 #include "vtab/connection_pool.h"
 #include "vtab/filter_pushdown.h"
@@ -493,6 +494,99 @@ int xRowid(sqlite3_vtab_cursor* base_cursor, sqlite3_int64* rowid_out) {
     return SQLITE_OK;
 }
 
+// True for a declared column carrying VGI's is_row_id metadata (the
+// worker-chosen per-row identifier column UPDATE/DELETE key writes by -
+// see table_writer.h's file comment and TableWriter::Write). Only INSERT
+// is wired up yet; UPDATE/DELETE need this column's *value*, not just
+// whether it exists, to identify which row to modify - real work this
+// vtab's xRowid/xColumn don't do yet (they assign a purely local,
+// scan-sequential rowid unrelated to VGI's own row identifier), scoped
+// out of this slice deliberately rather than half-built.
+bool IsRowIdColumn(const std::shared_ptr<arrow::Field>& field) {
+    return field->metadata() && field->metadata()->Contains("is_row_id");
+}
+
+// INSERT only for now (see the file comment above on why UPDATE/DELETE
+// need a real rowid-mapping design this vtab doesn't have yet - argc==1
+// is DELETE, argc>1 with a non-null argv[0] is UPDATE, both rejected
+// here with a clear error rather than silently mishandled).
+int xUpdate(sqlite3_vtab* base_vtab, int argc, sqlite3_value** argv, sqlite3_int64* pRowid) {
+    auto* vtab = reinterpret_cast<VgiVtab*>(base_vtab);
+    if (argc == 1) {
+        return SetVtabError(base_vtab, "vgi_worker: DELETE isn't supported yet");
+    }
+    if (sqlite3_value_type(argv[0]) != SQLITE_NULL) {
+        return SetVtabError(base_vtab, "vgi_worker: UPDATE isn't supported yet");
+    }
+    if (!vtab->table.supports_insert) {
+        return SetVtabError(base_vtab, "vgi_worker: table doesn't support INSERT");
+    }
+    if (!vtab->table.columns) {
+        return SetVtabError(base_vtab, "vgi_worker: table has no known columns to insert into");
+    }
+    try {
+        // The insert function's input schema is every user column *except*
+        // the is_row_id one (see table_writer.h's file comment / the
+        // research this was built from: VGI's INSERT input schema is
+        // "table columns minus rowid") - argv[2 + declared_index] holds
+        // that column's new value, in the same declared order.
+        arrow::FieldVector insert_fields;
+        std::vector<int> declared_indices;
+        const int num_columns = vtab->table.columns->num_fields();
+        for (int i = 0; i < num_columns; ++i) {
+            auto field = vtab->table.columns->field(i);
+            if (IsRowIdColumn(field)) continue;
+            insert_fields.push_back(field);
+            declared_indices.push_back(i);
+        }
+        std::vector<std::shared_ptr<arrow::Array>> columns;
+        for (size_t i = 0; i < declared_indices.size(); ++i) {
+            int argv_index = 2 + declared_indices[i];
+            if (argv_index >= argc) {
+                return SetVtabError(base_vtab, "vgi_worker: INSERT is missing a value for column \"" +
+                                                   insert_fields[i]->name() + "\"");
+            }
+            auto scalar = BuildArrowScalarFromSqliteValue(argv[argv_index], insert_fields[i]->type());
+            if (!scalar) {
+                return SetVtabError(base_vtab, "vgi_worker: value for column \"" + insert_fields[i]->name() +
+                                                   "\" doesn't match its declared type");
+            }
+            auto array_result = arrow::MakeArrayFromScalar(*scalar, 1);
+            if (!array_result.ok()) {
+                return SetVtabError(base_vtab, "vgi_worker: building INSERT column \"" +
+                                                   insert_fields[i]->name() +
+                                                   "\": " + array_result.status().ToString());
+            }
+            columns.push_back(array_result.ValueUnsafe());
+        }
+        auto input_row = arrow::RecordBatch::Make(arrow::schema(insert_fields), 1, columns);
+
+        // Resolved fresh on every INSERT, not cached on VgiVtab - a single
+        // quick RPC, and every other write/scan resolution in this driver
+        // already does the same (see TableScanner::Bind, ScalarFunctionCaller);
+        // caching is a documented follow-up if profiling ever shows this
+        // is a real cost for a bulk INSERT.
+        auto checkout = vtab->pool->Acquire(vtab->location, vtab->catalog_name);
+        VgiCatalogClient catalog(checkout->connection);
+        auto insert_fn =
+            catalog.TableInsertFunctionGet(checkout->attach_opaque_data, vtab->schema_name, vtab->table_name);
+
+        TableWriter writer(*vtab->pool, vtab->location, vtab->catalog_name);
+        writer.Write(insert_fn, /*schema_name=*/std::nullopt, input_row);
+
+        // No real new-rowid to report: return_chunks=false means the
+        // worker only echoes back a count, and this vtab has no rowid
+        // mapping yet regardless (see the file comment above) - honor an
+        // explicit rowid if the INSERT gave one, else report 0. Wrong for
+        // last_insert_rowid()/WITHOUT ROWID semantics, right for the
+        // INSERT itself; a documented gap alongside UPDATE/DELETE's.
+        *pRowid = (sqlite3_value_type(argv[1]) != SQLITE_NULL) ? sqlite3_value_int64(argv[1]) : 0;
+    } catch (const std::exception& e) {
+        return SetVtabError(base_vtab, e.what());
+    }
+    return SQLITE_OK;
+}
+
 const sqlite3_module kVgiWorkerModule = {
     /* iVersion */ 0,
     /* xCreate */ xCreate,
@@ -507,7 +601,7 @@ const sqlite3_module kVgiWorkerModule = {
     /* xEof */ xEof,
     /* xColumn */ xColumn,
     /* xRowid */ xRowid,
-    /* xUpdate */ nullptr,  // read-only; Milestone 4 (writable tables)
+    /* xUpdate */ xUpdate,  // INSERT only so far - see xUpdate's file comment
     /* xBegin */ nullptr,
     /* xSync */ nullptr,
     /* xCommit */ nullptr,

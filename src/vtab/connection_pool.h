@@ -32,6 +32,34 @@
 // reopened, and a session that briefly needed N concurrent connections
 // keeps all N spawned for the rest of the session. Reconnect-on-failure
 // and idle eviction are production-hardening follow-ups (see the plan).
+//
+// attach_opaque_data is minted ONCE per key, not once per physical
+// connection: the first successful Acquire() for a (location, catalog)
+// pair does a real catalog_attach and caches its attach_opaque_data;
+// every connection spawned afterward for that same key (when concurrency
+// needs a second physical process) reuses that cached value directly and
+// skips catalog_attach entirely, rather than minting its own. Found by
+// testing a real writable worker: vgi-fixture-worker's simple_writable
+// fixture derives its backing SQLite file's path from
+// attach_opaque_data's own bytes (a fresh random UUID each catalog_attach
+// call), so two physical connections that each independently attached
+// ended up looking at two completely unrelated, empty databases - an
+// INSERT on one connection was invisible to a SELECT on the other, with
+// no error anywhere to say so. Matches how VGI's own reference engine
+// (DuckDB's extension) is documented to work: attach_opaque_data is
+// minted once per ATTACH and threaded through every subsequent call
+// regardless of which of the engine's own worker-pool processes ends up
+// serving it - see vgi-c++'s CLAUDE.md ("A worker pool hands out a
+// different process per RPC, so...per-attachment state...belongs in
+// FunctionStorage, not in a member") and the design intent documented on
+// InitRequest.execution_id/substream_id (explicitly built to survive an
+// HTTP load balancer routing one execution's calls to different backend
+// processes). A worker whose catalog_attach does real *per-process* setup
+// a second, attach-skipping connection would miss (e.g. one backed by a
+// private in-process session dict rather than state derived from/keyed by
+// the opaque bytes themselves) isn't safe under this reuse - a narrower,
+// now-explicit version of the same caveat ScalarFunctionCaller's file
+// comment already documents about attach_opaque_data's portability.
 #pragma once
 
 #include <map>
@@ -89,6 +117,7 @@ private:
 
     std::mutex mutex_;
     std::map<std::string, std::vector<std::shared_ptr<PooledConnection>>> idle_;  // key: location + "\0" + catalog
+    std::map<std::string, std::string> shared_attach_opaque_data_;  // same key; set on the first Acquire()
 };
 
 }  // namespace vgi_sqlite

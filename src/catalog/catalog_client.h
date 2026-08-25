@@ -121,6 +121,21 @@ public:
     std::vector<CatalogFunction> SchemaContentsScalarFunctions(const std::string& attach_opaque_data,
                                                                  const std::string& schema_name);
 
+    // Write-path function resolution - only called for a table whose
+    // CatalogTable::supports_insert/update/delete says the operation is
+    // available. `WriteFunctionResult` is wire-identical to
+    // `ScanFunctionResult` (confirmed by reading vgi-c++'s
+    // VgiWriteFunctionResult, a literal type alias for VgiScanFunctionResult
+    // - not documented anywhere read ahead of time), so ScanFunction/
+    // ParseScanFunction are reused rather than duplicated. Each is a
+    // Binary-kind method like TableScanFunctionGet, not a Result-kind one.
+    ScanFunction TableInsertFunctionGet(const std::string& attach_opaque_data,
+                                         const std::string& schema_name, const std::string& table_name);
+    ScanFunction TableUpdateFunctionGet(const std::string& attach_opaque_data,
+                                         const std::string& schema_name, const std::string& table_name);
+    ScanFunction TableDeleteFunctionGet(const std::string& attach_opaque_data,
+                                         const std::string& schema_name, const std::string& table_name);
+
 private:
     VgiConnection& connection_;
 };

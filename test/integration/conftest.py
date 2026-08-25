@@ -55,6 +55,22 @@ def worker_location() -> str:
     return os.environ.get("VGI_TEST_WORKER", _default_worker())
 
 
+@pytest.fixture(scope="session")
+def writable_worker_location() -> str:
+    """The `simple_writable` catalog's worker command - a separate fixture
+    worker binary (not one of the catalogs vgi-fixture-worker's own
+    MetaWorker dispatches to), self-contained and SQLite-file-backed, no
+    transactor subprocess dependency - see table_writer.h's file comment
+    on why this is the write-path test target rather than the fuller
+    `writable` fixture (which requires supports_transactions=True).
+    VGI_SIMPLE_WRITABLE_WORKER overrides, matching vgi/Makefile's
+    convention for this same fixture."""
+    vgi_python = os.environ.get("VGI_PYTHON", str(Path.home() / "Development" / "vgi-python"))
+    return os.environ.get(
+        "VGI_SIMPLE_WRITABLE_WORKER", f"uv run --project {vgi_python} vgi-fixture-simple-writable-worker"
+    )
+
+
 @pytest.fixture()
 def conn(extension_path: Path, tmp_path: Path) -> sqlite3.Connection:
     """A fresh SQLite connection (file-backed, not :memory: - CREATE VIRTUAL

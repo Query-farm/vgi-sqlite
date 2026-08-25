@@ -73,6 +73,8 @@ add_library(vgi_sqlite_driver
     src/catalog/scan_requests.cpp
     src/catalog/table_scanner.cpp
     src/catalog/scalar_function_caller.cpp
+    src/catalog/write_requests.cpp
+    src/catalog/table_writer.cpp
     src/vtab/connection_pool.cpp
 )
 add_library(vgi_sqlite::driver ALIAS vgi_sqlite_driver)

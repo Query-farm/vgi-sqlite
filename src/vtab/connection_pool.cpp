@@ -1,6 +1,7 @@
 // © Copyright 2026 Query Farm LLC - https://query.farm
 #include "vtab/connection_pool.h"
 
+#include <optional>
 #include <sstream>
 #include <utility>
 #include <vector>
@@ -41,6 +42,7 @@ ConnectionPool::Checkout::~Checkout() {
 ConnectionPool::Checkout ConnectionPool::Acquire(const std::string& location,
                                                   const std::string& catalog_name) {
     const std::string key = location + '\0' + catalog_name;
+    std::optional<std::string> cached_attach_opaque_data;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = idle_.find(key);
@@ -49,17 +51,37 @@ ConnectionPool::Checkout ConnectionPool::Acquire(const std::string& location,
             it->second.pop_back();
             return Checkout(this, key, std::move(conn));
         }
+        if (auto shared_it = shared_attach_opaque_data_.find(key); shared_it != shared_attach_opaque_data_.end()) {
+            cached_attach_opaque_data = shared_it->second;
+        }
     }
-    // No idle connection for this key - spawn and attach a new one,
-    // outside the lock (spawning a subprocess and round-tripping
-    // catalog_attach can take a while; no need to block every other
-    // Acquire()/Release() on this pool while it happens).
+    // No idle connection for this key - spawn a new one, outside the lock
+    // (spawning a subprocess, and round-tripping catalog_attach when this
+    // is genuinely the first connection for this key, can both take a
+    // while; no need to block every other Acquire()/Release() on this
+    // pool while it happens).
     auto pooled = std::make_shared<PooledConnection>(PooledConnection{
         VgiConnection::spawn(SplitWhitespace(location)),
         {},
     });
-    VgiCatalogClient catalog(pooled->connection);
-    pooled->attach_opaque_data = catalog.Attach(catalog_name).attach_opaque_data;
+    if (cached_attach_opaque_data) {
+        // Not the first connection for this key - reuse the attachment
+        // identity the first one minted instead of calling catalog_attach
+        // again (which would mint an unrelated one on a worker whose
+        // attach_opaque_data carries real per-attach state) - see this
+        // header's file comment.
+        pooled->attach_opaque_data = *cached_attach_opaque_data;
+    } else {
+        VgiCatalogClient catalog(pooled->connection);
+        pooled->attach_opaque_data = catalog.Attach(catalog_name).attach_opaque_data;
+        std::lock_guard<std::mutex> lock(mutex_);
+        // Another thread may have raced this and already cached one first
+        // (this pool method is otherwise unused single-threaded today, but
+        // don't assume it stays that way) - first writer wins, so every
+        // connection for this key agrees on one identity.
+        shared_attach_opaque_data_.try_emplace(key, pooled->attach_opaque_data);
+        pooled->attach_opaque_data = shared_attach_opaque_data_[key];
+    }
     return Checkout(this, key, std::move(pooled));
 }
 
