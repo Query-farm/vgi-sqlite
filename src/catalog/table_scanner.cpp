@@ -21,50 +21,69 @@ std::shared_ptr<arrow::RecordBatch> Call(VgiConnection& connection, const std::s
     return wire::get_ipc(response.batch, "result");
 }
 
-// ScanFunctionResultSchema.arguments decodes to a *flat* 1-row batch, one
+// ScanFunctionResultSchema.arguments decodes to a *flat* batch, one
 // column per argument named "arg_N" (catalog_interface.py's scan-function
-// wiring convention), but BindRequest.arguments needs each argument's IPC
-// bytes to decode to a batch with exactly one column named "args" whose
-// type is a struct with fields named "positional_N" (vgi-python's
-// Arguments.encoded_dict()/decode() - decode() only recognizes keys
-// starting "positional_" or "named_"). Repackage AND rename, not just wrap.
+// wiring convention) - and, for a genuinely zero-argument function,
+// *zero rows* too (confirmed against vgi-fixture-worker's TenThousandFunction:
+// num_columns=0 *and* num_rows=0, not the 1-row-of-nothing that would have
+// been the more obvious encoding). But BindRequest.arguments needs each
+// argument's IPC bytes to decode to exactly one row - a batch with one
+// column named "args" whose type is a struct with fields named
+// "positional_N" (vgi-python's Arguments.encoded_dict()/decode() - decode()
+// only recognizes keys starting "positional_"/"named_", and
+// deserialize_from_bytes() indexes row 0 of "args" unconditionally, so a
+// 0-row batch fails with "IndexError: index out of bounds" resolving it -
+// found by testing a no-arg table, not documented anywhere read ahead of
+// time). Repackage, rename, AND normalize to exactly one row - never trust
+// flat->num_rows() for the output row count.
 std::vector<uint8_t> WrapAsArgsStruct(const std::shared_ptr<arrow::RecordBatch>& flat) {
     arrow::FieldVector fields;
-    std::vector<std::shared_ptr<arrow::Array>> children;
     for (int i = 0; i < flat->num_columns(); ++i) {
         fields.push_back(arrow::field("positional_" + std::to_string(i), flat->schema()->field(i)->type(),
                                        flat->schema()->field(i)->nullable()));
-        children.push_back(flat->column(i));
     }
 
-    std::shared_ptr<arrow::Array> struct_array;
-    if (fields.empty()) {
-        // StructArray::Make requires at least one child; a zero-argument
-        // function needs a valid (non-null) length-1 struct-of-nothing per
-        // row, built directly via StructBuilder::Append() instead (which,
-        // with no child builders to advance, just marks one row valid).
-        std::unique_ptr<arrow::ArrayBuilder> builder;
-        auto status = arrow::MakeBuilder(arrow::default_memory_pool(), arrow::struct_({}), &builder);
-        if (!status.ok()) throw std::runtime_error("building empty-args struct builder: " + status.ToString());
-        auto* struct_builder = static_cast<arrow::StructBuilder*>(builder.get());
-        for (int64_t i = 0; i < flat->num_rows(); ++i) {
-            if (auto append_status = struct_builder->Append(); !append_status.ok()) {
-                throw std::runtime_error("appending empty-args row: " + append_status.ToString());
+    // Build the one-row struct directly via StructBuilder/child builders
+    // rather than StructArray::Make(children, fields) (which infers length
+    // from the children and would carry over flat's own - possibly zero -
+    // row count): every path here must produce exactly one struct row,
+    // regardless of how many rows the flat source batch had.
+    auto struct_type = arrow::struct_(fields);
+    std::unique_ptr<arrow::ArrayBuilder> builder;
+    auto make_status = arrow::MakeBuilder(arrow::default_memory_pool(), struct_type, &builder);
+    if (!make_status.ok()) throw std::runtime_error("building args struct builder: " + make_status.ToString());
+    auto* struct_builder = static_cast<arrow::StructBuilder*>(builder.get());
+    if (auto append_status = struct_builder->Append(); !append_status.ok()) {
+        throw std::runtime_error("appending args struct row: " + append_status.ToString());
+    }
+    // Every child builder must end up exactly as long as the struct's own
+    // row count (1) or Finish() produces a struct claiming 1 row over
+    // children that don't agree - append a real value when flat has a row
+    // to read it from, else null (observed empty-args encoding: 0
+    // *columns* and 0 rows together, so this braces for the case those
+    // ever diverge - 0 rows with >0 columns - rather than assuming it away).
+    for (int i = 0; i < flat->num_columns(); ++i) {
+        auto* field_builder = struct_builder->field_builder(i);
+        if (flat->num_rows() == 0) {
+            if (auto status = field_builder->AppendNull(); !status.ok()) {
+                throw std::runtime_error("appending null arg " + std::to_string(i) + ": " + status.ToString());
             }
+            continue;
         }
-        auto finish_result = struct_builder->Finish();
-        if (!finish_result.ok()) throw std::runtime_error("finishing empty-args struct: " + finish_result.status().ToString());
-        struct_array = finish_result.ValueUnsafe();
-    } else {
-        auto struct_result = arrow::StructArray::Make(children, fields);
-        if (!struct_result.ok()) {
-            throw std::runtime_error("wrapping arguments as a struct: " + struct_result.status().ToString());
+        auto scalar_result = flat->column(i)->GetScalar(0);
+        if (!scalar_result.ok()) {
+            throw std::runtime_error("reading arg " + std::to_string(i) + ": " + scalar_result.status().ToString());
         }
-        struct_array = struct_result.ValueUnsafe();
+        if (auto append_status = field_builder->AppendScalar(**scalar_result); !append_status.ok()) {
+            throw std::runtime_error("appending arg " + std::to_string(i) + ": " + append_status.ToString());
+        }
     }
+    auto finish_result = struct_builder->Finish();
+    if (!finish_result.ok()) throw std::runtime_error("finishing args struct: " + finish_result.status().ToString());
+    auto struct_array = finish_result.ValueUnsafe();
 
-    auto args_schema = arrow::schema({arrow::field("args", arrow::struct_(fields), false)});
-    auto args_batch = arrow::RecordBatch::Make(args_schema, flat->num_rows(), {struct_array});
+    auto args_schema = arrow::schema({arrow::field("args", struct_type, false)});
+    auto args_batch = arrow::RecordBatch::Make(args_schema, /*num_rows=*/1, {struct_array});
     return to_bytes(wire::encode_ipc(args_batch));
 }
 
