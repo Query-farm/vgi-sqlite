@@ -245,11 +245,37 @@ int xDestroy(sqlite3_vtab* vtab) { return xDisconnect(vtab); }
 int xBestIndex(sqlite3_vtab* base_vtab, sqlite3_index_info* info) {
     // No ORDER BY/LIMIT pushdown yet - SQLite still sorts/limits itself,
     // always correct just not as cheap as it could be (later Milestone-3
-    // follow-up). Cost is deliberately high-ish (SQLite compares plans
-    // across joined tables) so a table with a real cardinality estimate
-    // can out-rank this once that's wired through.
-    info->estimatedCost = 1'000'000.0;
-    info->estimatedRows = 1'000'000;
+    // follow-up).
+    //
+    // Cost/row estimate: prefer the worker's own cardinality_estimate (or,
+    // failing that, cardinality_max as a conservative upper bound) over a
+    // guess - this is what lets SQLite's join planner correctly prefer
+    // scanning a 50-row table before a 10,000-row one, rather than
+    // treating every vgi_worker table as equally (and arbitrarily)
+    // expensive. Falls back to the same high-ish placeholder as before
+    // (1,000,000) only when the worker declared neither, so a genuinely
+    // unknown-size table still loses out to any table SQLite *does* have
+    // real statistics for, joined or not.
+    auto* vtab = reinterpret_cast<VgiVtab*>(base_vtab);  // used throughout this function
+    int64_t row_estimate = vtab->table.cardinality_estimate >= 0 ? vtab->table.cardinality_estimate
+                            : vtab->table.cardinality_max >= 0   ? vtab->table.cardinality_max
+                                                                  : 1'000'000;
+    // Reward plans that push work to the worker: each pushable constraint
+    // (computed below) makes this specific index strategy less costly
+    // relative to a full scan of the same table under a different
+    // strategy, even without real per-predicate selectivity from the
+    // worker - a fixed per-constraint discount is the same heuristic
+    // SQLite's own query planner falls back to when it has no ANALYZE
+    // statistics for a real table. Cost is never allowed below 1.0.
+    //
+    // Computed once here (not re-derived further down): SelectPushableConstraints
+    // also assigns each usable constraint's argvIndex as a side effect of
+    // being called, so it must run exactly once per xBestIndex invocation.
+    auto constraints = SelectPushableConstraints(info);
+    double discount = 1.0;
+    for (size_t i = 0; i < constraints.size() && i < 4; ++i) discount *= 0.25;
+    info->estimatedCost = std::max(1.0, static_cast<double>(row_estimate) * discount);
+    info->estimatedRows = std::max<int64_t>(1, row_estimate);
 
     // Projection pushdown: colUsed's low 63 bits name individual declared
     // columns actually referenced by this query; bit 63 stands for "column
@@ -259,7 +285,6 @@ int xBestIndex(sqlite3_vtab* base_vtab, sqlite3_index_info* info) {
     // degrade gracefully to "fetch everything" rather than fetching the
     // wrong columns, since colUsed can't distinguish "column 70" from
     // "column 90" once collapsed into bit 63.
-    auto* vtab = reinterpret_cast<VgiVtab*>(base_vtab);
     const int num_columns = vtab->table.columns ? vtab->table.columns->num_fields() : 0;
     std::vector<int> projected;
     if (num_columns > 0 && num_columns <= 63 && (info->colUsed & (1ULL << 63)) == 0) {
@@ -271,12 +296,11 @@ int xBestIndex(sqlite3_vtab* base_vtab, sqlite3_index_info* info) {
         if (static_cast<int>(projected.size()) == num_columns) projected.clear();
     }
 
-    // WHERE-constraint pushdown (see vtab/filter_pushdown.h) - claims
-    // argvIndex for each pushable constraint but never sets .omit, so
-    // SQLite always re-checks correctness itself regardless of whether
-    // the worker actually applies the filter.
-    auto constraints = SelectPushableConstraints(info);
-
+    // WHERE-constraint pushdown (see vtab/filter_pushdown.h) - `constraints`
+    // (computed above, alongside the cost estimate) claims argvIndex for
+    // each pushable constraint but never sets .omit, so SQLite always
+    // re-checks correctness itself regardless of whether the worker
+    // actually applies the filter.
     auto encoded = EncodeIdxStr(projected, constraints);
     info->idxStr = sqlite3_mprintf("%s", encoded.c_str());
     info->needToFreeIdxStr = 1;
