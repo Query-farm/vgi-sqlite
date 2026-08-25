@@ -1,6 +1,7 @@
 // © Copyright 2026 Query Farm LLC - https://query.farm
 #include "vtab/connection_pool.h"
 
+#include <algorithm>
 #include <optional>
 #include <sstream>
 #include <utility>
@@ -48,12 +49,25 @@ ConnectionPool::Checkout& ConnectionPool::Checkout::operator=(Checkout&& other) 
 
 ConnectionPool::Checkout::~Checkout() { ReleaseOrDiscard(); }
 
+void ConnectionPool::PruneStaleIdleLocked() {
+    auto now = std::chrono::steady_clock::now();
+    for (auto& [key, conns] : idle_) {
+        (void)key;
+        conns.erase(std::remove_if(conns.begin(), conns.end(),
+                                   [&](const std::shared_ptr<PooledConnection>& c) {
+                                       return now - c->idle_since > kIdleTimeout;
+                                   }),
+                    conns.end());
+    }
+}
+
 ConnectionPool::Checkout ConnectionPool::Acquire(const std::string& location,
                                                   const std::string& catalog_name) {
     const std::string key = location + '\0' + catalog_name;
     std::optional<AttachInfo> cached_attach_info;
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        PruneStaleIdleLocked();
         auto it = idle_.find(key);
         if (it != idle_.end() && !it->second.empty()) {
             auto conn = std::move(it->second.back());
@@ -71,6 +85,7 @@ ConnectionPool::Checkout ConnectionPool::Acquire(const std::string& location,
     // pool while it happens).
     auto pooled = std::make_shared<PooledConnection>(PooledConnection{
         VgiConnection::spawn(SplitWhitespace(location)),
+        {},
         {},
     });
     if (cached_attach_info) {
@@ -96,6 +111,7 @@ ConnectionPool::Checkout ConnectionPool::Acquire(const std::string& location,
 }
 
 void ConnectionPool::ReleaseInternal(const std::string& key, std::shared_ptr<PooledConnection> conn) {
+    conn->idle_since = std::chrono::steady_clock::now();
     std::lock_guard<std::mutex> lock(mutex_);
     idle_[key].push_back(std::move(conn));
 }

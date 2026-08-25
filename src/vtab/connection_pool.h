@@ -37,10 +37,21 @@
 // spurious extra respawn costs a little work but a truly dead connection
 // silently recycled forever (poisoning every future call on that key)
 // costs correctness. A session that briefly needed N concurrent
-// connections still keeps all N *live and idle* ones spawned for the rest
-// of the session, though - idle eviction (shrinking the pool back down
-// once concurrency drops) is a separate, still-open production-hardening
-// follow-up (see the plan).
+// connections doesn't keep all N spawned for the rest of the session,
+// though: every Acquire() call first prunes any idle connection across
+// *every* key that's been sitting unused longer than kIdleTimeout (see
+// PruneStaleIdleLocked) - a connection released back to idle_ that's
+// never reused within that window gets its worker process torn down (via
+// PooledConnection's own shared_ptr reaching zero references) the next
+// time anything, anywhere in the pool, calls Acquire(). This is
+// opportunistic, not a background timer - a key that's checked out once
+// and then never touched again for the rest of the session (and no other
+// key ever calls Acquire() again either) keeps its idle connections alive
+// until the whole pool is destroyed, since nothing triggers the check. A
+// real timer thread would close that gap but adds real complexity (thread
+// lifecycle tied to the pool's own, itself tied to a sqlite3_module's
+// client-data destructor) for a case unlikely to matter in practice -
+// accepted here rather than built.
 //
 // attach_opaque_data is minted ONCE per key, not once per physical
 // connection: the first successful Acquire() for a (location, catalog)
@@ -104,6 +115,7 @@
 // driver doesn't support that.
 #pragma once
 
+#include <chrono>
 #include <exception>
 #include <map>
 #include <memory>
@@ -119,6 +131,9 @@ namespace vgi_sqlite {
 struct PooledConnection {
     VgiConnection connection;
     std::string attach_opaque_data;
+    // Set by ReleaseInternal when this connection goes idle; read (and
+    // acted on) by PruneStaleIdleLocked. Meaningless while checked out.
+    std::chrono::steady_clock::time_point idle_since;
 };
 
 class ConnectionPool {
@@ -191,6 +206,13 @@ public:
 
 private:
     void ReleaseInternal(const std::string& key, std::shared_ptr<PooledConnection> conn);
+
+    // Drops every idle connection (any key) that's been sitting unused
+    // longer than kIdleTimeout - see the file comment. Called with
+    // mutex_ already held, at the start of every Acquire().
+    void PruneStaleIdleLocked();
+
+    static constexpr std::chrono::minutes kIdleTimeout{5};
 
     // Cached from the first successful Acquire() for a key - see the file
     // comment on why every later connection for that key reuses this
