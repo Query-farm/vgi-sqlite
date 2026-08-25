@@ -174,3 +174,41 @@ the wire protocol in isolation, THEN wire into the SQLite extension, where a
   when building as a sibling subdirectory, so a sibling's correct
   declaration is never consulted. A real, pre-existing bug in `vgi-c++`
   too, not specific to this repo.
+- **`catalog_attach`'s `attach_opaque_data` must be minted once per
+  (location, catalog) and reused, not re-minted per physical connection.**
+  A worker can derive real state identity from those bytes directly (found
+  against vgi-fixture-worker's `simple_writable` fixture: its backing
+  SQLite file's path is `{attach_opaque_data.hex()}.sqlite`) - two
+  independently-spawned connections that each called `catalog_attach`
+  looked at two unrelated, empty databases, with no error anywhere to say
+  so; an `INSERT` was silently invisible to a later `SELECT`. `ConnectionPool`
+  caches the first successful attach's value per key and has every later
+  connection for that key skip `catalog_attach` and reuse it directly - see
+  `connection_pool.h`'s file comment.
+- **VGI identifies a row for UPDATE/DELETE by a worker-declared column
+  (Arrow field metadata `is_row_id`), not a SQL PRIMARY KEY** - UPDATE
+  sends `(changed_columns..., rowid)`, DELETE sends `(rowid,)`. Mapping
+  this onto SQLite's own rowid contract needs `xRowid` to report that
+  column's *actual per-row value* (not a locally-assigned counter) - which
+  in turn requires `xBestIndex` to force that column into the fetched
+  projection whenever the table supports update/delete, even if the
+  query's own `colUsed` never asked for it (`UPDATE t SET x=? WHERE y=?`
+  never selects the rowid column at all). No `INTEGER PRIMARY KEY` DDL
+  aliasing was needed - `xRowid` alone is enough for both read-side
+  `rowid` display and `xUpdate`'s `argv[0]` contract, since this vtab does
+  a full scan for every query regardless.
+- **VGI's transaction RPC surface has no nested-savepoint concept at all**
+  - only `catalog_transaction_begin`/`_commit`/`_rollback`, one flat
+  transaction. SQLite's vtab contract has `xSavepoint`/`xRelease`/
+  `xRollbackTo` for `SAVEPOINT` nesting *within* one transaction - a real
+  implementation can't correctly support `ROLLBACK TO` a non-initial
+  savepoint at all (VGI has no partial-undo RPC), and must also solve a
+  scope mismatch before attempting any of this: SQLite calls `xBegin` once
+  *per vtab instance* per transaction, but `catalog_transaction_begin` is
+  scoped to one *(location, catalog) attachment* - three `vgi_worker`
+  tables from the same catalog in one SQL transaction get three `xBegin`
+  calls that must share exactly one `catalog_transaction_begin`/
+  `transaction_opaque_data`, the same kind of ref-counted shared state
+  `ConnectionPool` already carries for `attach_opaque_data`. Investigated
+  and deliberately deferred (see the plan file) rather than attempted
+  against a guess.
