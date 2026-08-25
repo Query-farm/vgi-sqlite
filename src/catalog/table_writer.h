@@ -40,6 +40,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include <arrow/record_batch.h>
 
@@ -58,8 +59,11 @@ public:
     // VgiCatalogClient::Table{Insert,Update,Delete}FunctionGet;
     // `input_row` must already be shaped to what that write function
     // expects (see vgi_vtab.cpp's xUpdate for how each op's row is built).
+    // transaction_opaque_data: see TableScanner::Bind's doc comment - same
+    // contract, same ConnectionPool::CurrentTransactionOpaqueData source.
     int64_t Write(const ScanFunction& write_function, const std::optional<std::string>& schema_name,
-                  const std::shared_ptr<arrow::RecordBatch>& input_row);
+                  const std::shared_ptr<arrow::RecordBatch>& input_row,
+                  const std::optional<std::vector<uint8_t>>& transaction_opaque_data = std::nullopt);
 
 private:
     ConnectionPool& pool_;

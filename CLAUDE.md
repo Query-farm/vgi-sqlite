@@ -200,15 +200,43 @@ the wire protocol in isolation, THEN wire into the SQLite extension, where a
 - **VGI's transaction RPC surface has no nested-savepoint concept at all**
   - only `catalog_transaction_begin`/`_commit`/`_rollback`, one flat
   transaction. SQLite's vtab contract has `xSavepoint`/`xRelease`/
-  `xRollbackTo` for `SAVEPOINT` nesting *within* one transaction - a real
-  implementation can't correctly support `ROLLBACK TO` a non-initial
-  savepoint at all (VGI has no partial-undo RPC), and must also solve a
-  scope mismatch before attempting any of this: SQLite calls `xBegin` once
-  *per vtab instance* per transaction, but `catalog_transaction_begin` is
-  scoped to one *(location, catalog) attachment* - three `vgi_worker`
-  tables from the same catalog in one SQL transaction get three `xBegin`
-  calls that must share exactly one `catalog_transaction_begin`/
-  `transaction_opaque_data`, the same kind of ref-counted shared state
-  `ConnectionPool` already carries for `attach_opaque_data`. Investigated
-  and deliberately deferred (see the plan file) rather than attempted
-  against a guess.
+  `xRollbackTo` for `SAVEPOINT` nesting *within* one transaction; this
+  driver leaves all three null rather than attempt partial rollback VGI's
+  protocol can't support - confirmed safe by every INSERT/UPDATE/DELETE
+  test having already passed with these null the whole time (SQLite simply
+  doesn't offer/use the savepoint mechanism for a vtab that doesn't
+  implement it; only an explicit SQL `SAVEPOINT` would need it).
+- **SQLite calls a vtab module's `xBegin` once per *vtab instance* per
+  transaction, but VGI's `catalog_transaction_begin` is scoped to one
+  *(location, catalog) attachment*** - three `vgi_worker` tables from the
+  same catalog in one SQL transaction get three `xBegin` calls that must
+  share exactly one `catalog_transaction_begin`/`transaction_opaque_data`
+  call. `ConnectionPool::Begin/Commit/RollbackTransaction` solve this with
+  the same ref-counted-per-key, shared-across-every-physical-connection
+  pattern already used for `attach_opaque_data` (see the entry above) -
+  only the first `Begin` for a key actually calls `catalog_transaction_
+  begin`, only the `Commit`/`Rollback` that brings the count back to zero
+  calls the real RPC, and every `bind` made during the transaction
+  (`TableScanner::Bind`, `TableWriter::Write`) threads
+  `CurrentTransactionOpaqueData(key)` through regardless of which specific
+  connection happens to serve that call.
+- **`xBegin` fires for *every* `vgi_worker` table touched inside a
+  transaction, not just written ones - including a plain `SELECT` inside
+  SQLite's own implicit per-statement transaction.** `example` (the
+  fixture catalog nearly every read test in this suite uses) declares
+  `supports_transactions = True`, so registering `xBegin`/`xCommit`
+  immediately put every existing read test through a real
+  `catalog_transaction_begin`/`_commit` round trip too, not just the new
+  write/transaction tests - worth remembering if a read-path test ever
+  needs to reason about extra RPC traffic per query.
+- **`Begin/Commit/RollbackTransaction` are gated on
+  `CatalogAttachResult.supports_transactions`, cached in `ConnectionPool`'s
+  `attach_info_` map alongside `attach_opaque_data`** - a catalog that
+  doesn't support transactions (`simple_writable`, the write-path test
+  target) never gets a `catalog_transaction_begin` call at all;
+  `CurrentTransactionOpaqueData` reports `nullopt` for it regardless of
+  how many `xBegin` calls ref-counted up, so every `bind` made "during"
+  that no-op transaction still passes `nullopt`, exactly as if no
+  transaction existed. `attach_info_` is guaranteed populated before any
+  `xBegin` could fire on a table, since `xConnect` (which every table runs
+  before it's usable at all) always resolves it first.

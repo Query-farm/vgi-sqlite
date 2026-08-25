@@ -69,12 +69,46 @@
 // the opaque bytes themselves) isn't safe under this reuse - a narrower,
 // now-explicit version of the same caveat ScalarFunctionCaller's file
 // comment already documents about attach_opaque_data's portability.
+//
+// Transactions (Begin/Commit/RollbackTransaction, CurrentTransactionOpaqueData)
+// apply the identical "one value per key, shared across every physical
+// connection for that key" pattern to VGI's transaction_opaque_data, for
+// the same underlying reason plus a second problem specific to
+// transactions: SQLite calls a vtab module's xBegin/xCommit/xRollback once
+// per *vtab instance* per transaction (three vgi_worker tables from the
+// same catalog in one SQL transaction get three xBegin calls), but VGI's
+// catalog_transaction_begin/commit/rollback is scoped to one *(location,
+// catalog) attachment*, not one table. Begin/Commit/RollbackTransaction
+// ref-count per key: only the first Begin for a key actually calls
+// catalog_transaction_begin (skipped entirely if that catalog's
+// CatalogAttachResult.supports_transactions is false - cached alongside
+// attach_opaque_data, see AttachInfo), and only the Commit/Rollback that
+// brings the ref count back to zero actually calls catalog_transaction_
+// commit/rollback. Every operation performed *during* the transaction
+// (TableScanner::Bind, TableWriter::Write, ...) reads
+// CurrentTransactionOpaqueData(key) and threads it into its own bind/init
+// call, regardless of which physical connection that particular checkout
+// happens to be - not the specific connection Begin used, matching the
+// same reuse-across-connections precedent attach_opaque_data already set.
+//
+// Not implemented: SQLite's xSavepoint/xRelease/xRollbackTo (SAVEPOINT
+// nesting within one transaction) - VGI's transaction RPC surface has no
+// savepoint concept at all (only whole-transaction begin/commit/rollback),
+// and leaving these three vtab callbacks null is safe: SQLite simply
+// doesn't offer/use the savepoint mechanism for a vtab that doesn't
+// implement them (confirmed by every INSERT/UPDATE/DELETE test in this
+// repo passing before transactions existed at all, all of them implicitly
+// wrapped in SQLite's own per-statement transaction machinery with these
+// three left null the whole time) - ordinary single- and multi-statement
+// writes don't need them; only an explicit SQL SAVEPOINT would, and this
+// driver doesn't support that.
 #pragma once
 
 #include <exception>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -135,12 +169,52 @@ public:
     // function call) surfaces it as a SQLite error.
     Checkout Acquire(const std::string& location, const std::string& catalog_name);
 
+    // Begin/Commit/RollbackTransaction and CurrentTransactionOpaqueData:
+    // see the file comment above for the full design (shared,
+    // ref-counted per (location, catalog) key, coordinating across
+    // however many vgi_worker table instances from that pair xBegin gets
+    // called on for one SQL transaction). Called from vgi_vtab.cpp's
+    // xBegin/xCommit/xRollback. All three throw on RPC failure; the
+    // caller surfaces it as SQLite's own xBegin/xSync/xCommit/xRollback
+    // error contract expects.
+    void BeginTransaction(const std::string& location, const std::string& catalog_name);
+    void CommitTransaction(const std::string& location, const std::string& catalog_name);
+    void RollbackTransaction(const std::string& location, const std::string& catalog_name);
+
+    // The active transaction's opaque data for (location, catalog), or
+    // nullopt if no transaction is active there right now (including:
+    // never began one because that catalog doesn't support transactions).
+    // Read by TableScanner::Bind/TableWriter::Write's callers to thread
+    // into their own bind calls - see the file comment.
+    std::optional<std::vector<uint8_t>> CurrentTransactionOpaqueData(const std::string& location,
+                                                                       const std::string& catalog_name);
+
 private:
     void ReleaseInternal(const std::string& key, std::shared_ptr<PooledConnection> conn);
 
+    // Cached from the first successful Acquire() for a key - see the file
+    // comment on why every later connection for that key reuses this
+    // rather than re-attaching.
+    struct AttachInfo {
+        std::string attach_opaque_data;
+        bool supports_transactions = false;
+    };
+
+    struct TransactionState {
+        int ref_count = 0;
+        // nullopt either "no transaction began yet for this key" or
+        // "began one, but that catalog doesn't support transactions so
+        // there's genuinely no transaction_opaque_data" - both mean
+        // CurrentTransactionOpaqueData reports nullopt either way, and
+        // Commit/Rollback skip their RPC either way, so the two cases
+        // don't need to be distinguished.
+        std::optional<std::vector<uint8_t>> transaction_opaque_data;
+    };
+
     std::mutex mutex_;
     std::map<std::string, std::vector<std::shared_ptr<PooledConnection>>> idle_;  // key: location + "\0" + catalog
-    std::map<std::string, std::string> shared_attach_opaque_data_;  // same key; set on the first Acquire()
+    std::map<std::string, AttachInfo> attach_info_;                               // same key; set on the first Acquire()
+    std::map<std::string, TransactionState> transactions_;                        // same key; present only while active
 };
 
 }  // namespace vgi_sqlite

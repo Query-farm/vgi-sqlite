@@ -344,7 +344,7 @@ std::shared_ptr<arrow::Scalar> BuildArrowScalarFromSqliteValue(
         case arrow::Type::UINT32:
         case arrow::Type::UINT64: {
             if (sqlite3_value_type(value) != SQLITE_INTEGER) return nullptr;
-            auto scalar = arrow::MakeScalar(sqlite3_value_int64(value));
+            auto scalar = arrow::MakeScalar(static_cast<int64_t>(sqlite3_value_int64(value)));
             auto cast_result = scalar->CastTo(target_type);
             return cast_result.ok() ? cast_result.ValueUnsafe() : nullptr;
         }

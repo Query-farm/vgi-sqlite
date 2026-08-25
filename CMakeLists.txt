@@ -10,6 +10,20 @@ if(NOT MSVC)
 endif()
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Position-independent code, globally, before pulling in vgi-c++ (and,
+# transitively through it, vgi-rpc-c++) below: every static library this
+# repo builds or depends on - vgi_sqlite_driver, vgi-c++'s own vgi target,
+# vgi-rpc-c++'s vgi_rpc target - ends up linked into vgi_extension, a
+# MODULE (shared) library. Linux's linker refuses non-PIC object code in a
+# shared object outright ("recompile with -fPIC"); macOS's doesn't enforce
+# this the same way for a static library linked into a dylib, so every
+# build of this repo so far (all on macOS) never surfaced it. Set here,
+# globally, rather than per-target: it has to apply to vgi-c++'s and
+# vgi-rpc-c++'s own targets too, and neither of those repos' CMakeLists.txt
+# needs editing for that - a target created after this is set inherits it
+# unless it explicitly overrides POSITION_INDEPENDENT_CODE itself.
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
 # ── vgi-c++ (worker SDK, also home of the public generated protocol
 #    schemas this client links against) and, transitively through it,
 #    vgi-rpc-c++ (the Arrow-IPC RPC transport: RpcClient et al.) ──────────

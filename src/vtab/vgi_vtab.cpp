@@ -456,7 +456,8 @@ int xFilter(sqlite3_vtab_cursor* base_cursor, int, const char* idxStr, int argc,
         // lookup by name instead, which every fixture table this driver
         // has scanned so far resolves correctly through. Revisit only if
         // a real name collision across schemas turns up.
-        cursor->scanner->Bind(*vtab->table.scan_function);
+        cursor->scanner->Bind(*vtab->table.scan_function, /*schema_name=*/std::nullopt,
+                             vtab->pool->CurrentTransactionOpaqueData(vtab->location, vtab->catalog_name));
         std::vector<int64_t> projection_ids(cursor->projected_columns.begin(),
                                              cursor->projected_columns.end());
         cursor->scanner->Init(projection_ids, pushdown_filters, row_limit);
@@ -600,7 +601,8 @@ int DoInsert(VgiVtab* vtab, int argc, sqlite3_value** argv, sqlite3_int64* pRowi
         auto insert_fn =
             catalog.TableInsertFunctionGet(checkout->attach_opaque_data, vtab->schema_name, vtab->table_name);
         TableWriter writer(*vtab->pool, vtab->location, vtab->catalog_name);
-        writer.Write(insert_fn, /*schema_name=*/std::nullopt, row_result.ValueUnsafe());
+        writer.Write(insert_fn, /*schema_name=*/std::nullopt, row_result.ValueUnsafe(),
+                     vtab->pool->CurrentTransactionOpaqueData(vtab->location, vtab->catalog_name));
 
         // No real new-rowid to report: return_chunks=false means the
         // worker only echoes back a count, and even with a real
@@ -648,7 +650,7 @@ int DoUpdate(VgiVtab* vtab, int argc, sqlite3_value** argv, sqlite3_vtab* base_v
         // proposed new one, argv[1]: this driver doesn't support changing
         // a row's own identity column via UPDATE, see the plan file).
         auto row_id_field = vtab->table.columns->field(*row_id_col);
-        auto row_id_scalar = arrow::MakeScalar(sqlite3_value_int64(argv[0]));
+        auto row_id_scalar = arrow::MakeScalar(static_cast<int64_t>(sqlite3_value_int64(argv[0])));
         auto row_id_arr_result = arrow::MakeArrayFromScalar(*row_id_scalar, 1);
         if (!row_id_arr_result.ok()) {
             return SetVtabError(base_vtab, "vgi_worker: UPDATE: building rowid column: " +
@@ -666,7 +668,8 @@ int DoUpdate(VgiVtab* vtab, int argc, sqlite3_value** argv, sqlite3_vtab* base_v
         auto update_fn =
             catalog.TableUpdateFunctionGet(checkout->attach_opaque_data, vtab->schema_name, vtab->table_name);
         TableWriter writer(*vtab->pool, vtab->location, vtab->catalog_name);
-        writer.Write(update_fn, /*schema_name=*/std::nullopt, with_rowid_result.ValueUnsafe());
+        writer.Write(update_fn, /*schema_name=*/std::nullopt, with_rowid_result.ValueUnsafe(),
+                     vtab->pool->CurrentTransactionOpaqueData(vtab->location, vtab->catalog_name));
     } catch (const std::exception& e) {
         return SetVtabError(base_vtab, e.what());
     }
@@ -686,20 +689,22 @@ int DoDelete(VgiVtab* vtab, sqlite3_value** argv, sqlite3_vtab* base_vtab) {
     }
     try {
         auto row_id_field = vtab->table.columns->field(*row_id_col);
-        auto row_id_scalar = arrow::MakeScalar(sqlite3_value_int64(argv[0]));
+        auto row_id_scalar = arrow::MakeScalar(static_cast<int64_t>(sqlite3_value_int64(argv[0])));
         auto row_id_arr_result = arrow::MakeArrayFromScalar(*row_id_scalar, 1);
         if (!row_id_arr_result.ok()) {
             return SetVtabError(base_vtab, "vgi_worker: DELETE: building rowid column: " +
                                                 row_id_arr_result.status().ToString());
         }
-        auto row = arrow::RecordBatch::Make(arrow::schema({row_id_field}), 1, {row_id_arr_result.ValueUnsafe()});
+        auto row = arrow::RecordBatch::Make(arrow::schema({row_id_field}), 1,
+                                            std::vector<std::shared_ptr<arrow::Array>>{row_id_arr_result.ValueUnsafe()});
 
         auto checkout = vtab->pool->Acquire(vtab->location, vtab->catalog_name);
         VgiCatalogClient catalog(checkout->connection);
         auto delete_fn =
             catalog.TableDeleteFunctionGet(checkout->attach_opaque_data, vtab->schema_name, vtab->table_name);
         TableWriter writer(*vtab->pool, vtab->location, vtab->catalog_name);
-        writer.Write(delete_fn, /*schema_name=*/std::nullopt, row);
+        writer.Write(delete_fn, /*schema_name=*/std::nullopt, row,
+                     vtab->pool->CurrentTransactionOpaqueData(vtab->location, vtab->catalog_name));
     } catch (const std::exception& e) {
         return SetVtabError(base_vtab, e.what());
     }
@@ -722,6 +727,50 @@ int xUpdate(sqlite3_vtab* base_vtab, int argc, sqlite3_value** argv, sqlite3_int
     return DoUpdate(vtab, argc, argv, base_vtab);
 }
 
+// See connection_pool.h's file comment for the full transaction design:
+// SQLite calls xBegin/xCommit/xRollback once per *vtab instance* per
+// transaction, but VGI's catalog_transaction_begin/commit/rollback is
+// scoped to one *(location, catalog) attachment* - ConnectionPool
+// coordinates that mismatch (ref-counted per key), so these four
+// callbacks are thin passthroughs. Not implemented: xSync (VGI has no
+// two-phase pre-commit step to run - a plain SQLITE_OK no-op, with the
+// real commit work happening in xCommit) and xSavepoint/xRelease/
+// xRollbackTo (left null entirely - VGI has no savepoint-nesting RPCs at
+// all, and SQLite doesn't require a vtab to implement them for ordinary
+// single- or multi-statement transactions to work, only for explicit SQL
+// SAVEPOINT nesting, which this driver doesn't support).
+int xBegin(sqlite3_vtab* base_vtab) {
+    auto* vtab = reinterpret_cast<VgiVtab*>(base_vtab);
+    try {
+        vtab->pool->BeginTransaction(vtab->location, vtab->catalog_name);
+    } catch (const std::exception& e) {
+        return SetVtabError(base_vtab, e.what());
+    }
+    return SQLITE_OK;
+}
+
+int xSync(sqlite3_vtab*) { return SQLITE_OK; }
+
+int xCommit(sqlite3_vtab* base_vtab) {
+    auto* vtab = reinterpret_cast<VgiVtab*>(base_vtab);
+    try {
+        vtab->pool->CommitTransaction(vtab->location, vtab->catalog_name);
+    } catch (const std::exception& e) {
+        return SetVtabError(base_vtab, e.what());
+    }
+    return SQLITE_OK;
+}
+
+int xRollback(sqlite3_vtab* base_vtab) {
+    auto* vtab = reinterpret_cast<VgiVtab*>(base_vtab);
+    try {
+        vtab->pool->RollbackTransaction(vtab->location, vtab->catalog_name);
+    } catch (const std::exception& e) {
+        return SetVtabError(base_vtab, e.what());
+    }
+    return SQLITE_OK;
+}
+
 const sqlite3_module kVgiWorkerModule = {
     /* iVersion */ 0,
     /* xCreate */ xCreate,
@@ -737,10 +786,10 @@ const sqlite3_module kVgiWorkerModule = {
     /* xColumn */ xColumn,
     /* xRowid */ xRowid,
     /* xUpdate */ xUpdate,  // INSERT/UPDATE/DELETE - see xUpdate's file comment
-    /* xBegin */ nullptr,
-    /* xSync */ nullptr,
-    /* xCommit */ nullptr,
-    /* xRollback */ nullptr,
+    /* xBegin */ xBegin,
+    /* xSync */ xSync,
+    /* xCommit */ xCommit,
+    /* xRollback */ xRollback,
     /* xFindFunction */ nullptr,
     /* xRename */ nullptr,
     /* xSavepoint */ nullptr,

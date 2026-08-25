@@ -30,8 +30,14 @@ public:
     TableScanner& operator=(const TableScanner&) = delete;
 
     // bind: resolves the function's output schema for this arguments/schema
-    // shape. Must be called once before Init().
-    void Bind(const ScanFunction& scan_function, const std::optional<std::string>& schema_name = std::nullopt);
+    // shape. Must be called once before Init(). transaction_opaque_data,
+    // when set, is VGI's own transaction handle - read from
+    // ConnectionPool::CurrentTransactionOpaqueData by the caller (see
+    // connection_pool.h's file comment) when a SQL transaction is
+    // currently open on this table's (location, catalog); nullopt
+    // otherwise (including: that catalog doesn't support transactions).
+    void Bind(const ScanFunction& scan_function, const std::optional<std::string>& schema_name = std::nullopt,
+              const std::optional<std::vector<uint8_t>>& transaction_opaque_data = std::nullopt);
 
     const std::shared_ptr<arrow::Schema>& output_schema() const { return bind_.output_schema; }
 

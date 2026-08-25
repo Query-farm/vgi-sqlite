@@ -38,7 +38,7 @@ convention) or the extension path with `VGI_SQLITE_EXTENSION`.
 | Scalar functions (registration, repeated calls, mid-scan interleaving, NULL args) | ported | `test_scalar_functions.py` |
 | Writable tables: INSERT, UPDATE, DELETE | ported | `test_writes.py` |
 | Aggregate functions (whole-table, GROUP BY, nullary, empty group) | ported | `test_aggregates.py` |
-| Transactions | not yet implemented (deferred - see the plan file's Milestone 4 status) | — |
+| Transactions (commit, rollback, multi-table coordination, sequential, non-transactional catalogs) | ported | `test_transactions.py` |
 | Windowed aggregates (SQL OVER clause) | not applicable (VGI's window RPC family is structurally separate - see `aggregate_caller.h`) | — |
 | Bearer/OAuth auth | not applicable yet (Milestone 3/4) | — |
 

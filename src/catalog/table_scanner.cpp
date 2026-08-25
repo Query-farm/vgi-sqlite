@@ -113,7 +113,8 @@ TableScanner::~TableScanner() {
     }
 }
 
-void TableScanner::Bind(const ScanFunction& scan_function, const std::optional<std::string>& schema_name) {
+void TableScanner::Bind(const ScanFunction& scan_function, const std::optional<std::string>& schema_name,
+                        const std::optional<std::vector<uint8_t>>& transaction_opaque_data) {
     std::string flat_bytes(scan_function.arguments_ipc_bytes.begin(), scan_function.arguments_ipc_bytes.end());
     auto flat_args = wire::decode_ipc(flat_bytes);
     // ScanFunctionResultSchema.arguments decodes to a *flat* batch (one
@@ -126,7 +127,7 @@ void TableScanner::Bind(const ScanFunction& scan_function, const std::optional<s
                                    /*function_type=*/"TABLE",
                                    /*input_schema_bytes=*/std::nullopt, /*settings_bytes=*/std::nullopt,
                                    /*secrets_bytes=*/std::nullopt, to_bytes(attach_opaque_data_),
-                                   /*transaction_opaque_data=*/std::nullopt,
+                                   transaction_opaque_data,
                                    /*resolved_secrets_provided=*/false, schema_name);
     bind_call_bytes_ = to_bytes(wire::encode_ipc(inner));
     auto params = gen::BuildBindParams(bind_call_bytes_);

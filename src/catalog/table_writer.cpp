@@ -29,7 +29,8 @@ TableWriter::TableWriter(ConnectionPool& pool, std::string location, std::string
 
 int64_t TableWriter::Write(const ScanFunction& write_function,
                            const std::optional<std::string>& schema_name,
-                           const std::shared_ptr<arrow::RecordBatch>& input_row) {
+                           const std::shared_ptr<arrow::RecordBatch>& input_row,
+                           const std::optional<std::vector<uint8_t>>& transaction_opaque_data) {
     auto checkout = pool_.Acquire(location_, catalog_name_);
 
     // return_chunks=false, on_conflict="throw": see the header's file
@@ -44,7 +45,7 @@ int64_t TableWriter::Write(const ScanFunction& write_function,
     auto bind_inner = BuildBindRequest(write_function.function_name, args_bytes, /*function_type=*/"TABLE",
                                        input_schema_bytes, /*settings_bytes=*/std::nullopt,
                                        /*secrets_bytes=*/std::nullopt, to_bytes(checkout->attach_opaque_data),
-                                       /*transaction_opaque_data=*/std::nullopt,
+                                       transaction_opaque_data,
                                        /*resolved_secrets_provided=*/false, schema_name);
     auto bind_call_bytes = to_bytes(wire::encode_ipc(bind_inner));
     auto bind_params = gen::BuildBindParams(bind_call_bytes);

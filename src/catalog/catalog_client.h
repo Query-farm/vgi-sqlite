@@ -139,6 +139,19 @@ public:
     // Binary-kind method like TableScanFunctionGet, not a Result-kind one.
     ScanFunction TableInsertFunctionGet(const std::string& attach_opaque_data,
                                          const std::string& schema_name, const std::string& table_name);
+    // Transaction lifecycle - only meaningful for a catalog whose
+    // CatalogAttachResult.supports_transactions is true; see
+    // connection_pool.h's Begin/Commit/RollbackTransaction, which gate on
+    // that and coordinate these calls across every vgi_worker table
+    // instance sharing one (location, catalog) transaction (SQLite calls
+    // xBegin/xCommit/xRollback once per vtab instance, VGI's transaction
+    // RPCs are scoped to the whole attachment - a mismatch this driver's
+    // caller resolves, not this client).
+    std::optional<std::vector<uint8_t>> TransactionBegin(const std::string& attach_opaque_data);
+    void TransactionCommit(const std::string& attach_opaque_data, const std::vector<uint8_t>& transaction_opaque_data);
+    void TransactionRollback(const std::string& attach_opaque_data,
+                              const std::vector<uint8_t>& transaction_opaque_data);
+
     ScanFunction TableUpdateFunctionGet(const std::string& attach_opaque_data,
                                          const std::string& schema_name, const std::string& table_name);
     ScanFunction TableDeleteFunctionGet(const std::string& attach_opaque_data,

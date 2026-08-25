@@ -79,6 +79,26 @@ CatalogAttachResult VgiCatalogClient::Attach(const std::string& catalog_name,
     return attach;
 }
 
+std::optional<std::vector<uint8_t>> VgiCatalogClient::TransactionBegin(const std::string& attach_opaque_data) {
+    auto params = gen::BuildCatalogTransactionBeginParams(to_bytes(attach_opaque_data));
+    auto result = Call(connection_, "catalog_transaction_begin", params);
+    auto opaque = wire::get_optional_binary(result, "transaction_opaque_data");
+    if (!opaque) return std::nullopt;
+    return to_bytes(*opaque);
+}
+
+void VgiCatalogClient::TransactionCommit(const std::string& attach_opaque_data,
+                                          const std::vector<uint8_t>& transaction_opaque_data) {
+    auto params = gen::BuildCatalogTransactionCommitParams(to_bytes(attach_opaque_data), transaction_opaque_data);
+    Call(connection_, "catalog_transaction_commit", params);
+}
+
+void VgiCatalogClient::TransactionRollback(const std::string& attach_opaque_data,
+                                            const std::vector<uint8_t>& transaction_opaque_data) {
+    auto params = gen::BuildCatalogTransactionRollbackParams(to_bytes(attach_opaque_data), transaction_opaque_data);
+    Call(connection_, "catalog_transaction_rollback", params);
+}
+
 std::vector<std::string> VgiCatalogClient::Catalogs() {
     auto params = gen::BuildCatalogCatalogsParams();
     auto result = Call(connection_, "catalog_catalogs", params);
