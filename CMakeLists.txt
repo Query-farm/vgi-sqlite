@@ -34,7 +34,36 @@ find_package(Arrow CONFIG REQUIRED)
 find_package(ArrowCompute CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
 
-# ── The driver ──────────────────────────────────────────────────────────
+# ── SQLite (the local, pinned build scripts/fetch_sqlite.sh produces) ─────
+#
+# Not vcpkg/find_package(SQLite3): the driver needs a recent SQLite (JSON,
+# xBestIndex LIMIT/OFFSET, generated columns) built with extension loading
+# enabled, and the system/package-manager SQLite is neither reliably recent
+# nor reliably built that way. See scripts/fetch_sqlite.sh's own comment.
+#
+# Two consumers, two different relationships to it:
+#   * vgi_extension (the loadable .so/.dylib) needs only sqlite3ext.h's
+#     *headers* - every sqlite3_* call it makes resolves dynamically
+#     through the host process's own function table (SQLITE_EXTENSION_INIT,
+#     see extension.cpp's file comment). It must NOT link libsqlite3.a: two
+#     independently-initialized copies of SQLite's process-global state in
+#     one process crash on load, even same-version.
+#   * Anything that IS its own process (tools/, tests/) links the real
+#     static library directly - there's no host to dispatch through.
+set(VGI_SQLITE_THIRD_PARTY_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/sqlite")
+if(NOT EXISTS "${VGI_SQLITE_THIRD_PARTY_DIR}/sqlite3.h")
+    message(FATAL_ERROR
+        "Local SQLite not found at ${VGI_SQLITE_THIRD_PARTY_DIR}.\n"
+        "Run scripts/fetch_sqlite.sh first.")
+endif()
+add_library(sqlite3 STATIC IMPORTED)
+set_target_properties(sqlite3 PROPERTIES
+    IMPORTED_LOCATION "${VGI_SQLITE_THIRD_PARTY_DIR}/libsqlite3.a"
+    INTERFACE_INCLUDE_DIRECTORIES "${VGI_SQLITE_THIRD_PARTY_DIR}"
+)
+add_library(SQLite::SQLite3 ALIAS sqlite3)
+
+# ── The driver: pure VGI client logic, no SQLite dependency ───────────────
 add_library(vgi_sqlite_driver
     src/rpc/vgi_connection.cpp
     src/wire/wire_builders.cpp
@@ -53,6 +82,25 @@ target_include_directories(vgi_sqlite_driver PUBLIC
 # vgi::vgi carries vgi-rpc-c++'s RpcClient (transport) and vgi-c++'s public
 # include/vgi/generated/ protocol schemas as PUBLIC transitive dependencies.
 target_link_libraries(vgi_sqlite_driver PUBLIC vgi::vgi nlohmann_json::nlohmann_json)
+
+# ── The loadable extension itself (.load ./vgi in a sqlite3 session) ──────
+#
+# type_mapping.cpp and vgi_vtab.cpp are built here, not into
+# vgi_sqlite_driver above: they're the two files that call sqlite3_*
+# directly, and they need this target's SQLITE_EXTENSION_INIT wiring
+# (headers only, no linked library - see the SQLite section's comment).
+add_library(vgi_extension MODULE
+    src/extension.cpp
+    src/types/type_mapping.cpp
+    src/vtab/vgi_vtab.cpp
+    src/vtab/connection_pool.cpp
+)
+target_link_libraries(vgi_extension PRIVATE vgi_sqlite::driver)
+target_include_directories(vgi_extension PRIVATE "${VGI_SQLITE_THIRD_PARTY_DIR}")
+set_target_properties(vgi_extension PROPERTIES
+    OUTPUT_NAME vgi
+    PREFIX ""              # SQLite's .load expects "vgi", not "libvgi"
+)
 
 # ── Dev tools (proof-of-connection binaries, not shipped) ─────────────────
 add_subdirectory(tools)

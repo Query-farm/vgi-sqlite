@@ -73,6 +73,27 @@ std::vector<uint8_t> WrapAsArgsStruct(const std::shared_ptr<arrow::RecordBatch>&
 TableScanner::TableScanner(VgiConnection& connection, std::string attach_opaque_data)
     : connection_(connection), attach_opaque_data_(std::move(attach_opaque_data)) {}
 
+TableScanner::~TableScanner() {
+    // vgi_rpc::RpcClient is single-call-at-a-time: a live ClientStream
+    // reserves the connection until explicitly closed/cancelled, and
+    // "destruction never drains: abandoning a live stream aborts its
+    // connection instead" (vgi_rpc/client.h) - including one that already
+    // reached natural end-of-stream via Next() returning nullopt, which
+    // marks the *stream* finished but doesn't itself release the
+    // connection's call slot. Skipping this close broke every query after
+    // the first on a pooled (shared) connection with "RPC client is
+    // closed" - found by testing two SELECTs against the same table in
+    // one session, not documented anywhere read ahead of time.
+    if (stream_) {
+        try {
+            stream_->close();
+        } catch (...) {
+            // Best-effort: a connection already broken for other reasons
+            // shouldn't turn a cursor teardown into a crash.
+        }
+    }
+}
+
 void TableScanner::Bind(const ScanFunction& scan_function, const std::optional<std::string>& schema_name) {
     std::string flat_bytes(scan_function.arguments_ipc_bytes.begin(), scan_function.arguments_ipc_bytes.end());
     auto flat_args = wire::decode_ipc(flat_bytes);

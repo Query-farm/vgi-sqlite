@@ -21,6 +21,13 @@ namespace vgi_sqlite {
 class TableScanner {
 public:
     TableScanner(VgiConnection& connection, std::string attach_opaque_data);
+    // Explicitly closes any live stream (see the .cpp: an abandoned,
+    // never-closed ClientStream aborts the whole shared connection on
+    // destruction, per vgi-rpc-c++'s contract - even one that already
+    // reached natural end-of-stream via Next() returning nullopt).
+    ~TableScanner();
+    TableScanner(const TableScanner&) = delete;
+    TableScanner& operator=(const TableScanner&) = delete;
 
     // bind: resolves the function's output schema for this arguments/schema
     // shape. Must be called once before Init().
