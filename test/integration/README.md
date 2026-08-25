@@ -29,8 +29,9 @@ convention) or the extension path with `VGI_SQLITE_EXTENSION`.
 | `vgi_attach()` discovery, auto-created virtual tables | ported | `test_attach.py` |
 | Full-scan correctness (`SELECT`, `LIMIT`, `WHERE`, `count(*)`) | ported | `test_scan.py` |
 | Connection pooling (repeated/concurrent-table scans on one worker) | ported | `test_scan.py` |
+| Projection pushdown (correct columns, incl. functions that ignore it) | ported | `test_pushdown.py` |
 | Type mapping (per Arrow type -> SQLite storage class) | not yet ported | — |
-| Filter/projection pushdown | not applicable yet (Milestone 3, no `xBestIndex` pushdown) | — |
+| Filter (WHERE-constraint) pushdown | not yet implemented (`xBestIndex` doesn't push constraints yet) | — |
 | Protocol version mismatch | not yet ported | — |
 | Scalar functions | not applicable yet (Milestone 3) | — |
 | Writable tables, transactions, aggregates | not applicable yet (Milestone 4) | — |

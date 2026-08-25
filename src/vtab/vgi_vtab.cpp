@@ -1,12 +1,14 @@
 // © Copyright 2026 Query Farm LLC - https://query.farm
 #include "vtab/vgi_vtab.h"
 
+#include <algorithm>
 #include <cstring>
 #include <map>
 #include <memory>
 #include <optional>
 #include <sstream>
 #include <string>
+#include <vector>
 
 // sqlite3ext.h + INIT3, not plain sqlite3.h: this file is only ever
 // compiled into the vgi_extension loadable module, which must resolve
@@ -73,7 +75,35 @@ struct VgiCursor {
     int64_t row_in_batch = 0;
     int64_t rowid = 0;
     bool eof = false;
+    // The declared-table column indices actually fetched over the wire,
+    // in fetch order, when xBestIndex found a real (not "select *")
+    // column subset - empty means "every column", the common case. Set
+    // from xFilter's idxStr; xColumn needs it to translate a declared
+    // column index into its position within the (narrower) fetched batch.
+    std::vector<int> projected_columns;
 };
+
+// idxStr encodes xBestIndex's chosen projection as a comma-separated list
+// of declared column indices (SQLite frees it via sqlite3_free per
+// needToFreeIdxStr - built with sqlite3_mprintf for exactly that reason).
+// Empty string means "no real subset - fetch every column".
+std::string EncodeProjection(const std::vector<int>& columns) {
+    std::string out;
+    for (size_t i = 0; i < columns.size(); ++i) {
+        if (i) out += ',';
+        out += std::to_string(columns[i]);
+    }
+    return out;
+}
+
+std::vector<int> DecodeProjection(const char* idxStr) {
+    std::vector<int> columns;
+    if (!idxStr || !*idxStr) return columns;
+    std::istringstream iss(idxStr);
+    std::string token;
+    while (std::getline(iss, token, ',')) columns.push_back(std::stoi(token));
+    return columns;
+}
 
 int SetVtabError(sqlite3_vtab* vtab, const std::string& message) {
     if (vtab->zErrMsg) sqlite3_free(vtab->zErrMsg);
@@ -155,13 +185,38 @@ int xDisconnect(sqlite3_vtab* vtab) {
 // disconnecting.
 int xDestroy(sqlite3_vtab* vtab) { return xDisconnect(vtab); }
 
-int xBestIndex(sqlite3_vtab*, sqlite3_index_info* info) {
-    // MVP: no constraint/order pushdown yet - always a full scan. Cost is
+int xBestIndex(sqlite3_vtab* base_vtab, sqlite3_index_info* info) {
+    // MVP: no WHERE-constraint/ORDER BY pushdown yet - every row is
+    // fetched and SQLite applies WHERE/ORDER BY itself, always correct
+    // just not as cheap as it could be (Milestone 3 follow-up). Cost is
     // deliberately high-ish (SQLite compares plans across joined tables)
     // so a table with a real cardinality estimate can out-rank this once
-    // that's wired through (see the plan's Phase 3).
+    // that's wired through.
     info->estimatedCost = 1'000'000.0;
     info->estimatedRows = 1'000'000;
+
+    // Projection pushdown: colUsed's low 63 bits name individual declared
+    // columns actually referenced by this query; bit 63 stands for "column
+    // 63 and every higher-numbered column" too (sqlite3.h's own doc
+    // comment on the field). A table with <=63 columns - true of every
+    // fixture table seen so far - gets an exact subset; wider tables
+    // degrade gracefully to "fetch everything" rather than fetching the
+    // wrong columns, since colUsed can't distinguish "column 70" from
+    // "column 90" once collapsed into bit 63.
+    auto* vtab = reinterpret_cast<VgiVtab*>(base_vtab);
+    const int num_columns = vtab->table.columns ? vtab->table.columns->num_fields() : 0;
+    std::vector<int> projected;
+    if (num_columns > 0 && num_columns <= 63 && (info->colUsed & (1ULL << 63)) == 0) {
+        for (int i = 0; i < num_columns; ++i) {
+            if (info->colUsed & (1ULL << i)) projected.push_back(i);
+        }
+        // Every column referenced anyway (a real "SELECT *"): don't
+        // bother encoding a subset that isn't one.
+        if (static_cast<int>(projected.size()) == num_columns) projected.clear();
+    }
+    auto encoded = EncodeProjection(projected);
+    info->idxStr = sqlite3_mprintf("%s", encoded.c_str());
+    info->needToFreeIdxStr = 1;
     return SQLITE_OK;
 }
 
@@ -190,9 +245,10 @@ void AdvanceBatch(VgiCursor* cursor) {
     cursor->row_in_batch = 0;
 }
 
-int xFilter(sqlite3_vtab_cursor* base_cursor, int, const char*, int, sqlite3_value**) {
+int xFilter(sqlite3_vtab_cursor* base_cursor, int, const char* idxStr, int, sqlite3_value**) {
     auto* cursor = reinterpret_cast<VgiCursor*>(base_cursor);
     auto* vtab = reinterpret_cast<VgiVtab*>(base_cursor->pVtab);
+    cursor->projected_columns = DecodeProjection(idxStr);
     try {
         cursor->scanner =
             std::make_unique<TableScanner>(vtab->pooled->connection, vtab->pooled->attach_opaque_data);
@@ -201,7 +257,9 @@ int xFilter(sqlite3_vtab_cursor* base_cursor, int, const char*, int, sqlite3_val
                                  "table has no scan_function (fallback RPC not wired into the vtab yet)");
         }
         cursor->scanner->Bind(*vtab->table.scan_function, vtab->table.schema_name);
-        cursor->scanner->Init();
+        std::vector<int64_t> projection_ids(cursor->projected_columns.begin(),
+                                             cursor->projected_columns.end());
+        cursor->scanner->Init(projection_ids);
     } catch (const std::exception& e) {
         return SetVtabError(base_cursor->pVtab, e.what());
     }
@@ -230,11 +288,39 @@ int xEof(sqlite3_vtab_cursor* base_cursor) {
 
 int xColumn(sqlite3_vtab_cursor* base_cursor, sqlite3_context* ctx, int col_idx) {
     auto* cursor = reinterpret_cast<VgiCursor*>(base_cursor);
-    if (!cursor->current_batch || col_idx < 0 || col_idx >= cursor->current_batch->num_columns()) {
+    if (!cursor->current_batch) {
         sqlite3_result_null(ctx);
         return SQLITE_OK;
     }
-    SetSqliteResultFromArrow(ctx, *cursor->current_batch->column(col_idx), cursor->row_in_batch);
+    // When a projection was requested AND the worker actually honored it,
+    // the returned batch has only the requested columns, in request order
+    // - translate the declared-table column index into its position
+    // there. Checked against the batch's own width, not just "did we ask
+    // for one": a function that doesn't declare projection_pushdown
+    // support silently ignores InitRequest.projection_ids and returns
+    // every column anyway (observed against vgi-fixture-worker's
+    // cache_multicol - not documented anywhere read ahead of time, and
+    // trusting the request without checking read the wrong column
+    // outright). Width-matching the actual response is the only way to
+    // tell honored-projection from ignored-projection from here.
+    int position = col_idx;
+    if (!cursor->projected_columns.empty() &&
+        cursor->current_batch->num_columns() == static_cast<int>(cursor->projected_columns.size())) {
+        auto it =
+            std::find(cursor->projected_columns.begin(), cursor->projected_columns.end(), col_idx);
+        if (it == cursor->projected_columns.end()) {
+            // SQLite asked for a column it told xBestIndex it didn't need -
+            // shouldn't happen, but null beats reading the wrong column.
+            sqlite3_result_null(ctx);
+            return SQLITE_OK;
+        }
+        position = static_cast<int>(it - cursor->projected_columns.begin());
+    }
+    if (position < 0 || position >= cursor->current_batch->num_columns()) {
+        sqlite3_result_null(ctx);
+        return SQLITE_OK;
+    }
+    SetSqliteResultFromArrow(ctx, *cursor->current_batch->column(position), cursor->row_in_batch);
     return SQLITE_OK;
 }
 
