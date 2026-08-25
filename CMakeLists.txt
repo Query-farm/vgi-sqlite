@@ -41,6 +41,8 @@ add_library(vgi_sqlite_driver
     src/wire/wire_readers.cpp
     src/catalog/catalog_requests.cpp
     src/catalog/catalog_client.cpp
+    src/catalog/scan_requests.cpp
+    src/catalog/table_scanner.cpp
 )
 add_library(vgi_sqlite::driver ALIAS vgi_sqlite_driver)
 

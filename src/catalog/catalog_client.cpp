@@ -47,10 +47,18 @@ CatalogTable ParseTableInfo(const std::string& schema_name_fallback,
     table.supports_delete = wire::get_bool(info, "supports_delete");
     if (auto v = wire::get_optional_int64(info, "cardinality_estimate")) table.cardinality_estimate = *v;
     if (auto v = wire::get_optional_int64(info, "cardinality_max")) table.cardinality_max = *v;
+    if (auto scan_fn = wire::get_ipc(info, "scan_function")) table.scan_function = ParseScanFunction(scan_fn);
     return table;
 }
 
 }  // namespace
+
+ScanFunction ParseScanFunction(const std::shared_ptr<arrow::RecordBatch>& scan_function_info) {
+    ScanFunction fn;
+    fn.function_name = wire::get_string(scan_function_info, "function_name");
+    fn.arguments_ipc_bytes = to_bytes(wire::get_binary(scan_function_info, "arguments"));
+    return fn;
+}
 
 CatalogAttachResult VgiCatalogClient::Attach(const std::string& catalog_name,
                                               const std::optional<std::string>& data_version_spec,
@@ -115,7 +123,25 @@ CatalogTable VgiCatalogClient::TableGet(const std::string& attach_opaque_data,
         throw std::runtime_error("catalog_table_get: no such table '" + schema_name + "." +
                                   table_name + "'");
     }
-    return ParseTableInfo(schema_name, items.front());
+    auto table = ParseTableInfo(schema_name, items.front());
+    if (!table.scan_function) {
+        table.scan_function = TableScanFunctionGet(attach_opaque_data, schema_name, table_name);
+    }
+    return table;
+}
+
+ScanFunction VgiCatalogClient::TableScanFunctionGet(const std::string& attach_opaque_data,
+                                                     const std::string& schema_name,
+                                                     const std::string& table_name) {
+    auto params = gen::BuildCatalogTableScanFunctionGetParams(
+        to_bytes(attach_opaque_data), schema_name, table_name, /*at_unit=*/std::nullopt,
+        /*at_value=*/std::nullopt, /*transaction_opaque_data=*/std::nullopt);
+    // catalog_table_scan_function_get is a Binary-kind method: the outer
+    // envelope's "result" bytes are the ScanFunctionResult payload
+    // directly - mechanically identical to Call()'s Result-kind unwrap
+    // (both are "binary field holding one IPC stream"), so it's reused.
+    auto result = Call(connection_, "catalog_table_scan_function_get", params);
+    return ParseScanFunction(result);
 }
 
 }  // namespace vgi_sqlite

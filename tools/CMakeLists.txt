@@ -13,3 +13,8 @@ target_link_libraries(vgi-describe-worker PRIVATE vgi_sqlite::driver)
 # Milestone-2 proof of the catalog-discovery RPCs end to end.
 add_executable(vgi-catalog-probe catalog_probe.cpp)
 target_link_libraries(vgi-catalog-probe PRIVATE vgi_sqlite::driver)
+
+# scan_probe: binds/inits/scans one table and prints its rows - the
+# Milestone-2 proof of the bind->init->producer-tick data path.
+add_executable(vgi-scan-probe scan_probe.cpp)
+target_link_libraries(vgi-scan-probe PRIVATE vgi_sqlite::driver)

@@ -23,11 +23,21 @@
 
 namespace vgi_sqlite {
 
+// Which table function to bind/init/scan to read a table's rows, and the
+// pre-encoded (fixed, worker-chosen) arguments to bind it with. A VGI
+// "table" doesn't scan itself - TableInfo.scan_function names the actual
+// scan; decoded from ScanFunctionResultSchema.
+struct ScanFunction {
+    std::string function_name;
+    std::vector<uint8_t> arguments_ipc_bytes;
+};
+
+ScanFunction ParseScanFunction(const std::shared_ptr<arrow::RecordBatch>& scan_function_info);
+
 // A worker table, as much of TableInfo as the read-only scan path needs.
 // Deliberately trimmed from vgi-c++'s worker-authoring CatalogTable
-// (include/vgi/catalog.h): no scan_function/branches/inline_scan - those
-// are worker-internal wiring a client never populates, only consumes via
-// separate RPCs (catalog_table_scan_function_get) when not inlined.
+// (include/vgi/catalog.h): no branches/inline_scan - those are worker-
+// internal wiring a client never populates.
 struct CatalogTable {
     std::string name;
     std::string schema_name;
@@ -39,6 +49,11 @@ struct CatalogTable {
     bool supports_delete = false;
     int64_t cardinality_estimate = -1;  // -1 = unknown
     int64_t cardinality_max = -1;       // -1 = unknown
+    // Present when TableInfo inlined it (the common case - skips a
+    // separate catalog_table_scan_function_get round trip). Falling back
+    // to that RPC when absent is not yet implemented (all fixture tables
+    // observed so far inline it).
+    std::optional<ScanFunction> scan_function;
 };
 
 struct CatalogSchema {
@@ -81,6 +96,11 @@ public:
 
     CatalogTable TableGet(const std::string& attach_opaque_data, const std::string& schema_name,
                           const std::string& table_name);
+
+    // Fallback for a table whose TableInfo didn't inline scan_function
+    // (CatalogTable::scan_function is nullopt).
+    ScanFunction TableScanFunctionGet(const std::string& attach_opaque_data,
+                                       const std::string& schema_name, const std::string& table_name);
 
 private:
     VgiConnection& connection_;
