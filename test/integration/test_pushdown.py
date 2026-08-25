@@ -34,3 +34,18 @@ def test_two_column_select_returns_correct_columns_in_order(
 
     a_c = conn.execute('SELECT a, c FROM "data.cache_multicol" ORDER BY a LIMIT 3').fetchall()
     assert [(r[0], r[1]) for r in a_c] == [(row[0], row[2]) for row in full_rows]
+
+
+def test_where_equality_is_actually_pushed_down(conn: sqlite3.Connection, worker_location: str) -> None:
+    """data.filter_echo_table (vgi-fixture-worker) echoes back the filters
+    it actually received in its own pushed_filters column - the only
+    reliable way to tell "the worker received this filter" from
+    "SQLite just filtered the full scan itself and got the right answer
+    either way". Also a real cross-schema bind regression test: this
+    table's backing function is registered under schema "main" while the
+    table itself lives in "data" - see vgi_vtab.cpp's xFilter comment."""
+    _attach(conn, worker_location)
+    (echoed,) = conn.execute(
+        'SELECT DISTINCT pushed_filters FROM "data.filter_echo_table" WHERE n = 5'
+    ).fetchone()
+    assert "n" in echoed and "5" in echoed, f"filter wasn't pushed down: pushed_filters={echoed!r}"

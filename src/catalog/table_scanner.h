@@ -36,8 +36,14 @@ public:
     const std::shared_ptr<arrow::Schema>& output_schema() const { return bind_.output_schema; }
 
     // init: opens the producer stream. projection_ids, if non-empty, asks
-    // the worker to emit only those column indices (into output_schema()).
-    void Init(const std::vector<int64_t>& projection_ids = {});
+    // the worker to emit only those column indices (into output_schema());
+    // pushdown_filters, if set, is an IPC-encoded WHERE-constraint batch
+    // in VGI's hybrid JSON+Arrow format (see vtab/filter_pushdown.h) -
+    // neither is a correctness guarantee, only a hint a function may
+    // ignore (see xColumn's width-check comment in vgi_vtab.cpp for what
+    // that means for projection in practice).
+    void Init(const std::vector<int64_t>& projection_ids = {},
+              const std::optional<std::string>& pushdown_filters = std::nullopt);
 
     // Pull the next output batch, or nullopt when the scan is exhausted.
     std::optional<std::shared_ptr<arrow::RecordBatch>> Next();

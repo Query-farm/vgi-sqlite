@@ -136,14 +136,15 @@ void TableScanner::Bind(const ScanFunction& scan_function, const std::optional<s
     bind_.opaque_data = parsed.opaque_data;
 }
 
-void TableScanner::Init(const std::vector<int64_t>& projection_ids) {
+void TableScanner::Init(const std::vector<int64_t>& projection_ids,
+                        const std::optional<std::string>& pushdown_filters) {
     if (!bind_.output_schema) throw std::runtime_error("TableScanner::Init called before Bind");
     auto output_schema_bytes = to_bytes(wire::encode_schema(bind_.output_schema));
     auto inner = BuildInitRequest(bind_call_bytes_, output_schema_bytes,
                                    bind_.opaque_data.empty()
                                        ? std::nullopt
                                        : std::optional<std::vector<uint8_t>>(bind_.opaque_data),
-                                   projection_ids);
+                                   projection_ids, pushdown_filters);
     auto init_bytes = to_bytes(wire::encode_ipc(inner));
     auto params = gen::BuildInitParams(init_bytes);
     // init is the one Stream-kind method: it returns a GlobalInitResponse

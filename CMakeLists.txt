@@ -94,6 +94,7 @@ add_library(vgi_extension MODULE
     src/types/type_mapping.cpp
     src/vtab/vgi_vtab.cpp
     src/vtab/connection_pool.cpp
+    src/vtab/filter_pushdown.cpp
 )
 target_link_libraries(vgi_extension PRIVATE vgi_sqlite::driver)
 target_include_directories(vgi_extension PRIVATE "${VGI_SQLITE_THIRD_PARTY_DIR}")

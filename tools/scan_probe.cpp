@@ -40,7 +40,9 @@ int main(int argc, char** argv) {
         }
 
         vgi_sqlite::TableScanner scanner(conn, attach.attach_opaque_data);
-        scanner.Bind(*table.scan_function, schema_name);
+        // Not schema_name: see vgi_vtab.cpp's xFilter comment on why the
+        // backing function's schema isn't assumed to match the table's.
+        scanner.Bind(*table.scan_function);
         std::printf("bind resolved output schema: %s\n", scanner.output_schema()->ToString().c_str());
         scanner.Init();
 

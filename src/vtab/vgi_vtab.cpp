@@ -24,6 +24,7 @@ SQLITE_EXTENSION_INIT3
 #include "catalog/table_scanner.h"
 #include "types/type_mapping.h"
 #include "vtab/connection_pool.h"
+#include "vtab/filter_pushdown.h"
 
 namespace vgi_sqlite {
 namespace {
@@ -83,26 +84,58 @@ struct VgiCursor {
     std::vector<int> projected_columns;
 };
 
-// idxStr encodes xBestIndex's chosen projection as a comma-separated list
-// of declared column indices (SQLite frees it via sqlite3_free per
-// needToFreeIdxStr - built with sqlite3_mprintf for exactly that reason).
-// Empty string means "no real subset - fetch every column".
-std::string EncodeProjection(const std::vector<int>& columns) {
-    std::string out;
-    for (size_t i = 0; i < columns.size(); ++i) {
+// idxStr is xBestIndex's only channel to xFilter (SQLite frees it via
+// sqlite3_free per needToFreeIdxStr - built with sqlite3_mprintf for
+// exactly that reason), so it carries both pushdown decisions: the
+// projected column list, and the pushed-down WHERE constraints (in
+// argvIndex order, so position i here lines up with xFilter's argv[i]) -
+// format "P<cols>|C<col>:<op>,...", either half empty when there's
+// nothing to push for it.
+std::string EncodeIdxStr(const std::vector<int>& projected_columns,
+                          const std::vector<PushableConstraint>& constraints) {
+    std::string out = "P";
+    for (size_t i = 0; i < projected_columns.size(); ++i) {
         if (i) out += ',';
-        out += std::to_string(columns[i]);
+        out += std::to_string(projected_columns[i]);
+    }
+    out += "|C";
+    for (size_t i = 0; i < constraints.size(); ++i) {
+        if (i) out += ',';
+        out += std::to_string(constraints[i].column_index) + ':' + std::to_string(constraints[i].op);
     }
     return out;
 }
 
-std::vector<int> DecodeProjection(const char* idxStr) {
-    std::vector<int> columns;
-    if (!idxStr || !*idxStr) return columns;
-    std::istringstream iss(idxStr);
-    std::string token;
-    while (std::getline(iss, token, ',')) columns.push_back(std::stoi(token));
-    return columns;
+struct DecodedIdxStr {
+    std::vector<int> projected_columns;
+    std::vector<PushableConstraint> constraints;
+};
+
+DecodedIdxStr DecodeIdxStr(const char* idxStr) {
+    DecodedIdxStr decoded;
+    if (!idxStr) return decoded;
+    std::string s(idxStr);
+    auto bar = s.find('|');
+    std::string proj = (bar == std::string::npos) ? "" : s.substr(1, bar - 1);
+    std::string cons = (bar == std::string::npos) ? "" : s.substr(bar + 2);  // skip "|C"
+
+    if (!proj.empty()) {
+        std::istringstream iss(proj);
+        std::string token;
+        while (std::getline(iss, token, ',')) decoded.projected_columns.push_back(std::stoi(token));
+    }
+    if (!cons.empty()) {
+        std::istringstream iss(cons);
+        std::string token;
+        while (std::getline(iss, token, ',')) {
+            auto colon = token.find(':');
+            if (colon == std::string::npos) continue;
+            decoded.constraints.push_back(
+                {std::stoi(token.substr(0, colon)),
+                 static_cast<unsigned char>(std::stoi(token.substr(colon + 1)))});
+        }
+    }
+    return decoded;
 }
 
 int SetVtabError(sqlite3_vtab* vtab, const std::string& message) {
@@ -186,12 +219,11 @@ int xDisconnect(sqlite3_vtab* vtab) {
 int xDestroy(sqlite3_vtab* vtab) { return xDisconnect(vtab); }
 
 int xBestIndex(sqlite3_vtab* base_vtab, sqlite3_index_info* info) {
-    // MVP: no WHERE-constraint/ORDER BY pushdown yet - every row is
-    // fetched and SQLite applies WHERE/ORDER BY itself, always correct
-    // just not as cheap as it could be (Milestone 3 follow-up). Cost is
-    // deliberately high-ish (SQLite compares plans across joined tables)
-    // so a table with a real cardinality estimate can out-rank this once
-    // that's wired through.
+    // No ORDER BY/LIMIT pushdown yet - SQLite still sorts/limits itself,
+    // always correct just not as cheap as it could be (later Milestone-3
+    // follow-up). Cost is deliberately high-ish (SQLite compares plans
+    // across joined tables) so a table with a real cardinality estimate
+    // can out-rank this once that's wired through.
     info->estimatedCost = 1'000'000.0;
     info->estimatedRows = 1'000'000;
 
@@ -214,7 +246,14 @@ int xBestIndex(sqlite3_vtab* base_vtab, sqlite3_index_info* info) {
         // bother encoding a subset that isn't one.
         if (static_cast<int>(projected.size()) == num_columns) projected.clear();
     }
-    auto encoded = EncodeProjection(projected);
+
+    // WHERE-constraint pushdown (see vtab/filter_pushdown.h) - claims
+    // argvIndex for each pushable constraint but never sets .omit, so
+    // SQLite always re-checks correctness itself regardless of whether
+    // the worker actually applies the filter.
+    auto constraints = SelectPushableConstraints(info);
+
+    auto encoded = EncodeIdxStr(projected, constraints);
     info->idxStr = sqlite3_mprintf("%s", encoded.c_str());
     info->needToFreeIdxStr = 1;
     return SQLITE_OK;
@@ -245,10 +284,18 @@ void AdvanceBatch(VgiCursor* cursor) {
     cursor->row_in_batch = 0;
 }
 
-int xFilter(sqlite3_vtab_cursor* base_cursor, int, const char* idxStr, int, sqlite3_value**) {
+int xFilter(sqlite3_vtab_cursor* base_cursor, int, const char* idxStr, int argc, sqlite3_value** argv) {
     auto* cursor = reinterpret_cast<VgiCursor*>(base_cursor);
     auto* vtab = reinterpret_cast<VgiVtab*>(base_cursor->pVtab);
-    cursor->projected_columns = DecodeProjection(idxStr);
+    auto decoded = DecodeIdxStr(idxStr);
+    cursor->projected_columns = decoded.projected_columns;
+    // argv[i] holds the value for the constraint at argvIndex i+1 - the
+    // same order SelectPushableConstraints assigned them in, so
+    // decoded.constraints and argv line up positionally.
+    std::optional<std::string> pushdown_filters;
+    if (!decoded.constraints.empty() && static_cast<int>(decoded.constraints.size()) <= argc) {
+        pushdown_filters = EncodePushdownFilters(vtab->table.columns, decoded.constraints, argv);
+    }
     try {
         cursor->scanner =
             std::make_unique<TableScanner>(vtab->pooled->connection, vtab->pooled->attach_opaque_data);
@@ -256,10 +303,21 @@ int xFilter(sqlite3_vtab_cursor* base_cursor, int, const char* idxStr, int, sqli
             return SetVtabError(base_cursor->pVtab,
                                  "table has no scan_function (fallback RPC not wired into the vtab yet)");
         }
-        cursor->scanner->Bind(*vtab->table.scan_function, vtab->table.schema_name);
+        // Not vtab->table.schema_name: a table's *backing function* isn't
+        // necessarily registered under the same schema as the table
+        // itself (observed against vgi-fixture-worker's
+        // filter_echo_table - the table lives in "data", its
+        // filter_echo_table_scan function is registered under "main").
+        // BindRequest.schema_name exists to disambiguate a function name
+        // registered in more than one schema; leaving it null (as here)
+        // is exactly what asks the worker to fall back to a cross-schema
+        // lookup by name instead, which every fixture table this driver
+        // has scanned so far resolves correctly through. Revisit only if
+        // a real name collision across schemas turns up.
+        cursor->scanner->Bind(*vtab->table.scan_function);
         std::vector<int64_t> projection_ids(cursor->projected_columns.begin(),
                                              cursor->projected_columns.end());
-        cursor->scanner->Init(projection_ids);
+        cursor->scanner->Init(projection_ids, pushdown_filters);
     } catch (const std::exception& e) {
         return SetVtabError(base_cursor->pVtab, e.what());
     }
