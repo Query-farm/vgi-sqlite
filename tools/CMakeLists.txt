@@ -29,3 +29,9 @@ target_link_libraries(vgi-scalar-probe PRIVATE vgi_sqlite::driver)
 # data path, independent of xUpdate.
 add_executable(vgi-write-probe write_probe.cpp)
 target_link_libraries(vgi-write-probe PRIVATE vgi_sqlite::driver)
+
+# aggregate_probe: binds an aggregate, steps N rows, finalizes - the
+# Milestone-4 proof of the aggregate bind/update/finalize/destructor data
+# path, independent of the SQLite xStep/xFinal bridge.
+add_executable(vgi-aggregate-probe aggregate_probe.cpp)
+target_link_libraries(vgi-aggregate-probe PRIVATE vgi_sqlite::driver)

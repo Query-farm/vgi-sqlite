@@ -21,6 +21,7 @@ SQLITE_EXTENSION_INIT1
 
 #include <arrow/api.h>
 
+#include "catalog/aggregate_caller.h"
 #include "catalog/catalog_client.h"
 #include "catalog/scalar_function_caller.h"
 #include "types/type_mapping.h"
@@ -54,6 +55,85 @@ void ScalarFunctionBridge(sqlite3_context* ctx, int argc, sqlite3_value** argv) 
             }
         }
         auto result = caller->Call(scalars);
+        SetSqliteResultFromArrow(ctx, *result->column(0), 0);
+    } catch (const std::exception& e) {
+        sqlite3_result_error(ctx, e.what(), -1);
+    }
+}
+
+// Registration info for one VGI aggregate function - the SQLite function's
+// user-data (shared across every SQLite aggregate context that function
+// gets invoked with, unlike ScalarFunctionCaller which *is* the user-data
+// directly). A fresh AggregateCaller is heap-allocated per SQLite
+// aggregate context instead (see AggregateStepBridge) - one per GROUP BY
+// group, or one for a whole-table aggregate - since each needs its own
+// independent VGI execution_id (see aggregate_caller.h's file comment).
+struct VgiAggregateFunctionEntry {
+    ConnectionPool* pool;
+    std::string location;
+    std::string catalog_name;
+    std::string function_name;
+    int num_args;
+    std::optional<std::string> schema_name;
+};
+
+// One row per SQL call, mirroring ScalarFunctionBridge: convert argv
+// (natural-typed, same reasoning as scalar functions - FunctionInfo.arguments
+// can't be trusted for real argument types), accumulate into this
+// aggregate context's caller (lazily constructed on the first call for
+// this context - sqlite3_aggregate_context zero-initializes new memory,
+// so a null slot means "first row of this group").
+void AggregateStepBridge(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
+    auto* entry = reinterpret_cast<VgiAggregateFunctionEntry*>(sqlite3_user_data(ctx));
+    if (argc != entry->num_args) {
+        sqlite3_result_error(ctx, "argument count mismatch calling VGI aggregate function", -1);
+        return;
+    }
+    auto* slot = reinterpret_cast<AggregateCaller**>(sqlite3_aggregate_context(ctx, sizeof(AggregateCaller*)));
+    if (!slot) {
+        sqlite3_result_error_nomem(ctx);
+        return;
+    }
+    try {
+        if (!*slot) {
+            *slot = new AggregateCaller(*entry->pool, entry->location, entry->catalog_name, entry->function_name,
+                                        entry->num_args, entry->schema_name);
+        }
+        std::vector<std::shared_ptr<arrow::Scalar>> scalars;
+        for (int i = 0; i < argc; ++i) {
+            scalars.push_back(BuildArrowScalarFromSqliteValueNatural(argv[i]));
+            if (!scalars.back()) {
+                sqlite3_result_error(ctx, "VGI aggregate functions don't accept a NULL argument here yet "
+                                          "(its Arrow type can't be inferred from an absent value)",
+                                      -1);
+                return;
+            }
+        }
+        (*slot)->Step(scalars);
+    } catch (const std::exception& e) {
+        sqlite3_result_error(ctx, e.what(), -1);
+    }
+}
+
+// Called exactly once per aggregate context, whether or not any row ever
+// reached AggregateStepBridge (an aggregate over zero rows still gets one
+// xFinal call, per SQLite's own contract) - sqlite3_aggregate_context(ctx, 0)
+// (no allocation) returns null in that case, meaning no AggregateCaller
+// was ever created; this driver reports NULL for an empty group rather
+// than guessing a per-function identity value (0 for COUNT, NULL for SUM,
+// ...) it has no way to know without ever binding.
+void AggregateFinalBridge(sqlite3_context* ctx) {
+    auto* slot = reinterpret_cast<AggregateCaller**>(sqlite3_aggregate_context(ctx, 0));
+    if (!slot || !*slot) {
+        sqlite3_result_null(ctx);
+        return;
+    }
+    // Owns the caller from here regardless of outcome - guarantees its
+    // destructor (best-effort aggregate_destructor RPC, see
+    // aggregate_caller.h) runs exactly once, even on a Finalize() error.
+    std::unique_ptr<AggregateCaller> caller(*slot);
+    try {
+        auto result = caller->Finalize();
         SetSqliteResultFromArrow(ctx, *result->column(0), 0);
     } catch (const std::exception& e) {
         sqlite3_result_error(ctx, e.what(), -1);
@@ -169,6 +249,37 @@ void VgiAttachFunc(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
                     [](void* p) { delete reinterpret_cast<ScalarFunctionCaller*>(p); });
                 if (rc != SQLITE_OK) {
                     sqlite3_log(SQLITE_WARNING, "vgi_attach: failed to register function \"%s\": rc=%d",
+                                sql_name.c_str(), rc);
+                    ++skip_count;
+                    continue;
+                }
+            }
+
+            // Aggregate functions: same "<catalog>_<function>" flat
+            // namespace as scalar functions, registered via
+            // sqlite3_create_function_v2's xStep/xFinal rather than xFunc
+            // - see AggregateStepBridge/AggregateFinalBridge. Windowed
+            // aggregates (SQL OVER clauses) aren't registered here at all
+            // (VGI's window RPC family is structurally separate and out
+            // of scope - see aggregate_caller.h's file comment); every
+            // aggregate this driver registers only ever answers a plain
+            // GROUP BY or whole-table aggregation.
+            for (const auto& fn : catalog.SchemaContentsAggregateFunctions(checkout->attach_opaque_data, schema.name)) {
+                if (!fn.argument_types) {
+                    sqlite3_log(SQLITE_WARNING, "vgi_attach: skipping aggregate \"%s.%s\": no argument count",
+                                schema.name.c_str(), fn.name.c_str());
+                    ++skip_count;
+                    continue;
+                }
+                std::string sql_name = catalog_name + "_" + fn.name;
+                auto* entry = new VgiAggregateFunctionEntry{pool, location, catalog_name, fn.name,
+                                                            fn.argument_types->num_fields(), fn.schema_name};
+                int rc = sqlite3_create_function_v2(
+                    db, sql_name.c_str(), fn.argument_types->num_fields(), SQLITE_UTF8, entry,
+                    /*xFunc=*/nullptr, AggregateStepBridge, AggregateFinalBridge,
+                    [](void* p) { delete reinterpret_cast<VgiAggregateFunctionEntry*>(p); });
+                if (rc != SQLITE_OK) {
+                    sqlite3_log(SQLITE_WARNING, "vgi_attach: failed to register aggregate \"%s\": rc=%d",
                                 sql_name.c_str(), rc);
                     ++skip_count;
                     continue;

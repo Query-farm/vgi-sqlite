@@ -174,12 +174,14 @@ ScanFunction VgiCatalogClient::TableDeleteFunctionGet(const std::string& attach_
     return ParseScanFunction(result);
 }
 
-std::vector<CatalogFunction> VgiCatalogClient::SchemaContentsScalarFunctions(
-    const std::string& attach_opaque_data, const std::string& schema_name) {
-    auto params = gen::BuildCatalogSchemaContentsFunctionsParams(
-        to_bytes(attach_opaque_data), schema_name, /*type=*/"SCALAR_FUNCTION",
-        /*transaction_opaque_data=*/std::nullopt);
-    auto result = Call(connection_, "catalog_schema_contents_functions", params);
+namespace {
+std::vector<CatalogFunction> SchemaContentsFunctionsByType(VgiConnection& connection,
+                                                            const std::string& attach_opaque_data,
+                                                            const std::string& schema_name,
+                                                            const std::string& type) {
+    auto params = gen::BuildCatalogSchemaContentsFunctionsParams(to_bytes(attach_opaque_data), schema_name, type,
+                                                                  /*transaction_opaque_data=*/std::nullopt);
+    auto result = Call(connection, "catalog_schema_contents_functions", params);
     std::vector<CatalogFunction> functions;
     for (const auto& item : Items(result)) {
         CatalogFunction fn;
@@ -189,6 +191,17 @@ std::vector<CatalogFunction> VgiCatalogClient::SchemaContentsScalarFunctions(
         functions.push_back(std::move(fn));
     }
     return functions;
+}
+}  // namespace
+
+std::vector<CatalogFunction> VgiCatalogClient::SchemaContentsScalarFunctions(
+    const std::string& attach_opaque_data, const std::string& schema_name) {
+    return SchemaContentsFunctionsByType(connection_, attach_opaque_data, schema_name, "SCALAR_FUNCTION");
+}
+
+std::vector<CatalogFunction> VgiCatalogClient::SchemaContentsAggregateFunctions(
+    const std::string& attach_opaque_data, const std::string& schema_name) {
+    return SchemaContentsFunctionsByType(connection_, attach_opaque_data, schema_name, "AGGREGATE_FUNCTION");
 }
 
 }  // namespace vgi_sqlite

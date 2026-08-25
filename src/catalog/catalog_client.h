@@ -121,6 +121,14 @@ public:
     std::vector<CatalogFunction> SchemaContentsScalarFunctions(const std::string& attach_opaque_data,
                                                                  const std::string& schema_name);
 
+    // Every aggregate function registered in `schema_name` - vgi_attach()'s
+    // data source for registering native SQLite aggregate functions. Same
+    // catalog_schema_contents_functions RPC as
+    // SchemaContentsScalarFunctions, filtered by type="AGGREGATE_FUNCTION"
+    // instead of "SCALAR_FUNCTION" - not a separate listing RPC.
+    std::vector<CatalogFunction> SchemaContentsAggregateFunctions(const std::string& attach_opaque_data,
+                                                                    const std::string& schema_name);
+
     // Write-path function resolution - only called for a table whose
     // CatalogTable::supports_insert/update/delete says the operation is
     // available. `WriteFunctionResult` is wire-identical to
