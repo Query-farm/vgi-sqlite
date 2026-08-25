@@ -37,6 +37,10 @@ find_package(nlohmann_json CONFIG REQUIRED)
 # ── The driver ──────────────────────────────────────────────────────────
 add_library(vgi_sqlite_driver
     src/rpc/vgi_connection.cpp
+    src/wire/wire_builders.cpp
+    src/wire/wire_readers.cpp
+    src/catalog/catalog_requests.cpp
+    src/catalog/catalog_client.cpp
 )
 add_library(vgi_sqlite::driver ALIAS vgi_sqlite_driver)
 
