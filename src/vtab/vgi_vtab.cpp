@@ -10,6 +10,8 @@
 #include <string>
 #include <vector>
 
+#include <arrow/api.h>
+
 // sqlite3ext.h + INIT3, not plain sqlite3.h: this file is only ever
 // compiled into the vgi_extension loadable module, which must resolve
 // every sqlite3_* call through the host's own function-pointer table
@@ -60,6 +62,24 @@ std::map<std::string, std::string> ParseModuleArgs(int argc, const char* const* 
         args[key] = value;
     }
     return args;
+}
+
+// True for a declared column carrying VGI's is_row_id metadata (the
+// worker-chosen per-row identifier column UPDATE/DELETE key writes by -
+// see table_writer.h's file comment and TableWriter::Write).
+bool IsRowIdColumn(const std::shared_ptr<arrow::Field>& field) {
+    return field->metadata() && field->metadata()->Contains("is_row_id");
+}
+
+// The declared-column index of the field VGI marked as this table's row
+// identifier, or nullopt if the table has none (no update/delete support,
+// or a scan-only table that never declared one).
+std::optional<int> FindRowIdColumn(const std::shared_ptr<arrow::Schema>& columns) {
+    if (!columns) return std::nullopt;
+    for (int i = 0; i < columns->num_fields(); ++i) {
+        if (IsRowIdColumn(columns->field(i))) return i;
+    }
+    return std::nullopt;
 }
 
 // One vgi_worker table. Doesn't hold a connection long-term - only
@@ -309,6 +329,21 @@ int xBestIndex(sqlite3_vtab* base_vtab, sqlite3_index_info* info) {
         // bother encoding a subset that isn't one.
         if (static_cast<int>(projected.size()) == num_columns) projected.clear();
     }
+    // A table this driver might UPDATE/DELETE needs its row-identifier
+    // column's value on every fetched row regardless of what the query
+    // actually selected - xRowid (see below) has to be able to report it
+    // for every row this scan produces, since SQLite's own UPDATE/DELETE
+    // plan against a vtab calls xUpdate with whatever xRowid reports for
+    // each matched row. Force it into a real (non-empty) subset if it's
+    // not already there; a "select everything" scan (empty `projected`)
+    // already includes it with nothing to force.
+    if (!projected.empty() && (vtab->table.supports_update || vtab->table.supports_delete)) {
+        if (auto row_id_col = FindRowIdColumn(vtab->table.columns)) {
+            if (std::find(projected.begin(), projected.end(), *row_id_col) == projected.end()) {
+                projected.push_back(*row_id_col);
+            }
+        }
+    }
 
     // WHERE-constraint pushdown (see vtab/filter_pushdown.h) - `constraints`
     // (computed above, alongside the cost estimate) claims argvIndex for
@@ -451,37 +486,39 @@ int xEof(sqlite3_vtab_cursor* base_cursor) {
     return reinterpret_cast<VgiCursor*>(base_cursor)->eof ? 1 : 0;
 }
 
-int xColumn(sqlite3_vtab_cursor* base_cursor, sqlite3_context* ctx, int col_idx) {
-    auto* cursor = reinterpret_cast<VgiCursor*>(base_cursor);
-    if (!cursor->current_batch) {
-        sqlite3_result_null(ctx);
-        return SQLITE_OK;
-    }
-    // When a projection was requested AND the worker actually honored it,
-    // the returned batch has only the requested columns, in request order
-    // - translate the declared-table column index into its position
-    // there. Checked against the batch's own width, not just "did we ask
-    // for one": a function that doesn't declare projection_pushdown
-    // support silently ignores InitRequest.projection_ids and returns
-    // every column anyway (observed against vgi-fixture-worker's
-    // cache_multicol - not documented anywhere read ahead of time, and
-    // trusting the request without checking read the wrong column
-    // outright). Width-matching the actual response is the only way to
-    // tell honored-projection from ignored-projection from here.
-    int position = col_idx;
+// Translates a declared-table column index into its position within the
+// current (possibly narrowed) fetched batch, or -1 if that column isn't
+// present in it at all. Shared by xColumn and xRowid.
+//
+// When a projection was requested AND the worker actually honored it, the
+// returned batch has only the requested columns, in request order - look
+// the declared index up there. Checked against the batch's own width, not
+// just "did we ask for one": a function that doesn't declare
+// projection_pushdown support silently ignores InitRequest.projection_ids
+// and returns every column anyway (observed against vgi-fixture-worker's
+// cache_multicol - not documented anywhere read ahead of time, and
+// trusting the request without checking read the wrong column outright).
+// Width-matching the actual response is the only way to tell
+// honored-projection from ignored-projection from here.
+int FetchedPosition(VgiCursor* cursor, int declared_index) {
+    if (!cursor->current_batch) return -1;
     if (!cursor->projected_columns.empty() &&
         cursor->current_batch->num_columns() == static_cast<int>(cursor->projected_columns.size())) {
-        auto it =
-            std::find(cursor->projected_columns.begin(), cursor->projected_columns.end(), col_idx);
-        if (it == cursor->projected_columns.end()) {
-            // SQLite asked for a column it told xBestIndex it didn't need -
-            // shouldn't happen, but null beats reading the wrong column.
-            sqlite3_result_null(ctx);
-            return SQLITE_OK;
-        }
-        position = static_cast<int>(it - cursor->projected_columns.begin());
+        auto it = std::find(cursor->projected_columns.begin(), cursor->projected_columns.end(), declared_index);
+        if (it == cursor->projected_columns.end()) return -1;
+        return static_cast<int>(it - cursor->projected_columns.begin());
     }
-    if (position < 0 || position >= cursor->current_batch->num_columns()) {
+    if (declared_index < 0 || declared_index >= cursor->current_batch->num_columns()) return -1;
+    return declared_index;
+}
+
+int xColumn(sqlite3_vtab_cursor* base_cursor, sqlite3_context* ctx, int col_idx) {
+    auto* cursor = reinterpret_cast<VgiCursor*>(base_cursor);
+    int position = FetchedPosition(cursor, col_idx);
+    if (position < 0) {
+        // Either no current batch, or (shouldn't happen, but null beats
+        // reading the wrong column) SQLite asked for a column it told
+        // xBestIndex it didn't need.
         sqlite3_result_null(ctx);
         return SQLITE_OK;
     }
@@ -489,102 +526,200 @@ int xColumn(sqlite3_vtab_cursor* base_cursor, sqlite3_context* ctx, int col_idx)
     return SQLITE_OK;
 }
 
+// Reports VGI's own declared row-identifier column's value (see
+// FindRowIdColumn) when the table has one and it's present in the current
+// row's fetched batch - required for UPDATE/DELETE to name the right row
+// (see xUpdate). Falls back to a purely local, scan-sequential counter for
+// a table with no is_row_id column (or, defensively, one where its value
+// couldn't be read this row) - fine for plain reads/`rowid` pseudo-column
+// display, meaningless for identifying a row to a write function, which is
+// exactly why xUpdate's UPDATE/DELETE paths require FindRowIdColumn to have
+// found one before attempting either at all.
 int xRowid(sqlite3_vtab_cursor* base_cursor, sqlite3_int64* rowid_out) {
-    *rowid_out = reinterpret_cast<VgiCursor*>(base_cursor)->rowid;
+    auto* cursor = reinterpret_cast<VgiCursor*>(base_cursor);
+    auto* vtab = reinterpret_cast<VgiVtab*>(base_cursor->pVtab);
+    if (auto row_id_col = FindRowIdColumn(vtab->table.columns)) {
+        int position = FetchedPosition(cursor, *row_id_col);
+        if (position >= 0) {
+            auto arr = std::dynamic_pointer_cast<arrow::Int64Array>(cursor->current_batch->column(position));
+            if (arr && !arr->IsNull(cursor->row_in_batch)) {
+                *rowid_out = arr->Value(cursor->row_in_batch);
+                return SQLITE_OK;
+            }
+        }
+    }
+    *rowid_out = cursor->rowid;
     return SQLITE_OK;
 }
 
-// True for a declared column carrying VGI's is_row_id metadata (the
-// worker-chosen per-row identifier column UPDATE/DELETE key writes by -
-// see table_writer.h's file comment and TableWriter::Write). Only INSERT
-// is wired up yet; UPDATE/DELETE need this column's *value*, not just
-// whether it exists, to identify which row to modify - real work this
-// vtab's xRowid/xColumn don't do yet (they assign a purely local,
-// scan-sequential rowid unrelated to VGI's own row identifier), scoped
-// out of this slice deliberately rather than half-built.
-bool IsRowIdColumn(const std::shared_ptr<arrow::Field>& field) {
-    return field->metadata() && field->metadata()->Contains("is_row_id");
+// Builds a 1-row batch from argv[2 + declared_index] for each field in
+// `fields`/`declared_indices` (parallel arrays) - shared by INSERT's
+// "every column but rowid" row and UPDATE's "every column but rowid, plus
+// rowid appended last" row (see xUpdate).
+arrow::Result<std::shared_ptr<arrow::RecordBatch>> BuildRowFromArgv(
+    const arrow::FieldVector& fields, const std::vector<int>& declared_indices, sqlite3_value** argv, int argc) {
+    std::vector<std::shared_ptr<arrow::Array>> columns;
+    for (size_t i = 0; i < declared_indices.size(); ++i) {
+        int argv_index = 2 + declared_indices[i];
+        if (argv_index >= argc) {
+            return arrow::Status::Invalid("missing a value for column \"" + fields[i]->name() + "\"");
+        }
+        auto scalar = BuildArrowScalarFromSqliteValue(argv[argv_index], fields[i]->type());
+        if (!scalar) {
+            return arrow::Status::Invalid("value for column \"" + fields[i]->name() +
+                                           "\" doesn't match its declared type");
+        }
+        ARROW_ASSIGN_OR_RAISE(auto array, arrow::MakeArrayFromScalar(*scalar, 1));
+        columns.push_back(std::move(array));
+    }
+    return arrow::RecordBatch::Make(arrow::schema(fields), 1, columns);
 }
 
-// INSERT only for now (see the file comment above on why UPDATE/DELETE
-// need a real rowid-mapping design this vtab doesn't have yet - argc==1
-// is DELETE, argc>1 with a non-null argv[0] is UPDATE, both rejected
-// here with a clear error rather than silently mishandled).
-int xUpdate(sqlite3_vtab* base_vtab, int argc, sqlite3_value** argv, sqlite3_int64* pRowid) {
-    auto* vtab = reinterpret_cast<VgiVtab*>(base_vtab);
-    if (argc == 1) {
-        return SetVtabError(base_vtab, "vgi_worker: DELETE isn't supported yet");
-    }
-    if (sqlite3_value_type(argv[0]) != SQLITE_NULL) {
-        return SetVtabError(base_vtab, "vgi_worker: UPDATE isn't supported yet");
-    }
+// INSERT: every user column except the is_row_id one (VGI's INSERT input
+// schema, per table_writer.h's file comment) - argv[2 + declared_index]
+// holds each column's new value, in declared order.
+int DoInsert(VgiVtab* vtab, int argc, sqlite3_value** argv, sqlite3_int64* pRowid, sqlite3_vtab* base_vtab) {
     if (!vtab->table.supports_insert) {
         return SetVtabError(base_vtab, "vgi_worker: table doesn't support INSERT");
     }
-    if (!vtab->table.columns) {
-        return SetVtabError(base_vtab, "vgi_worker: table has no known columns to insert into");
-    }
     try {
-        // The insert function's input schema is every user column *except*
-        // the is_row_id one (see table_writer.h's file comment / the
-        // research this was built from: VGI's INSERT input schema is
-        // "table columns minus rowid") - argv[2 + declared_index] holds
-        // that column's new value, in the same declared order.
-        arrow::FieldVector insert_fields;
+        arrow::FieldVector fields;
         std::vector<int> declared_indices;
         const int num_columns = vtab->table.columns->num_fields();
         for (int i = 0; i < num_columns; ++i) {
             auto field = vtab->table.columns->field(i);
             if (IsRowIdColumn(field)) continue;
-            insert_fields.push_back(field);
+            fields.push_back(field);
             declared_indices.push_back(i);
         }
-        std::vector<std::shared_ptr<arrow::Array>> columns;
-        for (size_t i = 0; i < declared_indices.size(); ++i) {
-            int argv_index = 2 + declared_indices[i];
-            if (argv_index >= argc) {
-                return SetVtabError(base_vtab, "vgi_worker: INSERT is missing a value for column \"" +
-                                                   insert_fields[i]->name() + "\"");
-            }
-            auto scalar = BuildArrowScalarFromSqliteValue(argv[argv_index], insert_fields[i]->type());
-            if (!scalar) {
-                return SetVtabError(base_vtab, "vgi_worker: value for column \"" + insert_fields[i]->name() +
-                                                   "\" doesn't match its declared type");
-            }
-            auto array_result = arrow::MakeArrayFromScalar(*scalar, 1);
-            if (!array_result.ok()) {
-                return SetVtabError(base_vtab, "vgi_worker: building INSERT column \"" +
-                                                   insert_fields[i]->name() +
-                                                   "\": " + array_result.status().ToString());
-            }
-            columns.push_back(array_result.ValueUnsafe());
-        }
-        auto input_row = arrow::RecordBatch::Make(arrow::schema(insert_fields), 1, columns);
+        auto row_result = BuildRowFromArgv(fields, declared_indices, argv, argc);
+        if (!row_result.ok()) return SetVtabError(base_vtab, "vgi_worker: INSERT: " + row_result.status().ToString());
 
-        // Resolved fresh on every INSERT, not cached on VgiVtab - a single
-        // quick RPC, and every other write/scan resolution in this driver
-        // already does the same (see TableScanner::Bind, ScalarFunctionCaller);
-        // caching is a documented follow-up if profiling ever shows this
-        // is a real cost for a bulk INSERT.
         auto checkout = vtab->pool->Acquire(vtab->location, vtab->catalog_name);
         VgiCatalogClient catalog(checkout->connection);
         auto insert_fn =
             catalog.TableInsertFunctionGet(checkout->attach_opaque_data, vtab->schema_name, vtab->table_name);
-
         TableWriter writer(*vtab->pool, vtab->location, vtab->catalog_name);
-        writer.Write(insert_fn, /*schema_name=*/std::nullopt, input_row);
+        writer.Write(insert_fn, /*schema_name=*/std::nullopt, row_result.ValueUnsafe());
 
         // No real new-rowid to report: return_chunks=false means the
-        // worker only echoes back a count, and this vtab has no rowid
-        // mapping yet regardless (see the file comment above) - honor an
-        // explicit rowid if the INSERT gave one, else report 0. Wrong for
-        // last_insert_rowid()/WITHOUT ROWID semantics, right for the
-        // INSERT itself; a documented gap alongside UPDATE/DELETE's.
+        // worker only echoes back a count, and even with a real
+        // is_row_id column mapped for UPDATE/DELETE (see FindRowIdColumn),
+        // a freshly-inserted row's assigned identity still isn't known
+        // without RETURNING, which isn't requested (see table_writer.h).
+        // Honor an explicit rowid if the INSERT gave one, else report 0 -
+        // wrong for last_insert_rowid(), right for the INSERT itself. A
+        // documented gap, not silently wrong.
         *pRowid = (sqlite3_value_type(argv[1]) != SQLITE_NULL) ? sqlite3_value_int64(argv[1]) : 0;
     } catch (const std::exception& e) {
         return SetVtabError(base_vtab, e.what());
     }
     return SQLITE_OK;
+}
+
+// UPDATE: every user column except is_row_id, with its (possibly
+// unchanged - this driver doesn't try to detect which columns genuinely
+// changed, see the file comment above DoUpdate's caller) new value, PLUS
+// the is_row_id column appended last carrying the *old* rowid (argv[0]) -
+// VGI's "(changed_columns..., rowid)" UPDATE input schema.
+int DoUpdate(VgiVtab* vtab, int argc, sqlite3_value** argv, sqlite3_vtab* base_vtab) {
+    if (!vtab->table.supports_update) {
+        return SetVtabError(base_vtab, "vgi_worker: table doesn't support UPDATE");
+    }
+    auto row_id_col = FindRowIdColumn(vtab->table.columns);
+    if (!row_id_col) {
+        return SetVtabError(base_vtab,
+                             "vgi_worker: table has no declared row-identifier column - can't UPDATE");
+    }
+    try {
+        arrow::FieldVector fields;
+        std::vector<int> declared_indices;
+        const int num_columns = vtab->table.columns->num_fields();
+        for (int i = 0; i < num_columns; ++i) {
+            if (i == *row_id_col) continue;
+            fields.push_back(vtab->table.columns->field(i));
+            declared_indices.push_back(i);
+        }
+        auto row_result = BuildRowFromArgv(fields, declared_indices, argv, argc);
+        if (!row_result.ok()) return SetVtabError(base_vtab, "vgi_worker: UPDATE: " + row_result.status().ToString());
+        auto row = row_result.ValueUnsafe();
+
+        // Append the rowid column (old identity, argv[0] - never the
+        // proposed new one, argv[1]: this driver doesn't support changing
+        // a row's own identity column via UPDATE, see the plan file).
+        auto row_id_field = vtab->table.columns->field(*row_id_col);
+        auto row_id_scalar = arrow::MakeScalar(sqlite3_value_int64(argv[0]));
+        auto row_id_arr_result = arrow::MakeArrayFromScalar(*row_id_scalar, 1);
+        if (!row_id_arr_result.ok()) {
+            return SetVtabError(base_vtab, "vgi_worker: UPDATE: building rowid column: " +
+                                                row_id_arr_result.status().ToString());
+        }
+        auto with_rowid_result =
+            row->AddColumn(row->num_columns(), row_id_field, row_id_arr_result.ValueUnsafe());
+        if (!with_rowid_result.ok()) {
+            return SetVtabError(base_vtab,
+                                 "vgi_worker: UPDATE: appending rowid column: " + with_rowid_result.status().ToString());
+        }
+
+        auto checkout = vtab->pool->Acquire(vtab->location, vtab->catalog_name);
+        VgiCatalogClient catalog(checkout->connection);
+        auto update_fn =
+            catalog.TableUpdateFunctionGet(checkout->attach_opaque_data, vtab->schema_name, vtab->table_name);
+        TableWriter writer(*vtab->pool, vtab->location, vtab->catalog_name);
+        writer.Write(update_fn, /*schema_name=*/std::nullopt, with_rowid_result.ValueUnsafe());
+    } catch (const std::exception& e) {
+        return SetVtabError(base_vtab, e.what());
+    }
+    return SQLITE_OK;
+}
+
+// DELETE: just the is_row_id column (VGI's "(rowid,)" DELETE input
+// schema), carrying argv[0] (the row to delete).
+int DoDelete(VgiVtab* vtab, sqlite3_value** argv, sqlite3_vtab* base_vtab) {
+    if (!vtab->table.supports_delete) {
+        return SetVtabError(base_vtab, "vgi_worker: table doesn't support DELETE");
+    }
+    auto row_id_col = FindRowIdColumn(vtab->table.columns);
+    if (!row_id_col) {
+        return SetVtabError(base_vtab,
+                             "vgi_worker: table has no declared row-identifier column - can't DELETE");
+    }
+    try {
+        auto row_id_field = vtab->table.columns->field(*row_id_col);
+        auto row_id_scalar = arrow::MakeScalar(sqlite3_value_int64(argv[0]));
+        auto row_id_arr_result = arrow::MakeArrayFromScalar(*row_id_scalar, 1);
+        if (!row_id_arr_result.ok()) {
+            return SetVtabError(base_vtab, "vgi_worker: DELETE: building rowid column: " +
+                                                row_id_arr_result.status().ToString());
+        }
+        auto row = arrow::RecordBatch::Make(arrow::schema({row_id_field}), 1, {row_id_arr_result.ValueUnsafe()});
+
+        auto checkout = vtab->pool->Acquire(vtab->location, vtab->catalog_name);
+        VgiCatalogClient catalog(checkout->connection);
+        auto delete_fn =
+            catalog.TableDeleteFunctionGet(checkout->attach_opaque_data, vtab->schema_name, vtab->table_name);
+        TableWriter writer(*vtab->pool, vtab->location, vtab->catalog_name);
+        writer.Write(delete_fn, /*schema_name=*/std::nullopt, row);
+    } catch (const std::exception& e) {
+        return SetVtabError(base_vtab, e.what());
+    }
+    return SQLITE_OK;
+}
+
+// argc==1 is DELETE; argc>1 with a null argv[0] is INSERT; argc>1 with a
+// non-null argv[0] is UPDATE (a changed rowid - argv[1] != argv[0] - isn't
+// treated as a delete+reinsert the way SQLite's own docs allow a vtab to;
+// this driver just ignores argv[1] and always updates the row named by
+// argv[0], see DoUpdate's comment on why: VGI's own UPDATE model has no
+// concept of changing the identity column's value in the first place).
+int xUpdate(sqlite3_vtab* base_vtab, int argc, sqlite3_value** argv, sqlite3_int64* pRowid) {
+    auto* vtab = reinterpret_cast<VgiVtab*>(base_vtab);
+    if (!vtab->table.columns) {
+        return SetVtabError(base_vtab, "vgi_worker: table has no known columns");
+    }
+    if (argc == 1) return DoDelete(vtab, argv, base_vtab);
+    if (sqlite3_value_type(argv[0]) == SQLITE_NULL) return DoInsert(vtab, argc, argv, pRowid, base_vtab);
+    return DoUpdate(vtab, argc, argv, base_vtab);
 }
 
 const sqlite3_module kVgiWorkerModule = {
@@ -601,7 +736,7 @@ const sqlite3_module kVgiWorkerModule = {
     /* xEof */ xEof,
     /* xColumn */ xColumn,
     /* xRowid */ xRowid,
-    /* xUpdate */ xUpdate,  // INSERT only so far - see xUpdate's file comment
+    /* xUpdate */ xUpdate,  // INSERT/UPDATE/DELETE - see xUpdate's file comment
     /* xBegin */ nullptr,
     /* xSync */ nullptr,
     /* xCommit */ nullptr,

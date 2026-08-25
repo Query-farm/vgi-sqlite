@@ -8,3 +8,4 @@ third_party/sqlite/
 test/integration/.venv/
 test/integration/.pytest_cache/
 test/integration/__pycache__/
+.claude/
