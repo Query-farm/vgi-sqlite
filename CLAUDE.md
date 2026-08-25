@@ -264,3 +264,33 @@ the wire protocol in isolation, THEN wire into the SQLite extension, where a
   = true` (refused by default in `vgi-rpc-c++`) - set only when the scheme
   is literally `http` (not `https`), treating an explicit `http://` as
   informed consent for a local/private channel.
+- **Any worker-supplied catalog metadata (schema/table/column names)
+  embedded in a SQL string this driver builds itself must go through
+  `sql_quote.h`'s `SqlQuoteIdentifier`/`SqlQuote`, never raw string
+  concatenation.** Found two real instances during the Milestone 5
+  security review where it wasn't: `vgi_attach()`'s generated
+  `CREATE VIRTUAL TABLE "<schema>.<table>" ...`/`DROP TABLE ...`
+  (`extension.cpp`) and `xConnect`/`xCreate`'s generated
+  `CREATE TABLE x("<column>" ...)` DDL passed to `sqlite3_declare_vtab`
+  (`vgi_vtab.cpp`) both embedded a worker-supplied name inside a bare
+  `"\"" + name + "\""` with no escaping of an embedded `"` - a worker
+  (buggy, or actively malicious - the location a caller points
+  `vgi_attach()` at is already a code-execution-level trust boundary, but
+  that's not license to let its *data* smuggle SQL into the attaching
+  connection too) whose metadata contained a `"` could break out of the
+  identifier. `location`/`catalog`/`schema`/`table` module arguments were
+  already correctly going through `SqlQuote` (string-literal escaping);
+  only the identifier side was missed.
+- **A bearer token passed to `vgi_attach()`'s `bearer_token` argument ends
+  up persisted in cleartext in the database file**, not just held in
+  memory for the connection's lifetime - it's folded into `location`
+  before `VgiAttachFunc` generates each table's `CREATE VIRTUAL TABLE`
+  statement, and SQLite itself stores that whole statement verbatim in
+  `sqlite_master`/`sqlite_schema` (`SELECT sql FROM sqlite_master` reads
+  it back). Not a new bug introduced by adding bearer-token support -
+  `location` was already persisted this way for the subprocess transport,
+  where it's rarely secret - but a token is exactly the kind of value
+  that shouldn't be silently written to disk. Surfaced via a
+  `sqlite3_log(SQLITE_WARNING, ...)` at attach time rather than fixed by
+  a bigger redesign (storing credentials outside the schema) - out of
+  scope for now, see the plan file's Milestone 5 status.

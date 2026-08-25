@@ -24,6 +24,7 @@ SQLITE_EXTENSION_INIT1
 #include "catalog/aggregate_caller.h"
 #include "catalog/catalog_client.h"
 #include "catalog/scalar_function_caller.h"
+#include "sql_quote.h"
 #include "types/type_mapping.h"
 #include "vtab/connection_pool.h"
 #include "vtab/vgi_vtab.h"
@@ -140,18 +141,6 @@ void AggregateFinalBridge(sqlite3_context* ctx) {
     }
 }
 
-// Single-quotes a value for embedding in a CREATE VIRTUAL TABLE argument,
-// per SQL string-literal escaping (double any embedded quote).
-std::string SqlQuote(const std::string& s) {
-    std::string out = "'";
-    for (char c : s) {
-        if (c == '\'') out += "''";
-        else out += c;
-    }
-    out += "'";
-    return out;
-}
-
 // vgi_attach(location, catalog[, bearer_token]) -> integer count of tables
 // discovered and declared as virtual tables. Uses the same ConnectionPool
 // the vgi_worker module itself uses (sqlite3_user_data), so this discovery
@@ -187,6 +176,25 @@ void VgiAttachFunc(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
             }
             auto scheme_end = location.find("://") + 3;
             location = location.substr(0, scheme_end) + bearer_token + "@" + location.substr(scheme_end);
+            // Every table this call creates persists this same `location`
+            // (token included) verbatim in its CREATE VIRTUAL TABLE
+            // statement - which SQLite itself stores, in cleartext, in
+            // sqlite_master/sqlite_schema on disk (`SELECT sql FROM
+            // sqlite_master` reads it back). That's not a bug introduced
+            // here - vgi_attach() already persisted `location` this way
+            // for the subprocess transport, where it's rarely secret - but
+            // a bearer token is exactly the kind of value that shouldn't
+            // be silently written to disk without the caller knowing.
+            // Surfaced loudly (found during this driver's Milestone 5
+            // security review) rather than fixed by a bigger redesign
+            // (e.g. storing credentials outside the schema, as SQLite's
+            // own ATTACH does for some encryption extensions) - out of
+            // scope for now; see the plan file's Milestone 5 status.
+            sqlite3_log(SQLITE_WARNING,
+                        "vgi_attach: bearer_token will be stored in cleartext in this database's "
+                        "sqlite_master (every vgi_worker table's CREATE VIRTUAL TABLE statement "
+                        "embeds it) - only use vgi_attach()'s bearer_token argument against a "
+                        "database file you're comfortable holding that credential");
         }
     }
     sqlite3* db = sqlite3_context_db_handle(ctx);
@@ -205,9 +213,10 @@ void VgiAttachFunc(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
 
         for (const auto& schema : catalog.Schemas(checkout->attach_opaque_data)) {
             for (const auto& table : catalog.SchemaContentsTables(checkout->attach_opaque_data, schema.name)) {
-                std::string vtab_name = schema.name + "." + table.name;
-                std::string drop_sql = "DROP TABLE IF EXISTS \"" + vtab_name + "\";";
-                std::string create_sql = "CREATE VIRTUAL TABLE \"" + vtab_name + "\" USING vgi_worker(" +
+                std::string vtab_name = schema.name + "." + table.name;  // display/log use only - never embedded raw in SQL below
+                std::string quoted_vtab_name = SqlQuoteIdentifier(vtab_name);
+                std::string drop_sql = "DROP TABLE IF EXISTS " + quoted_vtab_name + ";";
+                std::string create_sql = "CREATE VIRTUAL TABLE " + quoted_vtab_name + " USING vgi_worker(" +
                                           "location=" + SqlQuote(location) +
                                           ", catalog=" + SqlQuote(catalog_name) +
                                           ", schema=" + SqlQuote(schema.name) +

@@ -25,6 +25,7 @@ SQLITE_EXTENSION_INIT3
 #include "catalog/catalog_client.h"
 #include "catalog/table_scanner.h"
 #include "catalog/table_writer.h"
+#include "sql_quote.h"
 #include "types/type_mapping.h"
 #include "vtab/connection_pool.h"
 #include "vtab/filter_pushdown.h"
@@ -239,7 +240,15 @@ int ConnectImpl(sqlite3* db, void* pAux, int argc, const char* const* argv, sqli
         for (int i = 0; i < vtab->table.columns->num_fields(); ++i) {
             if (i) ddl << ", ";
             const auto& field = vtab->table.columns->field(i);
-            ddl << "\"" << field->name() << "\" " << SqliteDeclaredType(field->type());
+            // field->name() is worker-supplied catalog metadata, not a
+            // driver-controlled constant - must go through
+            // SqlQuoteIdentifier (see sql_quote.h's file comment), not a
+            // bare "\"...\"" - an unescaped embedded `"` would otherwise
+            // let a worker's column name break out of this identifier and
+            // inject arbitrary structure into the DDL sqlite3_declare_vtab
+            // parses. Found during this driver's Milestone 5 security
+            // review.
+            ddl << SqlQuoteIdentifier(field->name()) << " " << SqliteDeclaredType(field->type());
         }
     }
     ddl << ")";
