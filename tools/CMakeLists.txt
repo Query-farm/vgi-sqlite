@@ -18,3 +18,8 @@ target_link_libraries(vgi-catalog-probe PRIVATE vgi_sqlite::driver)
 # Milestone-2 proof of the bind->init->producer-tick data path.
 add_executable(vgi-scan-probe scan_probe.cpp)
 target_link_libraries(vgi-scan-probe PRIVATE vgi_sqlite::driver)
+
+# scalar_probe: binds and calls one scalar function via exchange mode -
+# the Milestone-3 proof of the scalar-function bind/exchange data path.
+add_executable(vgi-scalar-probe scalar_probe.cpp)
+target_link_libraries(vgi-scalar-probe PRIVATE vgi_sqlite::driver)

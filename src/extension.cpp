@@ -19,12 +19,46 @@
 #include <sqlite3ext.h>
 SQLITE_EXTENSION_INIT1
 
+#include <arrow/api.h>
+
 #include "catalog/catalog_client.h"
+#include "catalog/scalar_function_caller.h"
+#include "types/type_mapping.h"
 #include "vtab/connection_pool.h"
 #include "vtab/vgi_vtab.h"
 
 namespace vgi_sqlite {
 namespace {
+
+// Bridges a bound ScalarFunctionCaller (owned as this SQLite function's
+// user-data, see registration below) into sqlite3_create_function_v2's
+// callback shape: convert argv (natural-typed from each value's own
+// SQLite storage class - see ScalarFunctionCaller's file comment on why
+// there's no declared target type to convert against instead), call,
+// convert the single-row result back.
+void ScalarFunctionBridge(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
+    auto* caller = reinterpret_cast<ScalarFunctionCaller*>(sqlite3_user_data(ctx));
+    if (argc != caller->num_args()) {
+        sqlite3_result_error(ctx, "argument count mismatch calling VGI scalar function", -1);
+        return;
+    }
+    try {
+        std::vector<std::shared_ptr<arrow::Scalar>> scalars;
+        for (int i = 0; i < argc; ++i) {
+            scalars.push_back(BuildArrowScalarFromSqliteValueNatural(argv[i]));
+            if (!scalars.back()) {
+                sqlite3_result_error(ctx, "VGI scalar functions don't accept a NULL argument here yet "
+                                          "(its Arrow type can't be inferred from an absent value)",
+                                      -1);
+                return;
+            }
+        }
+        auto result = caller->Call(scalars);
+        SetSqliteResultFromArrow(ctx, *result->column(0), 0);
+    } catch (const std::exception& e) {
+        sqlite3_result_error(ctx, e.what(), -1);
+    }
+}
 
 // Single-quotes a value for embedding in a CREATE VIRTUAL TABLE argument,
 // per SQL string-literal escaping (double any embedded quote).
@@ -58,11 +92,16 @@ void VgiAttachFunc(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
     int table_count = 0;
     int skip_count = 0;
     try {
-        auto pooled = pool->GetOrCreate(location, catalog_name);
-        VgiCatalogClient catalog(pooled->connection);
+        // Checked out only for this discovery pass - released back to the
+        // pool once every schema/table/function is enumerated, not held
+        // for vgi_attach()'s caller's whole session (see connection_pool.h
+        // and ScalarFunctionCaller's file comment: nothing here keeps a
+        // connection long-term any more).
+        auto checkout = pool->Acquire(location, catalog_name);
+        VgiCatalogClient catalog(checkout->connection);
 
-        for (const auto& schema : catalog.Schemas(pooled->attach_opaque_data)) {
-            for (const auto& table : catalog.SchemaContentsTables(pooled->attach_opaque_data, schema.name)) {
+        for (const auto& schema : catalog.Schemas(checkout->attach_opaque_data)) {
+            for (const auto& table : catalog.SchemaContentsTables(checkout->attach_opaque_data, schema.name)) {
                 std::string vtab_name = schema.name + "." + table.name;
                 std::string drop_sql = "DROP TABLE IF EXISTS \"" + vtab_name + "\";";
                 std::string create_sql = "CREATE VIRTUAL TABLE \"" + vtab_name + "\" USING vgi_worker(" +
@@ -97,13 +136,51 @@ void VgiAttachFunc(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
                 }
                 ++table_count;
             }
+
+            // Scalar functions: SQLite has one flat function namespace
+            // (no catalog-qualified example.add_values(...) the way
+            // DuckDB has), so every function is registered under
+            // "<catalog>_<function>" - not exactly VGI's own opt-in
+            // global_functions/global_function_prefix mechanism
+            // (CatalogAttachResult), but the closest equivalent given
+            // SQLite has no other addressing scheme to offer. Argument
+            // types aren't checked here (unlike tables) - see
+            // ScalarFunctionCaller's file comment on why they aren't
+            // reliably known until the first real call; registration only
+            // needs the argument *count*, which is known.
+            for (const auto& fn : catalog.SchemaContentsScalarFunctions(checkout->attach_opaque_data, schema.name)) {
+                if (!fn.argument_types) {
+                    sqlite3_log(SQLITE_WARNING, "vgi_attach: skipping function \"%s.%s\": no argument count",
+                                schema.name.c_str(), fn.name.c_str());
+                    ++skip_count;
+                    continue;
+                }
+                std::string sql_name = catalog_name + "_" + fn.name;
+                // Not this discovery checkout: ScalarFunctionCaller
+                // Acquire()s its own fresh connection for every call (see
+                // its file comment) - it only needs the pool plus which
+                // (location, catalog) to ask it for, not a connection
+                // handed to it here.
+                auto* caller = new ScalarFunctionCaller(*pool, location, catalog_name, fn.name,
+                                                         fn.argument_types->num_fields(), fn.schema_name);
+                int rc = sqlite3_create_function_v2(
+                    db, sql_name.c_str(), fn.argument_types->num_fields(), SQLITE_UTF8, caller,
+                    ScalarFunctionBridge, nullptr, nullptr,
+                    [](void* p) { delete reinterpret_cast<ScalarFunctionCaller*>(p); });
+                if (rc != SQLITE_OK) {
+                    sqlite3_log(SQLITE_WARNING, "vgi_attach: failed to register function \"%s\": rc=%d",
+                                sql_name.c_str(), rc);
+                    ++skip_count;
+                    continue;
+                }
+            }
         }
     } catch (const std::exception& e) {
         sqlite3_result_error(ctx, e.what(), -1);
         return;
     }
     if (skip_count > 0) {
-        sqlite3_log(SQLITE_WARNING, "vgi_attach: %d table(s) skipped (see prior warnings)", skip_count);
+        sqlite3_log(SQLITE_WARNING, "vgi_attach: %d table(s)/function(s) skipped (see prior warnings)", skip_count);
     }
     sqlite3_result_int(ctx, table_count);
 }

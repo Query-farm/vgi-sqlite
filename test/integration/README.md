@@ -34,7 +34,7 @@ convention) or the extension path with `VGI_SQLITE_EXTENSION`.
 | Type mapping (per Arrow type -> SQLite storage class) | not yet ported | — |
 | ORDER BY / LIMIT pushdown | not yet implemented | — |
 | Protocol version mismatch | not yet ported | — |
-| Scalar functions | not applicable yet (Milestone 3) | — |
+| Scalar functions (registration, repeated calls, mid-scan interleaving, NULL args) | ported | `test_scalar_functions.py` |
 | Writable tables, transactions, aggregates | not applicable yet (Milestone 4) | — |
 | Bearer/OAuth auth | not applicable yet (Milestone 3/4) | — |
 

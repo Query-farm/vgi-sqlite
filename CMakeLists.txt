@@ -72,6 +72,8 @@ add_library(vgi_sqlite_driver
     src/catalog/catalog_client.cpp
     src/catalog/scan_requests.cpp
     src/catalog/table_scanner.cpp
+    src/catalog/scalar_function_caller.cpp
+    src/vtab/connection_pool.cpp
 )
 add_library(vgi_sqlite::driver ALIAS vgi_sqlite_driver)
 
@@ -85,15 +87,20 @@ target_link_libraries(vgi_sqlite_driver PUBLIC vgi::vgi nlohmann_json::nlohmann_
 
 # ── The loadable extension itself (.load ./vgi in a sqlite3 session) ──────
 #
-# type_mapping.cpp and vgi_vtab.cpp are built here, not into
-# vgi_sqlite_driver above: they're the two files that call sqlite3_*
+# type_mapping.cpp, vgi_vtab.cpp, and filter_pushdown.cpp are built here,
+# not into vgi_sqlite_driver above: they're the files that call sqlite3_*
 # directly, and they need this target's SQLITE_EXTENSION_INIT wiring
 # (headers only, no linked library - see the SQLite section's comment).
+# connection_pool.cpp moved *into* vgi_sqlite_driver above: despite living
+# under src/vtab/, it makes no sqlite3_* call at all - and
+# ScalarFunctionCaller (src/catalog/, part of the driver) now depends on
+# it directly (every scalar-function call Acquire()s its own connection -
+# see scalar_function_caller.h's file comment), so it has to be reachable
+# from tools/ and the pytest harness too, not just the extension.
 add_library(vgi_extension MODULE
     src/extension.cpp
     src/types/type_mapping.cpp
     src/vtab/vgi_vtab.cpp
-    src/vtab/connection_pool.cpp
     src/vtab/filter_pushdown.cpp
 )
 target_link_libraries(vgi_extension PRIVATE vgi_sqlite::driver)

@@ -61,6 +61,20 @@ struct CatalogSchema {
     std::optional<std::string> comment;
 };
 
+// A worker's registered function, as much of FunctionInfo as calling a
+// plain (non-const-argument) scalar function needs.
+struct CatalogFunction {
+    std::string name;
+    std::string schema_name;  // where the function is *registered* - not
+                               // necessarily the same schema as any table
+                               // that happens to use it (see vgi_vtab.cpp's
+                               // xFilter comment on filter_echo_table).
+    // One field per positional argument, decoded from FunctionInfo.arguments
+    // (itself a serialized Arrow schema, not values - distinct from
+    // ScanFunctionResultSchema.arguments' flat values batch).
+    std::shared_ptr<arrow::Schema> argument_types;
+};
+
 // Result of catalog_attach: the opaque session token every later call on
 // this attachment must echo back, plus the worker's advertised
 // capabilities.
@@ -101,6 +115,11 @@ public:
     // (CatalogTable::scan_function is nullopt).
     ScanFunction TableScanFunctionGet(const std::string& attach_opaque_data,
                                        const std::string& schema_name, const std::string& table_name);
+
+    // Every scalar function registered in `schema_name` - vgi_attach()'s
+    // data source for registering native SQLite functions.
+    std::vector<CatalogFunction> SchemaContentsScalarFunctions(const std::string& attach_opaque_data,
+                                                                 const std::string& schema_name);
 
 private:
     VgiConnection& connection_;

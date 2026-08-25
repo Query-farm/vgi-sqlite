@@ -144,4 +144,21 @@ ScanFunction VgiCatalogClient::TableScanFunctionGet(const std::string& attach_op
     return ParseScanFunction(result);
 }
 
+std::vector<CatalogFunction> VgiCatalogClient::SchemaContentsScalarFunctions(
+    const std::string& attach_opaque_data, const std::string& schema_name) {
+    auto params = gen::BuildCatalogSchemaContentsFunctionsParams(
+        to_bytes(attach_opaque_data), schema_name, /*type=*/"SCALAR_FUNCTION",
+        /*transaction_opaque_data=*/std::nullopt);
+    auto result = Call(connection_, "catalog_schema_contents_functions", params);
+    std::vector<CatalogFunction> functions;
+    for (const auto& item : Items(result)) {
+        CatalogFunction fn;
+        fn.name = wire::get_string(item, "name");
+        fn.schema_name = wire::get_optional_string(item, "schema_name").value_or(schema_name);
+        fn.argument_types = wire::get_schema(item, "arguments");
+        functions.push_back(std::move(fn));
+    }
+    return functions;
+}
+
 }  // namespace vgi_sqlite

@@ -326,4 +326,75 @@ void SetSqliteResultFromArrow(sqlite3_context* ctx, const arrow::Array& array, i
     }
 }
 
+std::shared_ptr<arrow::Scalar> BuildArrowScalarFromSqliteValue(
+    sqlite3_value* value, const std::shared_ptr<arrow::DataType>& target_type) {
+    if (!target_type) return nullptr;
+    if (sqlite3_value_type(value) == SQLITE_NULL) {
+        auto result = arrow::MakeNullScalar(target_type);
+        return result;
+    }
+    switch (target_type->id()) {
+        case arrow::Type::BOOL:
+        case arrow::Type::INT8:
+        case arrow::Type::INT16:
+        case arrow::Type::INT32:
+        case arrow::Type::INT64:
+        case arrow::Type::UINT8:
+        case arrow::Type::UINT16:
+        case arrow::Type::UINT32:
+        case arrow::Type::UINT64: {
+            if (sqlite3_value_type(value) != SQLITE_INTEGER) return nullptr;
+            auto scalar = arrow::MakeScalar(sqlite3_value_int64(value));
+            auto cast_result = scalar->CastTo(target_type);
+            return cast_result.ok() ? cast_result.ValueUnsafe() : nullptr;
+        }
+        case arrow::Type::HALF_FLOAT:
+        case arrow::Type::FLOAT:
+        case arrow::Type::DOUBLE: {
+            auto vtype = sqlite3_value_type(value);
+            if (vtype != SQLITE_FLOAT && vtype != SQLITE_INTEGER) return nullptr;
+            auto scalar = arrow::MakeScalar(sqlite3_value_double(value));
+            auto cast_result = scalar->CastTo(target_type);
+            return cast_result.ok() ? cast_result.ValueUnsafe() : nullptr;
+        }
+        case arrow::Type::STRING:
+        case arrow::Type::LARGE_STRING: {
+            if (sqlite3_value_type(value) != SQLITE_TEXT) return nullptr;
+            const auto* text = reinterpret_cast<const char*>(sqlite3_value_text(value));
+            return std::make_shared<arrow::StringScalar>(std::string(text ? text : ""));
+        }
+        case arrow::Type::BINARY:
+        case arrow::Type::LARGE_BINARY: {
+            if (sqlite3_value_type(value) != SQLITE_BLOB) return nullptr;
+            const auto* data = reinterpret_cast<const uint8_t*>(sqlite3_value_blob(value));
+            int size = sqlite3_value_bytes(value);
+            return std::make_shared<arrow::BinaryScalar>(
+                arrow::Buffer::Wrap(data, static_cast<size_t>(size)));
+        }
+        default:
+            return nullptr;  // temporal/decimal/nested: not handled here
+    }
+}
+
+std::shared_ptr<arrow::Scalar> BuildArrowScalarFromSqliteValueNatural(sqlite3_value* value) {
+    switch (sqlite3_value_type(value)) {
+        case SQLITE_INTEGER:
+            return arrow::MakeScalar(static_cast<int64_t>(sqlite3_value_int64(value)));
+        case SQLITE_FLOAT:
+            return arrow::MakeScalar(sqlite3_value_double(value));
+        case SQLITE_TEXT: {
+            const auto* text = reinterpret_cast<const char*>(sqlite3_value_text(value));
+            return std::make_shared<arrow::StringScalar>(std::string(text ? text : ""));
+        }
+        case SQLITE_BLOB: {
+            const auto* data = reinterpret_cast<const uint8_t*>(sqlite3_value_blob(value));
+            int size = sqlite3_value_bytes(value);
+            return std::make_shared<arrow::BinaryScalar>(
+                arrow::Buffer::Wrap(data, static_cast<size_t>(size)));
+        }
+        default:
+            return nullptr;  // SQLITE_NULL: no type to infer
+    }
+}
+
 }  // namespace vgi_sqlite

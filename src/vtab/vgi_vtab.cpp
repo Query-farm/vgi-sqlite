@@ -61,16 +61,32 @@ std::map<std::string, std::string> ParseModuleArgs(int argc, const char* const* 
     return args;
 }
 
-// One vgi_worker table, backed by a pooled (shared with every other table
-// from the same location+catalog) connection.
+// One vgi_worker table. Doesn't hold a connection long-term - only
+// (location, catalog, schema, table) plus the pool to Acquire() a fresh
+// checkout from whenever it actually needs one (xConnect's schema
+// resolution; each xFilter's whole scan) - see connection_pool.h's file
+// comment on why holding one connection per table for the table's entire
+// lifetime would defeat the pool (a catalog with 50 tables would spawn 50
+// worker processes just from attaching, exactly what ConnectionPool
+// exists to avoid).
 struct VgiVtab {
     sqlite3_vtab base;  // must be first member (sqlite3 vtab ABI)
-    std::shared_ptr<PooledConnection> pooled;
+    ConnectionPool* pool = nullptr;
+    std::string location;
+    std::string catalog_name;
+    std::string schema_name;
+    std::string table_name;
     CatalogTable table;
 };
 
 struct VgiCursor {
     sqlite3_vtab_cursor base;  // must be first member
+    // Declared before `scanner` so it's destroyed *after* scanner (members
+    // destroy in reverse declaration order): scanner's destructor must run
+    // (closing its stream) before this checkout releases the connection
+    // back to the pool for reuse, or a still-open stream would be handed
+    // to the next caller.
+    std::optional<ConnectionPool::Checkout> checkout;
     std::unique_ptr<TableScanner> scanner;
     std::shared_ptr<arrow::RecordBatch> current_batch;
     int64_t row_in_batch = 0;
@@ -169,10 +185,18 @@ int ConnectImpl(sqlite3* db, void* pAux, int argc, const char* const* argv, sqli
 
     auto vtab = std::make_unique<VgiVtab>();
     std::memset(&vtab->base, 0, sizeof(vtab->base));
+    vtab->pool = pool;
+    vtab->location = *location;
+    vtab->catalog_name = *catalog_name;
+    vtab->schema_name = *schema_name;
+    vtab->table_name = *table_name;
     try {
-        vtab->pooled = pool->GetOrCreate(*location, *catalog_name);
-        VgiCatalogClient catalog(vtab->pooled->connection);
-        vtab->table = catalog.TableGet(vtab->pooled->attach_opaque_data, *schema_name, *table_name);
+        // Briefly checked out, then released back to the pool at the end
+        // of this scope - schema resolution is a single quick round trip,
+        // not worth pinning a whole connection to this table for.
+        auto checkout = pool->Acquire(*location, *catalog_name);
+        VgiCatalogClient catalog(checkout->connection);
+        vtab->table = catalog.TableGet(checkout->attach_opaque_data, *schema_name, *table_name);
     } catch (const std::exception& e) {
         *err = sqlite3_mprintf("vgi_worker: %s", e.what());
         return SQLITE_ERROR;
@@ -297,8 +321,14 @@ int xFilter(sqlite3_vtab_cursor* base_cursor, int, const char* idxStr, int argc,
         pushdown_filters = EncodePushdownFilters(vtab->table.columns, decoded.constraints, argv);
     }
     try {
-        cursor->scanner =
-            std::make_unique<TableScanner>(vtab->pooled->connection, vtab->pooled->attach_opaque_data);
+        // Checked out for this cursor's whole lifetime (released in
+        // ~VgiCursor via `checkout`'s destructor, after `scanner`'s runs -
+        // see the struct's field-order comment): a scan's producer stream
+        // stays open across every xNext up to eof, so this connection is
+        // genuinely busy for that whole span, not just for xFilter itself.
+        cursor->checkout = vtab->pool->Acquire(vtab->location, vtab->catalog_name);
+        cursor->scanner = std::make_unique<TableScanner>((*cursor->checkout)->connection,
+                                                          (*cursor->checkout)->attach_opaque_data);
         if (!vtab->table.scan_function) {
             return SetVtabError(base_cursor->pVtab,
                                  "table has no scan_function (fallback RPC not wired into the vtab yet)");
