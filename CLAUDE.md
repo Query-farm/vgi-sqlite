@@ -240,3 +240,27 @@ the wire protocol in isolation, THEN wire into the SQLite extension, where a
   transaction existed. `attach_info_` is guaranteed populated before any
   `xBegin` could fire on a table, since `xConnect` (which every table runs
   before it's usable at all) always resolves it first.
+- **`vgi_rpc::RpcClient` and `vgi_rpc::HttpClient` are not a common
+  interface with two implementations - their method signatures genuinely
+  differ**, not just in name: HTTP's `open_producer`/`open_stream_exchange`
+  require explicit `input_schema`/`output_schema` arguments raw's
+  `open_producer`/`open_exchange` don't take at all, and HTTP's `call()`
+  wants an `AnnotatedBatch` request where raw's `call_unary()` wants a bare
+  `RecordBatch`. `VgiConnection` unifies them at the shape *this driver's*
+  call sites need (every one already has both schemas on hand from its own
+  prior `bind()` call), not by wrapping `RpcClient`/`HttpClient` themselves
+  - `CallUnary`/`OpenProducer`/`OpenExchange` dispatch to whichever of an
+  `optional<RpcClient>`/`optional<HttpClient>` pair `Connect()` engaged,
+  and `OpenProducer`/`OpenExchange` return a `VgiStream` abstract handle
+  (`vgi_rpc::AnnotatedBatch` itself needed no such wrapping - identical
+  type, one definition, on both transports). A bearer token is embedded as
+  URL userinfo (`http://TOKEN@host:port/...`), not a separate
+  `vgi_attach()` channel - `location` already threads unchanged through
+  every `CREATE VIRTUAL TABLE` this driver generates and every
+  `ConnectionPool` key, so folding the token in there once (in
+  `VgiAttachFunc`, before anything else touches `location`) avoids
+  plumbing a second channel through all of those call sites too. Plain
+  `http://` + a token requires `HttpClientConfig.allow_insecure_credentials
+  = true` (refused by default in `vgi-rpc-c++`) - set only when the scheme
+  is literally `http` (not `https`), treating an explicit `http://` as
+  informed consent for a local/private channel.

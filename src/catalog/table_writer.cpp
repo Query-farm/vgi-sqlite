@@ -18,7 +18,7 @@ std::vector<uint8_t> to_bytes(const std::string& s) { return {s.begin(), s.end()
 
 std::shared_ptr<arrow::RecordBatch> CallUnary(VgiConnection& connection, const std::string& method,
                                               const std::shared_ptr<arrow::RecordBatch>& params) {
-    auto response = connection.client().call_unary(method, params);
+    auto response = connection.CallUnary(method, params);
     return wire::get_ipc(response.batch, "result");
 }
 
@@ -67,15 +67,16 @@ int64_t TableWriter::Write(const ScanFunction& write_function,
                                        /*join_keys=*/{}, /*row_limit=*/std::nullopt, /*phase=*/"INPUT");
     auto init_bytes = to_bytes(wire::encode_ipc(init_inner));
     auto init_params = gen::BuildInitParams(init_bytes);
-    auto stream = checkout->connection.client().open_exchange("init", init_params, /*has_header=*/true);
-    auto response = stream.exchange(input_row);
+    auto stream = checkout->connection.OpenExchange("init", init_params, input_row->schema(),
+                                                     parsed.output_schema, /*has_header=*/true);
+    auto response = stream->Exchange(input_row);
     if (!response || !response->batch) {
-        stream.close();
+        stream->Close();
         throw std::runtime_error("write function '" + write_function.function_name +
                                   "': worker closed the stream without a response");
     }
     auto result_batch = response->batch;
-    stream.close();
+    stream->Close();
 
     auto count_col = std::dynamic_pointer_cast<arrow::Int64Array>(result_batch->GetColumnByName("count"));
     if (!count_col || count_col->length() == 0 || count_col->IsNull(0)) {

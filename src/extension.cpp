@@ -152,20 +152,43 @@ std::string SqlQuote(const std::string& s) {
     return out;
 }
 
-// vgi_attach(location, catalog) -> integer count of tables discovered and
-// declared as virtual tables. Uses the same ConnectionPool the vgi_worker
-// module itself uses (sqlite3_user_data), so this discovery call and
-// every table it creates share one spawned worker process per
+// vgi_attach(location, catalog[, bearer_token]) -> integer count of tables
+// discovered and declared as virtual tables. Uses the same ConnectionPool
+// the vgi_worker module itself uses (sqlite3_user_data), so this discovery
+// call and every table it creates share one spawned worker process per
 // (location, catalog) rather than each opening its own. Issues one CREATE
 // VIRTUAL TABLE per table found; re-running against the same catalog
 // refreshes (DROP + CREATE each table).
+//
+// bearer_token, when given (registered as a separate nArg=3 overload, not
+// a NULL-able 3rd argument on one nArg=2 registration - see
+// sqlite3_vgi_init below), only applies to an http:// or https:// location
+// (VgiConnection::Connect's own HTTP-only auth mechanism - see its file
+// comment) and is folded directly into `location`'s userinfo
+// (`http://TOKEN@host:port/...`) before anything else touches it, so every
+// downstream use of this same `location` string - this call's own
+// checkout, and every CREATE VIRTUAL TABLE issued below - carries the
+// token identically without a second, parallel channel to keep in sync.
 void VgiAttachFunc(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
-    if (argc != 2) {
-        sqlite3_result_error(ctx, "vgi_attach(location, catalog) takes exactly 2 arguments", -1);
+    if (argc != 2 && argc != 3) {
+        sqlite3_result_error(ctx, "vgi_attach(location, catalog[, bearer_token]) takes 2 or 3 arguments", -1);
         return;
     }
     auto location = std::string(reinterpret_cast<const char*>(sqlite3_value_text(argv[0])));
     auto catalog_name = std::string(reinterpret_cast<const char*>(sqlite3_value_text(argv[1])));
+    if (argc == 3 && sqlite3_value_type(argv[2]) != SQLITE_NULL) {
+        auto bearer_token = std::string(reinterpret_cast<const char*>(sqlite3_value_text(argv[2])));
+        if (!bearer_token.empty()) {
+            bool is_http = location.rfind("http://", 0) == 0 || location.rfind("https://", 0) == 0;
+            if (!is_http) {
+                sqlite3_result_error(ctx, "vgi_attach: bearer_token is only valid for an http:// or https:// location",
+                                      -1);
+                return;
+            }
+            auto scheme_end = location.find("://") + 3;
+            location = location.substr(0, scheme_end) + bearer_token + "@" + location.substr(scheme_end);
+        }
+    }
     sqlite3* db = sqlite3_context_db_handle(ctx);
     auto* pool = reinterpret_cast<ConnectionPool*>(sqlite3_user_data(ctx));
 
@@ -310,6 +333,11 @@ extern "C" int sqlite3_vgi_init(sqlite3* db, char** pzErrMsg, const sqlite3_api_
     auto* pool = vgi_sqlite::RegisterVgiWorkerModule(db);
     if (!pool) return SQLITE_ERROR;
 
-    return sqlite3_create_function(db, "vgi_attach", 2, SQLITE_UTF8, pool, vgi_sqlite::VgiAttachFunc,
+    int rc = sqlite3_create_function(db, "vgi_attach", 2, SQLITE_UTF8, pool, vgi_sqlite::VgiAttachFunc,
+                                      nullptr, nullptr);
+    if (rc != SQLITE_OK) return rc;
+    // Separate nArg=3 overload for the bearer_token form - see
+    // VgiAttachFunc's file comment.
+    return sqlite3_create_function(db, "vgi_attach", 3, SQLITE_UTF8, pool, vgi_sqlite::VgiAttachFunc,
                                     nullptr, nullptr);
 }

@@ -17,7 +17,7 @@ std::vector<uint8_t> to_bytes(const std::string& s) { return {s.begin(), s.end()
 
 std::shared_ptr<arrow::RecordBatch> Call(VgiConnection& connection, const std::string& method,
                                           const std::shared_ptr<arrow::RecordBatch>& params) {
-    auto response = connection.client().call_unary(method, params);
+    auto response = connection.CallUnary(method, params);
     return wire::get_ipc(response.batch, "result");
 }
 
@@ -105,7 +105,7 @@ TableScanner::~TableScanner() {
     // one session, not documented anywhere read ahead of time.
     if (stream_) {
         try {
-            stream_->close();
+            stream_->Close();
         } catch (...) {
             // Best-effort: a connection already broken for other reasons
             // shouldn't turn a cursor teardown into a crash.
@@ -151,7 +151,7 @@ void TableScanner::Init(const std::vector<int64_t>& projection_ids,
     auto params = gen::BuildInitParams(init_bytes);
     // init is the one Stream-kind method: it returns a GlobalInitResponse
     // header, then a producer stream of output batches.
-    stream_ = connection_.client().open_producer("init", params, /*has_header=*/true);
+    stream_ = connection_.OpenProducer("init", params, bind_.output_schema, /*has_header=*/true);
 }
 
 std::optional<std::shared_ptr<arrow::RecordBatch>> TableScanner::Next() {
@@ -162,7 +162,7 @@ std::optional<std::shared_ptr<arrow::RecordBatch>> TableScanner::Next() {
     // skip empty ticks rather than surfacing them as rows, but keep
     // pulling until the stream actually ends.
     for (;;) {
-        auto batch = stream_->tick();
+        auto batch = stream_->Tick();
         if (!batch) return std::nullopt;
         if (batch->batch && batch->batch->num_rows() > 0) return batch->batch;
     }

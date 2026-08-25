@@ -22,7 +22,7 @@ class TableScanner {
 public:
     TableScanner(VgiConnection& connection, std::string attach_opaque_data);
     // Explicitly closes any live stream (see the .cpp: an abandoned,
-    // never-closed ClientStream aborts the whole shared connection on
+    // never-closed stream aborts the whole shared connection on
     // destruction, per vgi-rpc-c++'s contract - even one that already
     // reached natural end-of-stream via Next() returning nullopt).
     ~TableScanner();
@@ -68,7 +68,7 @@ private:
         std::shared_ptr<arrow::Schema> output_schema;
         std::vector<uint8_t> opaque_data;
     } bind_;
-    std::optional<vgi_rpc::ClientStream> stream_;
+    std::unique_ptr<VgiStream> stream_;
 };
 
 }  // namespace vgi_sqlite

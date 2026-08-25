@@ -40,7 +40,8 @@ convention) or the extension path with `VGI_SQLITE_EXTENSION`.
 | Aggregate functions (whole-table, GROUP BY, nullary, empty group) | ported | `test_aggregates.py` |
 | Transactions (commit, rollback, multi-table coordination, sequential, non-transactional catalogs) | ported | `test_transactions.py` |
 | Windowed aggregates (SQL OVER clause) | not applicable (VGI's window RPC family is structurally separate - see `aggregate_caller.h`) | — |
-| Bearer/OAuth auth | not applicable yet (Milestone 3/4) | — |
+| HTTP transport, bearer-token auth (incl. auth actually enforced: 401 on missing/wrong token) | ported | `test_http_transport.py` |
+| OAuth auth | not implemented (not in scope - see the plan's Milestone 5 status) | — |
 
 Known worker-side gap this suite works around, not fixes: several of
 `vgi-fixture-worker`'s own fixture tables (`geo_points`, the

@@ -17,7 +17,7 @@ std::vector<uint8_t> to_bytes(const std::string& s) { return {s.begin(), s.end()
 
 std::shared_ptr<arrow::RecordBatch> CallUnary(VgiConnection& connection, const std::string& method,
                                               const std::shared_ptr<arrow::RecordBatch>& params) {
-    auto response = connection.client().call_unary(method, params);
+    auto response = connection.CallUnary(method, params);
     return wire::get_ipc(response.batch, "result");
 }
 
@@ -133,14 +133,15 @@ std::shared_ptr<arrow::RecordBatch> ScalarFunctionCaller::Call(
                                             : std::optional<std::vector<uint8_t>>(parsed.opaque_data));
     auto init_bytes = to_bytes(wire::encode_ipc(init_inner));
     auto init_params = gen::BuildInitParams(init_bytes);
-    auto stream = checkout->connection.client().open_exchange("init", init_params, /*has_header=*/true);
-    auto response = stream.exchange(input_batch);
+    auto stream = checkout->connection.OpenExchange("init", init_params, arg_types_, parsed.output_schema,
+                                                     /*has_header=*/true);
+    auto response = stream->Exchange(input_batch);
     if (!response || !response->batch) {
-        stream.close();
+        stream->Close();
         throw std::runtime_error("scalar function '" + function_name_ + "': worker closed the stream");
     }
     auto result = response->batch;
-    stream.close();  // see TableScanner::~TableScanner() for why this matters even on success
+    stream->Close();  // see TableScanner::~TableScanner() for why this matters even on success
     return result;
 }
 

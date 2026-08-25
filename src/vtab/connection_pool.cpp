@@ -3,24 +3,12 @@
 
 #include <algorithm>
 #include <optional>
-#include <sstream>
 #include <utility>
 #include <vector>
 
 #include "catalog/catalog_client.h"
 
 namespace vgi_sqlite {
-namespace {
-
-std::vector<std::string> SplitWhitespace(const std::string& s) {
-    std::vector<std::string> parts;
-    std::istringstream iss(s);
-    std::string part;
-    while (iss >> part) parts.push_back(part);
-    return parts;
-}
-
-}  // namespace
 
 void ConnectionPool::Checkout::ReleaseOrDiscard() {
     if (!pool_ || !conn_) return;
@@ -84,7 +72,7 @@ ConnectionPool::Checkout ConnectionPool::Acquire(const std::string& location,
     // while; no need to block every other Acquire()/Release() on this
     // pool while it happens).
     auto pooled = std::make_shared<PooledConnection>(PooledConnection{
-        VgiConnection::spawn(SplitWhitespace(location)),
+        VgiConnection::Connect(location),
         {},
         {},
     });

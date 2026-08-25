@@ -21,7 +21,7 @@ std::vector<uint8_t> to_bytes(const std::string& s) { return {s.begin(), s.end()
 // return here means a well-formed result.
 std::shared_ptr<arrow::RecordBatch> Call(VgiConnection& connection, const std::string& method,
                                           const std::shared_ptr<arrow::RecordBatch>& params) {
-    auto response = connection.client().call_unary(method, params);
+    auto response = connection.CallUnary(method, params);
     return wire::get_ipc(response.batch, "result");
 }
 

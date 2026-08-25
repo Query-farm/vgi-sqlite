@@ -11,8 +11,11 @@ from __future__ import annotations
 
 import os
 import platform
+import socket
 import sqlite3
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -69,6 +72,104 @@ def writable_worker_location() -> str:
     return os.environ.get(
         "VGI_SIMPLE_WRITABLE_WORKER", f"uv run --project {vgi_python} vgi-fixture-simple-writable-worker"
     )
+
+
+def _free_port() -> int:
+    """Bind to an OS-assigned port, then release it - a real race window
+    (something else could grab it before we launch our own server) but the
+    same acceptable-risk tradeoff vgi-python's own tests/_http_fixtures.py
+    makes for exactly this fixture worker, rather than parsing the
+    subprocess's stdout "PORT:N" line."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+@pytest.fixture(scope="session")
+def http_bearer_token() -> str:
+    return "vgi-sqlite-test-token"
+
+
+@pytest.fixture(scope="session")
+def http_worker_base_url(http_bearer_token: str):
+    """Session-scoped `vgi-fixture-http` (the HTTP-transport counterpart of
+    `worker_location`'s subprocess `vgi-fixture-worker`) - see
+    VgiConnection::Connect's file comment (rpc/vgi_connection.h) for what
+    this exercises. VGI_BEARER_TOKENS is set so the fixture enforces real
+    bearer auth rather than falling back to its own never-401 anonymous
+    mode (see vgi-python's http_server.py - auth is only enforced when this
+    env var is non-empty). Requires vgi-python's optional `http` extra
+    (`uv sync --extra http` under VGI_PYTHON) - skips (not fails) the whole
+    session's HTTP-transport tests if that's missing, same
+    environment-gap-not-code-bug spirit as _verify_worker_available below.
+
+    stdout/stderr are drained on background daemon threads rather than left
+    unread: an unread OS pipe fills up under load and freezes waitress's
+    single I/O loop, hanging every subsequent request - found by reading
+    vgi-python's own tests/_http_fixtures.py, which hits the identical
+    problem for the identical fixture and documents the same fix.
+    """
+    vgi_python = os.environ.get("VGI_PYTHON", str(Path.home() / "Development" / "vgi-python"))
+    port = _free_port()
+    env = dict(os.environ)
+    env["VGI_BEARER_TOKENS"] = f"{http_bearer_token}=test-principal"
+
+    proc = subprocess.Popen(
+        [
+            "uv", "run", "--project", vgi_python, "vgi-fixture-http",
+            "--host", "127.0.0.1", "--port", str(port), "--prefix", "/vgi",
+        ],
+        cwd=vgi_python,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    tail: list[str] = []
+
+    def _drain(stream) -> None:
+        for line in stream:
+            tail.append(line)
+            del tail[:-50]  # keep only the last 50 lines, for a failure message
+
+    threads = [threading.Thread(target=_drain, args=(s,), daemon=True) for s in (proc.stdout, proc.stderr)]
+    for t in threads:
+        t.start()
+
+    base_url = f"http://127.0.0.1:{port}"
+    deadline = time.monotonic() + 15
+    ready = False
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            break
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                ready = True
+                break
+        except OSError:
+            time.sleep(0.2)
+
+    if not ready:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        pytest.skip(
+            f"vgi-fixture-http didn't start listening on {base_url} (rc={proc.returncode}) - "
+            f"probably missing the 'http' extra (uv sync --extra http under {vgi_python}). "
+            f"Last output:\n{''.join(tail)}"
+        )
+
+    yield base_url
+
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
 
 
 @pytest.fixture()
