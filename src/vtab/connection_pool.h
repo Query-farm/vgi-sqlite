@@ -26,12 +26,21 @@
 // scan is contending) still shares one process, and only genuine
 // concurrent use pays for an extra one.
 //
-// MVP: connections are never evicted/health-checked and the idle pool
-// never shrinks - a worker process that dies mid-session leaves whichever
-// checkouts were using it broken until the db connection is closed and
-// reopened, and a session that briefly needed N concurrent connections
-// keeps all N spawned for the rest of the session. Reconnect-on-failure
-// and idle eviction are production-hardening follow-ups (see the plan).
+// A checkout whose scope is exited via a propagating exception is
+// discarded instead of recycled into idle_ - see Checkout::Release()'s
+// std::uncaught_exceptions() check. Every call site already wraps its use
+// of a checked-out connection in a try/catch that turns an exception into
+// a SQLite error (a `bad function name`-type application error looks the
+// same as a truly dead connection from here), so this can't distinguish
+// "the worker process actually crashed" from "the call was rejected for
+// an unrelated reason" - it deliberately errs toward discarding, since a
+// spurious extra respawn costs a little work but a truly dead connection
+// silently recycled forever (poisoning every future call on that key)
+// costs correctness. A session that briefly needed N concurrent
+// connections still keeps all N *live and idle* ones spawned for the rest
+// of the session, though - idle eviction (shrinking the pool back down
+// once concurrency drops) is a separate, still-open production-hardening
+// follow-up (see the plan).
 //
 // attach_opaque_data is minted ONCE per key, not once per physical
 // connection: the first successful Acquire() for a (location, catalog)
@@ -62,6 +71,7 @@
 // comment already documents about attach_opaque_data's portability.
 #pragma once
 
+#include <exception>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -98,11 +108,24 @@ public:
     private:
         friend class ConnectionPool;
         Checkout(ConnectionPool* pool, std::string key, std::shared_ptr<PooledConnection> conn)
-            : pool_(pool), key_(std::move(key)), conn_(std::move(conn)) {}
+            : pool_(pool),
+              key_(std::move(key)),
+              conn_(std::move(conn)),
+              uncaught_at_construction_(std::uncaught_exceptions()) {}
+
+        // Recycle into idle_ on a normal exit, or drop (never call
+        // ReleaseInternal - just let conn_'s reference count fall to zero
+        // and destroy the connection) if an exception is propagating
+        // through this Checkout's scope - see the file comment on why
+        // that's the right default even though it can't distinguish a
+        // truly dead connection from an unrelated application-level
+        // error. Shared by the destructor and move-assignment.
+        void ReleaseOrDiscard();
 
         ConnectionPool* pool_ = nullptr;
         std::string key_;
         std::shared_ptr<PooledConnection> conn_;
+        int uncaught_at_construction_ = 0;
     };
 
     // Checks out a connection to (location, catalog) for exclusive use,

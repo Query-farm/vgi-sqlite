@@ -21,23 +21,32 @@ std::vector<std::string> SplitWhitespace(const std::string& s) {
 
 }  // namespace
 
+void ConnectionPool::Checkout::ReleaseOrDiscard() {
+    if (!pool_ || !conn_) return;
+    if (std::uncaught_exceptions() > uncaught_at_construction_) {
+        conn_.reset();
+    } else {
+        pool_->ReleaseInternal(key_, std::move(conn_));
+    }
+}
+
 ConnectionPool::Checkout& ConnectionPool::Checkout::operator=(Checkout&& other) noexcept {
     if (this != &other) {
-        // Release whatever this Checkout currently holds before taking
-        // over other's - matches std::unique_ptr's move-assign contract.
-        if (pool_ && conn_) pool_->ReleaseInternal(key_, std::move(conn_));
+        // Release (or discard) whatever this Checkout currently holds
+        // before taking over other's - matches std::unique_ptr's
+        // move-assign contract.
+        ReleaseOrDiscard();
         pool_ = other.pool_;
         key_ = std::move(other.key_);
         conn_ = std::move(other.conn_);
+        uncaught_at_construction_ = other.uncaught_at_construction_;
         other.pool_ = nullptr;
         other.conn_.reset();
     }
     return *this;
 }
 
-ConnectionPool::Checkout::~Checkout() {
-    if (pool_ && conn_) pool_->ReleaseInternal(key_, std::move(conn_));
-}
+ConnectionPool::Checkout::~Checkout() { ReleaseOrDiscard(); }
 
 ConnectionPool::Checkout ConnectionPool::Acquire(const std::string& location,
                                                   const std::string& catalog_name) {
