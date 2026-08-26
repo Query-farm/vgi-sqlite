@@ -75,43 +75,31 @@ std::shared_ptr<arrow::RecordBatch> ScalarFunctionCaller::Call(
                                   std::to_string(num_args_) + " arguments, got " +
                                   std::to_string(args.size()));
     }
-    if (!types_locked_) {
-        arg_types_ = SchemaFromArgs(args);
-        types_locked_ = true;
-    }
+    // Re-derive the argument schema fresh from this call's own actual
+    // values every time - see the file comment on why there's nothing to
+    // cache/lock here.
+    auto arg_types = SchemaFromArgs(args);
 
     std::vector<std::shared_ptr<arrow::Array>> columns;
     for (size_t i = 0; i < args.size(); ++i) {
-        // Cast rather than require an exact type match: the schema was
-        // locked in from whichever call happened to bind first, and a
-        // later call's SQLite value might arrive as a different (but
-        // compatible) storage class - e.g. the first call got an INTEGER
-        // and locked in int64, a later call passes a REAL for the same
-        // argument. A genuinely incompatible type (e.g. TEXT where int64
-        // was bound) fails the cast with a clear error instead of
-        // silently sending the worker the wrong wire type.
-        auto cast_result = args[i]->CastTo(arg_types_->field(static_cast<int>(i))->type());
-        if (!cast_result.ok()) {
-            throw std::runtime_error("scalar function '" + function_name_ + "': argument " +
-                                      std::to_string(i) + " (" + args[i]->type->ToString() +
-                                      ") doesn't match the type bound on this caller's first call (" +
-                                      arg_types_->field(static_cast<int>(i))->type()->ToString() +
-                                      "): " + cast_result.status().ToString());
-        }
-        auto array_result = arrow::MakeArrayFromScalar(*cast_result.ValueUnsafe(), 1);
+        // No cast needed: arg_types was just derived from these exact
+        // scalars' own natural types, so each one already matches the
+        // field type built for it.
+        auto array_result = arrow::MakeArrayFromScalar(*args[i], 1);
         if (!array_result.ok()) {
             throw std::runtime_error("scalar function '" + function_name_ + "': argument " +
                                       std::to_string(i) + ": " + array_result.status().ToString());
         }
         columns.push_back(array_result.ValueUnsafe());
     }
-    auto input_batch = arrow::RecordBatch::Make(arg_types_, 1, columns);
+    auto input_batch = arrow::RecordBatch::Make(arg_types, 1, columns);
 
     // Acquire, bind, init, exchange, close, release - all on one freshly
     // checked-out connection, every call. See the header's file comment on
-    // why nothing here is cached across calls beyond the argument types.
+    // why nothing here is cached across calls at all, including the
+    // argument types.
     auto checkout = pool_.Acquire(location_, catalog_name_);
-    auto input_schema_bytes = to_bytes(wire::encode_schema(arg_types_));
+    auto input_schema_bytes = to_bytes(wire::encode_schema(arg_types));
     auto inner = BuildBindRequest(function_name_, BuildEmptyArgsBytes(), /*function_type=*/"SCALAR",
                                    input_schema_bytes, /*settings_bytes=*/std::nullopt,
                                    /*secrets_bytes=*/std::nullopt, to_bytes(checkout->attach_opaque_data),
@@ -133,7 +121,7 @@ std::shared_ptr<arrow::RecordBatch> ScalarFunctionCaller::Call(
                                             : std::optional<std::vector<uint8_t>>(parsed.opaque_data));
     auto init_bytes = to_bytes(wire::encode_ipc(init_inner));
     auto init_params = gen::BuildInitParams(init_bytes);
-    auto stream = checkout->connection.OpenExchange("init", init_params, arg_types_, parsed.output_schema,
+    auto stream = checkout->connection.OpenExchange("init", init_params, arg_types, parsed.output_schema,
                                                      /*has_header=*/true);
     auto response = stream->Exchange(input_batch);
     if (!response || !response->batch) {

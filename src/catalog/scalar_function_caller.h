@@ -44,8 +44,8 @@
 // only when a call happens to reacquire that same connection) only if
 // profiling shows this is a real bottleneck.
 //
-// Argument types are inferred from the *first call's actual values*, not
-// from catalog metadata: FunctionInfo.arguments (the catalog-declared
+// Argument types are inferred fresh from *every call's own actual values*,
+// not from catalog metadata: FunctionInfo.arguments (the catalog-declared
 // argument schema) turned out to carry Arrow's null/"any" type for a
 // function like vgi-fixture-worker's add_values(a, b) - VGI resolves the
 // real per-argument types dynamically per call site, the same way
@@ -53,9 +53,23 @@
 // caller's actually-bound argument types rather than any catalog
 // declaration (VgiScalarFunctionBind, src/vgi_scalar_function_impl.cpp in
 // that repo) - not documented anywhere read ahead of time; found by
-// testing. Locking in that schema from the first call means a genuinely
-// polymorphic function called with different argument types across a
-// session isn't supported (Call() throws rather than silently mis-binding).
+// testing. An earlier version of this caller locked that schema in from
+// the first call and CastTo'd every later call's arguments into it -
+// which sounds conservative but was a real, silent correctness bug:
+// Arrow's Scalar::CastTo between compatible-but-different numeric types
+// (e.g. double -> int64) *succeeds* with silent truncation rather than
+// failing, so a genuinely polymorphic function called with different
+// argument types across a session (e.g. add_values(1, 2) followed by
+// add_values(1.5, 2.5)) got its later call's real values quietly
+// truncated to the first call's locked types instead of throwing or
+// re-resolving - confirmed against vgi's own sqllogictest corpus
+// (test/sql/integration/scalar/add_values.test): 1.5/2.5 truncated to
+// 1/2 before ever reaching the worker, computing 3.0 instead of 4.0.
+// Recomputing the schema unconditionally on every call (this file's
+// current behavior) fixes that with no offsetting performance cost to
+// weigh against: a full bind/init/exchange RPC round trip already
+// happens fresh on every single Call() regardless (see above) - there
+// was never a cheaper path being protected by caching the schema alone.
 //
 // Scoped to plain (non-const) positional arguments only for now: every
 // argument becomes a per-row exchange column named "col_N" (VGI's fixed
@@ -85,10 +99,11 @@ public:
     // FunctionInfo.arguments.num_fields(), even when the per-argument
     // types themselves aren't) - it's what SQLite's own
     // sqlite3_create_function_v2 needs up front. Argument *types* are
-    // decided from the first Call(). `pool`/`location`/`catalog_name`
-    // identify which (location, catalog) to Acquire() a fresh checkout
-    // from on every call - see the file comment on why this caller never
-    // holds one connection across calls the way TableScanner does.
+    // re-derived fresh from each Call()'s own actual values (see the file
+    // comment). `pool`/`location`/`catalog_name` identify which (location,
+    // catalog) to Acquire() a fresh checkout from on every call - see the
+    // file comment on why this caller never holds one connection across
+    // calls the way TableScanner does.
     ScalarFunctionCaller(ConnectionPool& pool, std::string location, std::string catalog_name,
                           std::string function_name, int num_args,
                           std::optional<std::string> schema_name);
@@ -97,8 +112,9 @@ public:
 
     // Acquires a fresh connection, binds and calls on it, releases it -
     // every single call (see the file comment on why). `args` must have
-    // exactly num_args() elements. Argument types are locked in from the
-    // first call's actual values.
+    // exactly num_args() elements. Argument types are re-inferred fresh
+    // from this call's own actual values every time (see the file
+    // comment).
     std::shared_ptr<arrow::RecordBatch> Call(const std::vector<std::shared_ptr<arrow::Scalar>>& args);
 
 private:
@@ -108,9 +124,6 @@ private:
     std::string function_name_;
     int num_args_;
     std::optional<std::string> schema_name_;
-
-    bool types_locked_ = false;
-    std::shared_ptr<arrow::Schema> arg_types_;  // locked in on first call; "col_N" names
 };
 
 }  // namespace vgi_sqlite

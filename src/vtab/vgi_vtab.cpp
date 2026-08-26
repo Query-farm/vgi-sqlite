@@ -470,11 +470,17 @@ int xFilter(sqlite3_vtab_cursor* base_cursor, int, const char* idxStr, int argc,
         std::vector<int64_t> projection_ids(cursor->projected_columns.begin(),
                                              cursor->projected_columns.end());
         cursor->scanner->Init(projection_ids, pushdown_filters, row_limit);
+        cursor->rowid = 0;
+        // Fetching the very first batch is just as capable of throwing (an
+        // RPC "tick") as every later xNext-driven fetch below - must be
+        // inside this same try/catch, not after it, or a worker error on
+        // the first tick reaches std::terminate()/abort() instead of
+        // surfacing as a normal SQLite error. See xNext's identical
+        // try/catch around its own AdvanceBatch call.
+        AdvanceBatch(cursor);
     } catch (const std::exception& e) {
         return SetVtabError(base_cursor->pVtab, e.what());
     }
-    cursor->rowid = 0;
-    AdvanceBatch(cursor);
     return SQLITE_OK;
 }
 
