@@ -35,7 +35,17 @@
 // vgi_attach() parameter, specifically because `location` is already the
 // one string every one of those call sites threads through unchanged;
 // adding a parallel token channel would mean plumbing it through all of
-// them again. `unix:///path/to.sock` connects to an already-running worker
+// them again. `?vgi_prefix=<value>` (a trailing query param, e.g.
+// `https://host?vgi_prefix=`) overrides vgi_rpc::HttpClientConfig's own
+// default RPC mount point ("/vgi") - needed for a real deployed worker
+// whose RPC surface is mounted somewhere else (a Cloudflare Worker
+// mounting at the bare root, `/catalog_attach` not `/vgi/catalog_attach`,
+// is what this was built against); an empty value explicitly asks for
+// bare method paths, distinct from omitting the parameter (which leaves
+// vgi_rpc's own default untouched) - see ParseLocation's own comment for
+// why this can't just be a path segment in `location` itself
+// (`HttpClient::builder()` refuses a base_url with a path at all).
+// `unix:///path/to.sock` connects to an already-running worker
 // (RpcClient::connect_unix) instead of spawning a new subprocess per
 // connection - see Connect()'s own comment for why this is deliberately
 // smaller than the full launcher-protocol discovery contract

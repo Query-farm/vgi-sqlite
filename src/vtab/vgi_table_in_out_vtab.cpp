@@ -56,6 +56,7 @@
 // v1 - a documented gap, not a silent one.
 #include "vtab/vgi_table_in_out_vtab.h"
 
+#include <algorithm>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -185,6 +186,38 @@ int ConnectImpl(sqlite3* db, void* pAux, int argc, const char* const* argv, sqli
         return SQLITE_ERROR;
     }
 
+    // Real-world functions collide output/argument names constantly (e.g.
+    // open-meteo's `geocoding(name, count, country_code, language)`, whose
+    // output rows also carry `name`/`country_code` columns) - confirmed
+    // against a live worker, not a contrived case: every one of that
+    // worker's 13 blended functions hit this, so silently refusing to
+    // register any of them (this module's original stance - see the
+    // header's file comment history) turned out to be a real, practically-
+    // blocking limitation, not a narrow edge case worth leaving
+    // undisambiguated. A hidden column's NAME only matters for two things
+    // - CREATE TABLE uniqueness, and an explicit `SELECT hidden_col FROM
+    // fn(...)` read-back (see xColumn) - never for call-syntax argument
+    // binding, which is purely positional (SQLite's own table-valued-
+    // function convention, confirmed in this module's own design notes).
+    // So a colliding hidden column can be safely renamed without changing
+    // what any real query can do: append "_arg" (and "_arg2", "_arg3", ...
+    // if that's *also* taken - pathological, but a deterministic fallback
+    // beats an infinite loop or a silent failure) until it's unique against
+    // every name declared so far.
+    std::vector<std::string> declared_names;
+    for (int i = 0; i < vtab->output_schema->num_fields(); ++i) {
+        declared_names.push_back(vtab->output_schema->field(i)->name());
+    }
+    auto disambiguate = [&](const std::string& name) {
+        if (std::find(declared_names.begin(), declared_names.end(), name) == declared_names.end()) return name;
+        for (int suffix = 1;; ++suffix) {
+            std::string candidate = name + "_arg" + (suffix == 1 ? "" : std::to_string(suffix));
+            if (std::find(declared_names.begin(), declared_names.end(), candidate) == declared_names.end()) {
+                return candidate;
+            }
+        }
+    };
+
     std::ostringstream ddl;
     ddl << "CREATE TABLE x(";
     bool first = true;
@@ -203,7 +236,9 @@ int ConnectImpl(sqlite3* db, void* pAux, int argc, const char* const* argv, sqli
         // returned by a plain SELECT * - see the file comment on why this
         // is what makes correlated `FROM t, fn(t.x)` work with no extra
         // code.
-        ddl << SqlQuoteIdentifier(field->name()) << " " << SqliteDeclaredType(field->type()) << " HIDDEN";
+        std::string hidden_name = disambiguate(field->name());
+        declared_names.push_back(hidden_name);
+        ddl << SqlQuoteIdentifier(hidden_name) << " " << SqliteDeclaredType(field->type()) << " HIDDEN";
     }
     ddl << ")";
     if (int rc = sqlite3_declare_vtab(db, ddl.str().c_str()); rc != SQLITE_OK) {

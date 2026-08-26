@@ -44,16 +44,21 @@
 //     representable as a fixed set of HIDDEN scalar columns the way the
 //     blended/RowTransformFunction shape is; see
 //     CatalogTableInOutFunction's own file comment in catalog_client.h.
-//   - A function whose OUTPUT schema shares a column name with one of its
-//     own declared arguments - the DDL this module's xConnect/xCreate
-//     builds declares both in one `CREATE TABLE`, and SQLite rejects a
-//     duplicate column name outright. Not a crash: `sqlite3_declare_vtab`
-//     fails cleanly, and vgi_attach() already treats any one function's
-//     CREATE VIRTUAL TABLE failure as a per-function skip (logged, not
-//     fatal to the rest of the attach) - same handling as an ordinary
-//     table's xConnect failure. Not worth disambiguating (e.g. renaming
-//     colliding hidden columns) automatically for v1 - a real function
-//     hitting this can just pick a non-colliding argument name.
+// A function whose OUTPUT schema shares a column name with one of its own
+// declared arguments - the DDL this module's xConnect/xCreate builds
+// would otherwise declare both in one `CREATE TABLE`, and SQLite rejects
+// a duplicate column name outright - is handled, not just documented as
+// a gap: turned out to be the COMMON case against a real-world worker
+// (open-meteo's `geocoding(name, count, country_code, language)`, whose
+// output rows also carry `name`/`country_code`; all 13 of that worker's
+// functions hit this), not the narrow edge case an earlier version of
+// this file assumed. A colliding HIDDEN (argument) column is silently
+// renamed (`<name>_arg`, `<name>_arg2`, ... until unique) before
+// declaring the DDL - safe because a hidden column's name only matters
+// for `CREATE TABLE` uniqueness and an explicit `SELECT hidden_col FROM
+// fn(...)` read-back, never for call-syntax argument binding (always
+// positional). See vgi_table_in_out_vtab.cpp's `ConnectImpl` for the
+// exact disambiguation logic.
 #pragma once
 
 struct sqlite3;

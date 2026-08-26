@@ -3,6 +3,7 @@
 
 #include <mutex>
 #include <sstream>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 
@@ -82,8 +83,14 @@ std::vector<std::string> SplitWhitespace(const std::string& s) {
 struct ParsedLocation {
     bool is_http = false;
     std::string scheme;   // "http" or "https"; only meaningful when is_http
-    std::string base_url;  // scheme://host[:port][/path], credentials stripped
+    std::string base_url;  // scheme://host[:port], credentials/query stripped
     std::optional<std::string> bearer_token;
+    // Overrides vgi_rpc::HttpClientConfig's own default ("/vgi") when
+    // present - see the `vgi_prefix` query-param comment below. nullopt
+    // (the common case) means "use vgi_rpc's own default", not "use an
+    // empty prefix" - those are different: an explicit `vgi_prefix=`
+    // (empty value) is how a caller asks for bare method paths.
+    std::optional<std::string> http_prefix;
     std::vector<std::string> argv;  // subprocess mode only
 };
 
@@ -105,16 +112,47 @@ ParsedLocation ParseLocation(const std::string& location) {
 
     const size_t authority_start = scheme.size() + 3;  // strlen("://")
     const size_t slash_pos = location.find('/', authority_start);
-    const size_t authority_end = (slash_pos == std::string::npos) ? location.size() : slash_pos;
+    const size_t query_pos = location.find('?', authority_start);
+    // The end of the authority component (host[:port]) - whichever of a
+    // path or a query string starts first, or the whole string if
+    // neither is present.
+    size_t authority_end = location.size();
+    if (slash_pos != std::string::npos) authority_end = slash_pos;
+    if (query_pos != std::string::npos && query_pos < authority_end) authority_end = query_pos;
     // '@' only counts as a userinfo delimiter within the authority
     // component (host[:port]) - one appearing in the path/query, if any,
     // isn't a credential separator.
     const size_t at_pos = location.find('@', authority_start);
+    std::string authority;
     if (at_pos != std::string::npos && at_pos < authority_end) {
         result.bearer_token = location.substr(authority_start, at_pos - authority_start);
-        result.base_url = location.substr(0, authority_start) + location.substr(at_pos + 1);
+        authority = location.substr(at_pos + 1, authority_end - at_pos - 1);
     } else {
-        result.base_url = location;
+        authority = location.substr(authority_start, authority_end - authority_start);
+    }
+    result.base_url = location.substr(0, authority_start) + authority;
+
+    // `?vgi_prefix=<value>` - the only query parameter this driver
+    // understands, and the only way to reach a worker whose RPC mount
+    // point isn't vgi_rpc::HttpClientConfig's own default `/vgi` (found
+    // against a real deployed worker - a Cloudflare Worker mounting its
+    // RPC surface at the bare root, `/catalog_attach` not `/vgi/
+    // catalog_attach` - `HttpClient::builder(base_url)` itself refuses a
+    // base_url with a path at all ("use prefix" is its own error
+    // message), so this can't just be folded into the URL path the way
+    // location's own scheme://host[:port] already isn't one). An empty
+    // value (`?vgi_prefix=`) is the explicit, deliberate way to ask for
+    // bare method paths - distinct from omitting the parameter entirely,
+    // which leaves vgi_rpc's own "/vgi" default untouched. Any path
+    // component before `?` (a caller writing `https://host/somepath?...`)
+    // is silently dropped rather than rejected outright - HttpClient's
+    // own base_url validation catches a genuine mistake there instead.
+    if (query_pos != std::string::npos) {
+        std::string query = location.substr(query_pos + 1);
+        constexpr std::string_view kKey = "vgi_prefix=";
+        if (query.rfind(kKey, 0) == 0) {
+            result.http_prefix = query.substr(kKey.size());
+        }
     }
     return result;
 }
@@ -179,6 +217,12 @@ VgiConnection VgiConnection::Connect(const std::string& location) {
     builder.protocol_version(std::string(vgi::generated::VGI_PROTOCOL_VERSION));
     if (parsed.bearer_token) {
         builder.header("Authorization", "Bearer " + *parsed.bearer_token);
+    }
+    // Only override when the caller explicitly asked to (see the
+    // `?vgi_prefix=` comment in ParseLocation) - otherwise leave
+    // vgi_rpc::HttpClientConfig's own default ("/vgi") alone.
+    if (parsed.http_prefix) {
+        builder.prefix(*parsed.http_prefix);
     }
     return VgiConnection(builder.build());
 }

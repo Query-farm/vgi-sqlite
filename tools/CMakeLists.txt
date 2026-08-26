@@ -51,3 +51,9 @@ target_link_libraries(vgi-split-probe PRIVATE vgi_sqlite::driver)
 # (catalog/table_in_out_caller.h), independent of the SQLite vtab bridge.
 add_executable(vgi-table-in-out-probe table_in_out_probe.cpp)
 target_link_libraries(vgi-table-in-out-probe PRIVATE vgi_sqlite::driver)
+
+# http_probe: ad hoc diagnostic tool, connects via VgiConnection::Connect()
+# (so it can reach http(s):// locations, unlike every other probe here)
+# and walks catalog discovery with verbose per-step output.
+add_executable(vgi-http-probe http_probe.cpp)
+target_link_libraries(vgi-http-probe PRIVATE vgi_sqlite::driver)

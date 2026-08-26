@@ -57,11 +57,41 @@
 //     never send projection_ids either for v1 (see the .cpp file comment
 //     on why projection pushdown is scoped out for now even though
 //     FunctionInfo.projection_pushdown is decoded and available).
+//
+// NAMED vs POSITIONAL declared arguments (VGI_ARG_KEY="vgi_arg"/
+// VGI_ARG_NAMED="named" field metadata, vgi-python's argument_spec.py) -
+// found via a real end-to-end mismatch against a live worker (open-meteo,
+// a Cloudflare Worker), not from the protocol docs alone: a declared
+// argument's `vgi_arg: named` metadata (VGI's general model for a DuckDB
+// `:=`-style keyword argument, not table_in_out-specific) means its VALUE
+// belongs in BindRequest's `arguments` struct - read by the worker as
+// `params.args` - not as a per-row streaming column at all. The initial
+// version of this class put every declared argument, named or not, into
+// input_schema and always sent an empty arguments struct - which doesn't
+// error, doesn't warn, just silently means the worker's own `process()`
+// never sees a named argument's value and falls back to its own default
+// (confirmed: `forecast_hourly(..., temperature_unit := 'fahrenheit')`
+// against the real worker returned identical values whether 'fahrenheit'
+// or 'celsius' was supplied - the worker was never told either way).
+// Fixed by splitting input_schema (computed once in the constructor, from
+// each field's own metadata) into `stream_schema_` (true positional
+// fields - what actually flows through Exchange(), unchanged) and the
+// named subset (extracted from the FIRST real Exchange() call's row and
+// sent as this caller's bind()-time `arguments`, matching
+// TableScanner::WrapAsArgsStruct's "positional_N"/"named_<name>"-prefixed
+// struct-field wire convention - see this file's own .cpp for the
+// `named_<name>` variant). This means a named argument's value is fixed
+// for this caller's WHOLE lifetime (one bind, reused across every later
+// Exchange() call on the same cursor) - a caller supplying a DIFFERENT
+// named-arg value on a later correlated row has no way to make it take
+// effect, which matches VGI's own bind-time-fixed semantics for named
+// arguments generally (not a limitation specific to this class).
 #pragma once
 
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include <arrow/record_batch.h>
 
@@ -72,14 +102,15 @@ namespace vgi_sqlite {
 
 class TableInOutCaller {
 public:
-    // `input_schema` is the function's declared argument schema
-    // (CatalogTableInOutFunction::input_schema) - field names/types this
-    // caller sends verbatim as InitRequest's input_schema and as every
-    // Exchange() call's 1-row input batch's schema. Binding doesn't
-    // happen until the first Exchange() call (EnsureBound(), lazy - a
-    // caller only used to probe output_schema, e.g. the vtab's own
-    // xConnect/xCreate schema-declaration step, still needs to force it -
-    // see Bind()).
+    // `input_schema` is the function's FULL declared argument schema
+    // (CatalogTableInOutFunction::input_schema, both positional and
+    // named fields together, in declared order) - field names/types the
+    // vtab's HIDDEN columns are built from, and what every Exchange()
+    // call's input_row parameter must match exactly (the vtab's xFilter
+    // builds it that way from argv). Internally split once, in the
+    // constructor, into `stream_schema_` (true positional fields - what
+    // actually flows through the exchange stream) and the named subset
+    // (routed to bind()'s `arguments` instead) - see the file comment.
     TableInOutCaller(ConnectionPool& pool, std::string location, std::string catalog_name,
                      std::string schema_name, std::string function_name,
                      std::shared_ptr<arrow::Schema> input_schema);
@@ -94,32 +125,54 @@ public:
     TableInOutCaller(const TableInOutCaller&) = delete;
     TableInOutCaller& operator=(const TableInOutCaller&) = delete;
 
-    // Forces bind() to happen now (idempotent past the first call) and
-    // returns the worker-resolved output schema - the real one, not
-    // FunctionInfo.output_schema (empty/not-authoritative for a
-    // table-shaped function per vgi-c++'s own encode_table_function_info
-    // comment: "A table function's output schema is settled at bind").
-    // Used by the vtab's xConnect/xCreate to declare its DDL before any
-    // cursor/row exists; a cursor's own caller calls this implicitly via
-    // its first Exchange() rather than calling it separately.
+    // Forces bind() to happen now (idempotent past the first call, using
+    // an EMPTY arguments struct - no real named-arg values are available
+    // yet at this call site) and returns the worker-resolved output
+    // schema - the real one, not FunctionInfo.output_schema (empty/
+    // not-authoritative for a table-shaped function per vgi-c++'s own
+    // encode_table_function_info comment: "A table function's output
+    // schema is settled at bind"). Used by the vtab's xConnect/xCreate to
+    // declare its DDL before any cursor/row (and hence no real named-arg
+    // values) exists; a cursor's own caller never calls this directly -
+    // its first Exchange() call does the REAL bind, threading that row's
+    // actual named-arg values through (see Exchange()'s own comment).
     const std::shared_ptr<arrow::Schema>& Bind();
 
-    // Sends `input_row` (must match input_schema's schema exactly - the
-    // vtab's xFilter is responsible for building it that way from argv)
-    // as this call's one input row and returns the worker's response
-    // batch (0+ rows, output_schema()'s schema) - see the file comment on
-    // the exact 1:1 lockstep/never-EOS-mid-scan contract. Binds lazily on
-    // the first call. Throws on a protocol violation (the stream closing
-    // mid-scan) or an RPC failure.
+    // Sends `input_row` (must match the FULL declared input_schema this
+    // caller was constructed with - the vtab's xFilter is responsible for
+    // building it that way from argv) as this call's one input row and
+    // returns the worker's response batch (0+ rows, output_schema()'s
+    // schema) - see the file comment on the exact 1:1 lockstep/never-EOS-
+    // mid-scan contract. On the FIRST call, binds using THIS row's actual
+    // named-argument values (see the file comment on why - discards
+    // whatever Bind() may have already probed, since that used an empty
+    // arguments struct); every later call just exchanges its own row's
+    // stream (positional-only) subset on the already-open stream, ignoring
+    // that later row's named-argument values entirely (they can't take
+    // effect after bind - also see the file comment). Throws on a
+    // protocol violation (the stream closing mid-scan) or an RPC failure.
     std::shared_ptr<arrow::RecordBatch> Exchange(const std::shared_ptr<arrow::RecordBatch>& input_row);
 
 private:
+    // Binds (if not already bound) with `args_bytes` as BindRequest's
+    // arguments and `stream_schema_` as its input_schema, then opens the
+    // exchange stream - shared by Bind() (empty args, probe-only) and
+    // Exchange()'s first-call path (real args, from the row's own named
+    // columns).
+    const std::shared_ptr<arrow::Schema>& EnsureBoundWithArgs(std::vector<uint8_t> args_bytes);
+
     ConnectionPool& pool_;
     std::string location_;
     std::string catalog_name_;
     std::string schema_name_;
     std::string function_name_;
-    std::shared_ptr<arrow::Schema> input_schema_;
+    std::shared_ptr<arrow::Schema> input_schema_;  // full declared schema (positional + named)
+
+    // Computed once in the constructor from input_schema_'s own field
+    // metadata (VGI_ARG_KEY="vgi_arg"=="named") - see the file comment.
+    std::shared_ptr<arrow::Schema> stream_schema_;  // positional-only subset, in original relative order
+    std::vector<int> stream_field_indices_;         // indices into input_schema_ that are positional
+    std::vector<int> named_field_indices_;          // indices into input_schema_ that are named
 
     bool bound_ = false;
     std::optional<ConnectionPool::Checkout> checkout_;

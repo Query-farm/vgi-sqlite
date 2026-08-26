@@ -578,3 +578,86 @@ the wire protocol in isolation, THEN wire into the SQLite extension, where a
   given `vcpkg install` hands the build. Verified: builds clean against
   both Arrow 23.0.1 (macOS) and Arrow 25.0.1 (Linux/GCC/aarch64) from the
   same source, no `#ifdef`/version-number branching needed.
+- **Real-world validation against a live, third-party-deployed VGI HTTP
+  worker (open-meteo, a Cloudflare Worker) found three more real bugs -
+  none reachable via any fixture worker this driver had tested against
+  before**, prompted directly by the user handing over a working DuckDB
+  demo query and asking for it to be run and adapted:
+  1. **`vgi_attach()`'s HTTP transport had no way to reach a worker
+     mounted at a non-default RPC prefix.** `vgi_rpc::HttpClientConfig`'s
+     own default (`/vgi`) doesn't match vgi-python's reference HTTP
+     client (`vgi_rpc.http.http_connect`'s own default is `""` - bare
+     method paths), and this open-meteo deployment mounts at the bare
+     root. Fixed with a new `?vgi_prefix=<value>` query parameter on an
+     `http(s)://` location (`rpc/vgi_connection.{h,cpp}`'s
+     `ParseLocation`/`Connect`) - an empty value explicitly asks for bare
+     paths, distinct from omitting the parameter (which leaves
+     `HttpClientConfig`'s own default untouched, so every existing test
+     against `vgi-fixture-http`'s `--prefix /vgi` convention is
+     unaffected). Can't just be a path segment in `location` itself -
+     `HttpClient::builder()` refuses a base_url containing a path at all.
+  2. **`vgi_table_in_out`'s output/HIDDEN-column name collision handling
+     turned out to block essentially every real-world function, not a
+     narrow edge case.** All 13 of open-meteo's blended functions have an
+     output column sharing a name with one of their own arguments (e.g.
+     `geocoding(name, count, country_code, language)` whose output rows
+     also carry `name`/`country_code`) - the "not worth disambiguating
+     automatically" scope decision this module shipped with (see the
+     entry above) turned out to be wrong the first time it met a real
+     worker. Fixed: a colliding HIDDEN column is now silently renamed
+     (`<name>_arg`, `<name>_arg2`, ...) before declaring the vtab's DDL -
+     safe because a hidden column's name only matters for `CREATE TABLE`
+     uniqueness and an explicit `SELECT hidden_col FROM fn(...)`
+     read-back, never for call-syntax argument binding (always
+     positional). See `vgi_table_in_out_vtab.cpp`'s `ConnectImpl`.
+  3. **The real, high-value bug: `TableInOutCaller` routed EVERY declared
+     argument through the per-row streaming channel, silently dropping
+     "named" (VGI's general `:=`-keyword-argument model,
+     `FunctionInfo.arguments`' `vgi_arg: named` field metadata,
+     vgi-python's `argument_spec.py`) argument values entirely.** VGI's
+     protocol requires a named argument's VALUE to travel in
+     `BindRequest.arguments` (read server-side as `params.args`), not as
+     an `input_schema` streaming column - this class sent every argument,
+     named or not, as a streaming column and always sent an EMPTY
+     `arguments` struct at bind() time. No error, no warning: the
+     worker's own `process()` simply never looks at the streaming
+     column for a named argument and falls back to its own default.
+     Confirmed both the bug and the fix with a real, externally-
+     verifiable comparison: `forecast_hourly(..., temperature_unit :=
+     'fahrenheit')` returned IDENTICAL values whether `'fahrenheit'` or
+     `'celsius'` was supplied before the fix (17.5, matching Celsius);
+     after the fix, `'fahrenheit'` correctly returns 63.5 (matching
+     `'celsius'`'s 17.5 exactly, 17.5°C = 63.5°F) - and the driver's full
+     adapted query output now matches `haybarn-cli` (a DuckDB+VGI
+     reference build) byte-for-byte across all 6 rows of a live LATERAL
+     join. Fixed by splitting a function's declared `input_schema` once,
+     in `TableInOutCaller`'s constructor, by each field's own `vgi_arg`
+     metadata: true positional fields flow through `Exchange()` per row,
+     unchanged; named fields' values are extracted from the FIRST real
+     `Exchange()` call's row and sent as that (real, not the throwaway
+     xConnect-time probe) bind()'s `arguments` (via a new
+     `BuildNamedArgsStruct`, mirroring `TableScanner::WrapAsArgsStruct`'s
+     "positional_N"/`named_<name>`-prefixed struct-field wire
+     convention). A real, documented consequence: a named argument's
+     value is fixed for a cursor's WHOLE lifetime (one bind, reused
+     across every later `Exchange()` call) - a caller supplying a
+     DIFFERENT named-arg value on a later correlated row can't make it
+     take effect, matching VGI's own bind-time-fixed semantics for named
+     arguments generally, not a limitation specific to this class.
+  Also found along the way, in `vgi-rpc-c++` (not vgi-sqlite) - see that
+  repo's own commit: `HttpClient`'s schema-equality check compared field
+  metadata and nullability, both of which this same worker's bind()/
+  init()/exchange() responses carry inconsistently for the identical
+  logical schema - fixed to compare structural shape only (names + types,
+  recursively).
+  SQLite has no keyword-argument call syntax at all (unlike DuckDB's
+  `:=`), which is a separate, unrelated fact from the bug above - every
+  declared argument, positional or named, is still exposed as an
+  ordinary positional HIDDEN column in declared order; a caller supplies
+  a value (or explicit `NULL`, "use the worker's default") for all of
+  them positionally, e.g. `forecast_hourly(lat, lon, 2, NULL, NULL, NULL,
+  'fahrenheit', NULL, NULL)`. New `tools/vgi-http-probe.cpp`: an ad hoc
+  diagnostic tool (connects via `VgiConnection::Connect()`, unlike every
+  other probe here which hardcodes `spawn()`) that made isolating each of
+  these three bugs from a real worker's actual RPC responses tractable,
+  independent of the SQLite layer.
