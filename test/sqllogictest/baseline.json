@@ -1,8 +1,8 @@
 {
   "generated_by": "test/sqllogictest/run_sqllogictest.py",
   "total": {
-    "pass": 615,
-    "fail": 1296,
+    "pass": 616,
+    "fail": 1295,
     "skip": 1435
   },
   "passing_ids": [
@@ -134,6 +134,7 @@
     "catalog/window_self_join.test:20",
     "catalog/window_self_join.test:26",
     "catalog/window_self_join.test:45",
+    "catalog/window_self_join.test:57",
     "catalog/window_self_join.test:76",
     "catalog/zero_count_bypass.test:105",
     "catalog/zero_count_bypass.test:111",

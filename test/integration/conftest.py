@@ -43,7 +43,21 @@ def _extension_path() -> Path:
 
 def _default_worker() -> str:
     vgi_python = os.environ.get("VGI_PYTHON", str(Path.home() / "Development" / "vgi-python"))
-    return f"uv run --project {vgi_python} vgi-fixture-worker"
+    # launch: (rpc/launcher.h's full AF_UNIX discovery protocol), not a
+    # bare spawn argv: this suite's `conn` fixture is function-scoped (a
+    # fresh ConnectionPool per test), so a bare spawn argv means every one
+    # of the ~50 tests here pays a full `uv run` + Python-interpreter-
+    # startup cost - measured at ~4-5s/test, dominating this suite's
+    # wall-clock time. launch: makes every test's Acquire() discover and
+    # reuse the SAME already-running worker process instead (one real
+    # spawn for the whole session, not one per test) - the identical
+    # spawn-per-connection bottleneck test/sqllogictest/ already solved
+    # this way (see its own README and CLAUDE.md's launcher-protocol
+    # entry). Safe to share across tests for the same reason sharing one
+    # worker across many attach()es/tables already is within a single
+    # test: every attach mints its own attach_opaque_data, and this
+    # driver never assumes worker-process-lifetime state beyond that.
+    return f"launch:uv run --project {vgi_python} vgi-fixture-worker"
 
 
 @pytest.fixture(scope="session")
@@ -69,9 +83,30 @@ def writable_worker_location() -> str:
     VGI_SIMPLE_WRITABLE_WORKER overrides, matching vgi/Makefile's
     convention for this same fixture."""
     vgi_python = os.environ.get("VGI_PYTHON", str(Path.home() / "Development" / "vgi-python"))
+    # launch: - same rationale as _default_worker() above.
     return os.environ.get(
-        "VGI_SIMPLE_WRITABLE_WORKER", f"uv run --project {vgi_python} vgi-fixture-simple-writable-worker"
+        "VGI_SIMPLE_WRITABLE_WORKER", f"launch:uv run --project {vgi_python} vgi-fixture-simple-writable-worker"
     )
+
+
+@pytest.fixture(scope="session")
+def row_transform_worker_location() -> str:
+    """The `row_transform` catalog's worker command - a standalone script
+    under fixtures/, not part of vgi-python itself (that repo is the
+    shared, canonical protocol implementation across every client SDK,
+    not vgi-sqlite's to add driver-specific fixtures to - see
+    fixtures/row_transform_worker.py's own file comment). Hosts two
+    `RowTransformFunction` ("blended" table_in_out) functions -
+    vgi-fixture-worker has none (confirmed by grepping vgi-python's
+    _test_fixtures/ tree; every existing table_in_out fixture there is
+    the classic relation-valued-argument shape this driver can't
+    represent at all - see catalog/table_in_out_caller.h). VGI_PYTHON
+    overrides which vgi-python checkout supplies the interpreter/SDK,
+    matching every other worker fixture's convention here."""
+    vgi_python = os.environ.get("VGI_PYTHON", str(Path.home() / "Development" / "vgi-python"))
+    script = REPO_ROOT / "test" / "integration" / "fixtures" / "row_transform_worker.py"
+    # launch: - same rationale as _default_worker() above.
+    return f"launch:uv run --project {vgi_python} python {script}"
 
 
 def _free_port() -> int:
@@ -189,8 +224,12 @@ def conn(extension_path: Path, tmp_path: Path) -> sqlite3.Connection:
 @pytest.fixture(scope="session", autouse=True)
 def _verify_worker_available(worker_location: str) -> None:
     """Fail fast with a clear message if the fixture worker can't even
-    start, rather than every test timing out individually."""
-    argv = worker_location.split()
+    start, rather than every test timing out individually. Strips a
+    leading `launch:` (see _default_worker's comment on why worker
+    locations use it now) - this check runs the worker argv directly as
+    its own one-shot subprocess, not through rpc/launcher.h's discovery
+    protocol, so it needs the bare argv either way."""
+    argv = worker_location.removeprefix("launch:").split()
     try:
         result = subprocess.run(
             [*argv, "--help"], capture_output=True, timeout=30, text=True

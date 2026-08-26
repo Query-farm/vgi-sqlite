@@ -87,6 +87,33 @@ struct CatalogSchema {
     std::optional<std::string> comment;
 };
 
+// A table_in_out function eligible for this driver's per-row-correlated
+// table-valued-function mapping (see vtab/vgi_table_in_out_vtab.h's file
+// comment for the full design). Only the "blended"/RowTransformFunction
+// shape is representable in SQLite at all - FunctionInfo.input_from_args
+// true means the function's declared positional arguments ARE its
+// per-row input columns (no separate relation-valued/TABLE-typed
+// argument, which SQLite's table-valued-function calling convention has
+// no way to express - see VgiCatalogClient::SchemaContentsTableInOutFunctions'
+// file comment on why that shape is filtered out at discovery, not
+// merely undocumented).
+struct CatalogTableInOutFunction {
+    std::string function_name;
+    std::string schema_name;
+    // Declared argument names+types (FunctionInfo.arguments, a SCHEMA,
+    // not values - same "arguments describes types, not literal call
+    // values" shape CatalogFunction::argument_types already uses for
+    // scalar/aggregate functions). Field order is positional-call order;
+    // field names become this function's HIDDEN column names.
+    std::shared_ptr<arrow::Schema> input_schema;
+    // FunctionInfo.projection_pushdown - not yet acted on by this driver
+    // (v1 always requests every output column; see
+    // vgi_table_in_out_vtab.cpp's file comment on why that's scoped out
+    // for now), but decoded and carried through so a future projection
+    // pushdown pass doesn't need to re-thread it from scratch.
+    bool projection_pushdown = false;
+};
+
 // A worker's registered function, as much of FunctionInfo as calling a
 // plain (non-const-argument) scalar function needs.
 struct CatalogFunction {
@@ -154,6 +181,35 @@ public:
     // instead of "SCALAR_FUNCTION" - not a separate listing RPC.
     std::vector<CatalogFunction> SchemaContentsAggregateFunctions(const std::string& attach_opaque_data,
                                                                     const std::string& schema_name);
+
+    // Every table_in_out function registered in `schema_name` that this
+    // driver can represent (see CatalogTableInOutFunction's file
+    // comment: input_from_args=true, has_finalize=false - every other
+    // shape, including a plain no-input table function like
+    // split_sequence, is silently excluded here rather than filtered by
+    // the caller, since "callable with no correlation at all" isn't
+    // representable as a vgi_worker-style fixed table either and has no
+    // home in this driver yet - see the plan file's table-function-call
+    // gap). Same catalog_schema_contents_functions RPC as the scalar/
+    // aggregate listings above, filtered by type="TABLE_FUNCTION" instead -
+    // not a separate listing RPC (mirrors SchemaContentsAggregateFunctions'
+    // own comment). vgi_attach()'s data source for registering each
+    // qualifying function as a vgi_table_in_out virtual table.
+    std::vector<CatalogTableInOutFunction> SchemaContentsTableInOutFunctions(
+        const std::string& attach_opaque_data, const std::string& schema_name);
+
+    // Fallback for a vgi_table_in_out vtab's xConnect/xCreate, which only
+    // has (schema, function) from its own module arguments, not the full
+    // listing already enumerated at vgi_attach() time - re-lists and
+    // finds by name (there is no dedicated single-function catalog RPC;
+    // vgi's own DuckDB client resolves the same way, see the plan file's
+    // Milestone 9 research notes). Throws if no such eligible function is
+    // found (a real "no such table_in_out function" error, not a null/
+    // optional - matches VgiCatalogClient::TableGet's own contract for
+    // an unknown table).
+    CatalogTableInOutFunction TableInOutFunctionGet(const std::string& attach_opaque_data,
+                                                     const std::string& schema_name,
+                                                     const std::string& function_name);
 
     // Write-path function resolution - only called for a table whose
     // CatalogTable::supports_insert/update/delete says the operation is

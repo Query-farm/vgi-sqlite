@@ -445,3 +445,136 @@ the wire protocol in isolation, THEN wire into the SQLite extension, where a
   so every `launch:` connection uses `LaunchConfig`'s plain defaults
   (300s idle timeout, 30s connect timeout, 60s worker-startup timeout) -
   a real, documented scope decision, not an oversight.
+- **`test/integration/`'s own worker fixtures now use `launch:` locations,
+  not bare spawn argv** - `conn` is function-scoped (a fresh
+  `ConnectionPool` per test), so a bare spawn argv paid a full `uv run` +
+  Python-interpreter-startup cost on literally every one of this suite's
+  ~50 tests; `launch:` makes every test's `Acquire()` discover and reuse
+  the one already-running worker process instead. Measured: the full
+  suite went from ~4 minutes to ~100s. `_verify_worker_available`'s own
+  fast-fail check strips the `launch:` prefix first - it runs the worker
+  argv directly as a one-shot subprocess (`--help`), not through
+  `rpc/launcher.h`'s discovery protocol, so it needs the bare argv either
+  way.
+- **VGI's table_in_out protocol has two structurally different call
+  shapes, and only one is representable in SQLite at all.** Researched
+  thoroughly first (reading `vgi_table_in_out_impl.cpp`/
+  `vgi_lateral_batch_operator.cpp`/`vgi_function_connection.cpp` from
+  vgi's own DuckDB extension, plus vgi-python's `table_in_out_function.py`
+  and vgi-c++'s `table_in_out.cpp`/`function_dispatch.cpp` for the
+  worker-side wire contract) rather than guessing from the protocol docs
+  alone: (1) the classic shape takes a genuine relation-valued (`TABLE`-
+  typed) argument, streaming an entire sub-relation in - SQLite's
+  table-valued-function calling convention has no equivalent of a
+  TABLE-typed argument at all, only scalar HIDDEN-column arguments, so
+  this shape can't be ported, full stop. (2) The "blended"/
+  `RowTransformFunction` shape - discovery signal
+  `FunctionInfo.input_from_args=true` - has REAL typed positional
+  arguments that ARE its per-row input columns (no synthetic TABLE
+  placeholder), is guaranteed `has_finalize=false` (the worker's own
+  `resolve_metadata` rejects a blended function that declares one), and
+  is map-shaped (1 input row -> 0, 1, or N output rows, no accumulation
+  across rows) - this maps almost exactly onto a SQLite table-valued
+  function with HIDDEN argument columns, called once per correlated
+  outer row exactly like `json_each(t.x)` (no LATERAL keyword needed -
+  see the entry above on `FROM t, json_each(t.x)`). Implemented as a new
+  `vgi_table_in_out` vtab module (`src/vtab/vgi_table_in_out_vtab.{h,cpp}`)
+  plus `TableInOutCaller` (`src/catalog/table_in_out_caller.{h,cpp}`),
+  which binds ONCE and holds one open exchange stream for a cursor's
+  ENTIRE lifetime (every `xFilter` call on that cursor - one per outer
+  row - is just another `Exchange()` on the same stream, not a fresh
+  bind), matching the DuckDB client's own "bind is expensive relative to
+  exchange, don't re-bind per row" design intent.
+  Confirmed via the wire protocol's OWN authoritative contract
+  (`vgi-c++/src/function_dispatch.cpp`'s `TableInOutExchange::exchange`),
+  not just the DuckDB client's usage of it: exactly one `WriteInputBatch`
+  per `Exchange()` call, ALWAYS answered by exactly one response batch -
+  a strict 1:1 lockstep, never more or fewer - and that one response
+  batch can hold 0, 1, or many rows with no row-count cap and no second
+  round trip needed for "more of the same input row's output." This
+  directly resolved a design question the user raised mid-session
+  (prompted by noticing `SumAllColumnsFunction` in vgi-python's fixtures
+  is a genuine table_in_out contract violation - a whole-relation
+  aggregation that should have been a real aggregate function instead):
+  confirmed, via a purpose-built fixture (`test/integration/fixtures/
+  row_transform_worker.py`'s `repeat_row(value, n)`) and both a literal
+  and a CORRELATED query against it, that one input row producing zero,
+  one, or many output rows already works with zero protocol-level design
+  change - the existing "one response batch, no row-count cap" wire
+  contract already covers it.
+  Never sends `pushdown_filters` or `projection_ids` on this function's
+  `init()` for v1 (confirmed via the DuckDB client: its planner never
+  sends `table_filters` to a table-in-out function's init at all -
+  filtering happens locally over the fetched result like any other
+  unclaimed WHERE constraint; `CatalogTableInOutFunction::projection_pushdown`
+  is decoded and carried through for a future pass but not yet wired to
+  `InitRequest.projection_ids`). No transactions (`xBegin`/`xSync`/
+  `xCommit`/`xRollback` all null) - this vtab never writes and needs no
+  cross-statement read-consistency coordination beyond what one
+  `bind()`/`init()` pair already gives a single query's whole cursor.
+  `xBestIndex` requires an EQ constraint on EVERY hidden (argument)
+  column, returning `SQLITE_CONSTRAINT` (SQLite's own documented "this
+  plan can't work" signal, matching `json_each`/`generate_series`'s own
+  reference behavior) when one is missing - confirmed a missing-argument
+  query fails cleanly at PREPARE time ("no query solution"), not at
+  runtime and not by silently calling the worker with a wrong-arity
+  request.
+  A real, narrow, and now-documented constraint found via a self-inflicted
+  bug while building the verification fixture, not a driver defect: an
+  output column and a HIDDEN input-argument column can't share a name
+  (both are plain columns in the one `CREATE TABLE` this module's
+  `xConnect`/`xCreate` declares; SQLite rejects a duplicate column name
+  outright) - not a crash, `sqlite3_declare_vtab` just fails cleanly and
+  `vgi_attach()` already treats any one function's `CREATE VIRTUAL TABLE`
+  failure as a per-function skip (logged, not fatal to the rest of the
+  attach), same handling an ordinary table's `xConnect` failure already
+  gets.
+  No fixture worker anywhere in the ecosystem exercised this shape
+  (confirmed by grepping vgi-python's whole `_test_fixtures/` tree - every
+  existing table_in_out fixture there is the classic, unrepresentable
+  relation-valued-argument shape) - built a small standalone fixture
+  worker (`test/integration/fixtures/row_transform_worker.py`, importing
+  vgi-python's SDK as a library rather than modifying vgi-python itself,
+  which is the shared, canonical protocol implementation other client
+  SDKs also depend on) rather than testing against a synthetic/mocked
+  wire response, matching this driver's established "probe tool first,
+  against something real" discipline (`tools/vgi-table-in-out-probe.cpp`
+  proved the catalog/RPC layer standalone before any vtab code was
+  written). Verified end-to-end, both via the probe and via real SQLite
+  queries through the built extension: a literal call
+  (`add_row(3, 4) = 7`), a correlated call over three outer rows via
+  `FROM pairs, row_transform_add_row(pairs.x, pairs.y)` (each row
+  independently computed, on the SAME bound connection/stream), the
+  1-input-row->N-output-rows and ->0-output-rows cases (both standalone
+  and correlated, with varying `n` per outer row), and the
+  missing-argument-rejected-at-prepare-time case. `test/integration/
+  test_table_in_out.py` (7 tests) covers all of the above as real,
+  regression-tracked pytest coverage. Full suite re-run clean on both
+  macOS (local) and Linux/GCC/aarch64 (EC2): 53/53 (46 pre-existing + 7
+  new).
+- **`arrow::util::base64_decode`'s return type isn't just version-
+  dependent, it's non-monotonically version-dependent across this repo's
+  own build environments** - confirmed the hard way while working on the
+  above: a from-scratch macOS/vcpkg build resolved Arrow 23.0.1 (plain
+  `std::string` return) the same day a from-scratch Linux/vcpkg build on
+  a different machine resolved Arrow 25.0.1 (`arrow::Result<std::string>`
+  return) - the opposite direction from the drift Milestone 4 already hit
+  and fixed once. Neither `vgi-sqlite/vcpkg.json` nor `vgi-c++/vcpkg.json`
+  pins a `builtin-baseline`, so a fresh `vcpkg install` isn't guaranteed
+  to resolve the same Arrow version twice, let alone across machines -
+  a real, still-unfixed root cause (out of scope to fix here; pinning a
+  baseline is a bigger, separate repo-hygiene decision that could affect
+  every other vcpkg-resolved dependency, not just Arrow). Two prior fixes
+  each hardcoded one specific signature and broke the other build
+  environment in turn. Fixed properly this time in `vgi-c++` (not
+  `vgi-sqlite` - the affected call sites are worker-dispatch-side, in
+  `vgi-c++/src/catalog.cpp` and `src/function_dispatch.cpp`, this repo
+  only depends on the result via the sibling-checkout build): a new
+  `vgi::wire::base64_decode(s)` helper (`vgi-c++/src/wire.{h,cpp}`) that
+  compiles against EITHER signature via a real template + `if constexpr`
+  (a non-template function's `if constexpr` still requires both branches
+  to type-check - only a genuinely dependent type parameter lets the
+  compiler discard the untaken branch), so it doesn't matter which one a
+  given `vcpkg install` hands the build. Verified: builds clean against
+  both Arrow 23.0.1 (macOS) and Arrow 25.0.1 (Linux/GCC/aarch64) from the
+  same source, no `#ifdef`/version-number branching needed.

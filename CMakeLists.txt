@@ -91,6 +91,7 @@ add_library(vgi_sqlite_driver
     src/catalog/scalar_function_caller.cpp
     src/catalog/write_requests.cpp
     src/catalog/table_writer.cpp
+    src/catalog/table_in_out_caller.cpp
     src/catalog/aggregate_requests.cpp
     src/catalog/aggregate_caller.cpp
     src/vtab/connection_pool.cpp
@@ -121,6 +122,7 @@ add_library(vgi_extension MODULE
     src/extension.cpp
     src/types/type_mapping.cpp
     src/vtab/vgi_vtab.cpp
+    src/vtab/vgi_table_in_out_vtab.cpp
     src/vtab/filter_pushdown.cpp
 )
 target_link_libraries(vgi_extension PRIVATE vgi_sqlite::driver)

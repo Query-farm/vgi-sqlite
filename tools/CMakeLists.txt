@@ -43,3 +43,11 @@ target_link_libraries(vgi-aggregate-probe PRIVATE vgi_sqlite::driver)
 # per-split init/tick, independent of the SQLite vtab bridge.
 add_executable(vgi-split-probe split_probe.cpp)
 target_link_libraries(vgi-split-probe PRIVATE vgi_sqlite::driver)
+
+# table_in_out_probe: discovers + binds a blended table_in_out
+# (RowTransformFunction) function once, then drives multiple Exchange()
+# calls on the same bound connection/stream - the Milestone-9 proof of
+# the bind-once/exchange-per-correlated-row lifecycle
+# (catalog/table_in_out_caller.h), independent of the SQLite vtab bridge.
+add_executable(vgi-table-in-out-probe table_in_out_probe.cpp)
+target_link_libraries(vgi-table-in-out-probe PRIVATE vgi_sqlite::driver)

@@ -230,4 +230,59 @@ std::vector<CatalogFunction> VgiCatalogClient::SchemaContentsAggregateFunctions(
     return SchemaContentsFunctionsByType(connection_, attach_opaque_data, schema_name, "AGGREGATE_FUNCTION");
 }
 
+namespace {
+// catalog_schema_contents_functions' type="TABLE_FUNCTION" filter returns
+// EVERY table-shaped function - plain generator functions (e.g.
+// split_sequence, no input relation at all) and table_in_out functions
+// (both the classic TABLE-arg shape and the blended/RowTransformFunction
+// shape this driver targets) all come back tagged the same
+// function_type="table" (confirmed by reading vgi-c++'s
+// encode_table_function_info/encode_table_in_out_info - both call the
+// shared common_function_info helper with enums::function_type::kTable).
+// input_from_args is the only field that distinguishes "this function's
+// declared positional args ARE its per-row input columns" (representable
+// here) from either a plain no-input generator or a classic TABLE-typed-
+// argument function (neither representable - see
+// CatalogTableInOutFunction's file comment). has_finalize is checked too,
+// defensively: the worker's own resolve_metadata rejects a blended
+// function that also sets has_finalize (confirmed via vgi-python's
+// table_in_out_function.py), so this should never actually filter
+// anything out in practice, but a stale/older worker isn't something to
+// trust blindly.
+std::vector<CatalogTableInOutFunction> ParseTableInOutFunctions(
+    const std::vector<std::shared_ptr<arrow::RecordBatch>>& items, const std::string& schema_name_fallback) {
+    std::vector<CatalogTableInOutFunction> functions;
+    for (const auto& item : items) {
+        bool input_from_args = wire::get_optional_bool(item, "input_from_args").value_or(false);
+        bool has_finalize = wire::get_optional_bool(item, "has_finalize").value_or(false);
+        if (!input_from_args || has_finalize) continue;
+        CatalogTableInOutFunction fn;
+        fn.function_name = wire::get_string(item, "name");
+        fn.schema_name = wire::get_optional_string(item, "schema_name").value_or(schema_name_fallback);
+        fn.input_schema = wire::get_schema(item, "arguments");
+        fn.projection_pushdown = wire::get_optional_bool(item, "projection_pushdown").value_or(false);
+        functions.push_back(std::move(fn));
+    }
+    return functions;
+}
+}  // namespace
+
+std::vector<CatalogTableInOutFunction> VgiCatalogClient::SchemaContentsTableInOutFunctions(
+    const std::string& attach_opaque_data, const std::string& schema_name) {
+    auto params = gen::BuildCatalogSchemaContentsFunctionsParams(to_bytes(attach_opaque_data), schema_name,
+                                                                  "TABLE_FUNCTION",
+                                                                  /*transaction_opaque_data=*/std::nullopt);
+    auto result = Call(connection_, "catalog_schema_contents_functions", params);
+    return ParseTableInOutFunctions(Items(result), schema_name);
+}
+
+CatalogTableInOutFunction VgiCatalogClient::TableInOutFunctionGet(const std::string& attach_opaque_data,
+                                                                   const std::string& schema_name,
+                                                                   const std::string& function_name) {
+    for (auto& fn : SchemaContentsTableInOutFunctions(attach_opaque_data, schema_name)) {
+        if (fn.function_name == function_name) return fn;
+    }
+    throw std::runtime_error("no such table_in_out function '" + schema_name + "." + function_name + "'");
+}
+
 }  // namespace vgi_sqlite
