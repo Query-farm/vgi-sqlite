@@ -38,10 +38,11 @@ it "passes" is a lead, not a substitute for that.
 
 ## Current status
 
-As of the first real full-corpus run against this driver (see the plan
-file's Milestone 6 status for the full writeup): **512 passing records**
-out of 1619 executed (pass+fail; 31.6%), 1434 skipped (mostly real, correct
-skips - see `skip_reasons` in a `--json-out` run), across all 327 files.
+As of Milestone 7's combined verification (splits support + the two bugs
+this framework found - see the plan file's Milestone 6/7 status for the
+full writeup): **615 passing records** out of 1911 executed (pass+fail;
+32.2%), 1435 skipped (mostly real, correct skips - see `skip_reasons` in a
+`--json-out` run), across all 327 files, zero of which crash the process.
 Runs in **~16 seconds** on a 16-core box with pooled persistent workers
 (see below; ~48s with one persistent worker per fixture instead of a pool,
 several minutes with `--no-persistent-workers`) - `baseline.json` (checked
@@ -100,7 +101,6 @@ which fixture worker is available:
 | directory | why |
 |---|---|
 | `table_in_out/` | table-in-out functions - explicit, already-documented gap (see the plan file) |
-| `splits/` | split/pagination scanning has no vgi-sqlite equivalent |
 | `secret/` | DuckDB's secrets manager - N/A |
 | `launcher/` | AF_UNIX launcher discovery protocol - not implemented |
 | `cache/` | DuckDB-extension-side VGI result cache - vgi-sqlite has no query cache layer at all |
@@ -114,6 +114,17 @@ which fixture worker is available:
 Every one of these was actually read (representative files, not assumed)
 before being added to this list - see the plan file's Milestone 6 status
 for what each category's files actually assert.
+
+**`splits/` is no longer on this list** - vgi-sqlite implements sequential
+split redemption (`src/catalog/catalog_table_plan.h`; see the plan file's
+Milestone 7 status). Most individual `splits/*.test` files still fail,
+though - every split-capable fixture in this corpus is exposed only as a
+directly-callable table FUNCTION with SQL-visible arguments
+(`split_sequence(n := 100, splits := 1)`), which is the SAME
+table-function-call gap `overload/`/`settings/` hit above, not a splits-
+specific one. Splits itself was verified against those same fixtures via
+a standalone probe tool instead (`tools/vgi-split-probe`) - see the plan
+file for the exact scenarios checked.
 
 ## Running it
 

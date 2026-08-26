@@ -1,13 +1,14 @@
 // © Copyright 2026 Query Farm LLC - https://query.farm
 //
 // Hand-coded inner request builders / response parsers for the function
-// bind/init lifecycle - bind's and init's outer params schemas are both
-// just {request: binary}, wrapping these inner dataclasses. Ported from
-// vgi's (the DuckDB extension's) vgi_rpc_types.{hpp,cpp} for field layout,
-// with no DuckDB dependency. Field order/nullability must match
-// vgi-python's BindRequest/InitRequest exactly - see that ported code's
-// comments on why (a worker that validates its declared parameter contract
-// with Schema.Equal is name/type/order/nullability-sensitive).
+// bind/init/plan lifecycle - bind's, init's, and table_function_plan's
+// outer params schemas are all just {request: binary}, wrapping these
+// inner dataclasses. Ported from vgi's (the DuckDB extension's)
+// vgi_rpc_types.{hpp,cpp} for field layout, with no DuckDB dependency.
+// Field order/nullability must match vgi-python's BindRequest/InitRequest/
+// TableFunctionPlanRequest exactly - see that ported code's comments on
+// why (a worker that validates its declared parameter contract with
+// Schema.Equal is name/type/order/nullability-sensitive).
 #pragma once
 
 #include <cstdint>
@@ -64,13 +65,26 @@ BindResponseResult ParseBindResponse(const std::shared_ptr<arrow::RecordBatch>& 
 // unused here). std::nullopt for every non-table-in-out call this driver
 // makes (plain table scans, scalar functions) - InitRequest.phase is
 // "None for other function types" (vgi-python's own doc comment).
+// split_tokens: redeems one split of a planned scan (see
+// catalog_table_plan.h) - a single-element list carrying exactly the
+// token bytes TableFunctionPlan's ScanSplit.token gave back, opaque and
+// passed through verbatim (never parsed/validated/reordered - the worker
+// owns that envelope). Empty (the default) for every non-split call this
+// driver makes, which InitRequest.split_tokens encodes as null, not an
+// empty list - matches every other "absent" optional field's convention
+// here, and vgi's own DuckDB client only ever sends zero or one token
+// itself (a bin-packing multi-token client is a distinct, unimplemented
+// use case - see BuildTableFunctionPlanRequest's comment on why this
+// driver's plan requests never invite the worker to produce fewer, larger
+// splits than it would for a client that reads one at a time).
 std::shared_ptr<arrow::RecordBatch> BuildInitRequest(
     const std::vector<uint8_t>& bind_call_bytes, const std::vector<uint8_t>& output_schema_bytes,
     const std::optional<std::vector<uint8_t>>& bind_opaque_data = std::nullopt,
     const std::vector<int64_t>& projection_ids = {},
     const std::optional<std::string>& pushdown_filters = std::nullopt,
     const std::vector<std::string>& join_keys = {}, std::optional<int64_t> row_limit = std::nullopt,
-    const std::optional<std::string>& phase = std::nullopt);
+    const std::optional<std::string>& phase = std::nullopt,
+    const std::vector<std::vector<uint8_t>>& split_tokens = {});
 
 // The header batch init's producer stream returns before any data batch.
 struct GlobalInitResponseResult {

@@ -85,6 +85,7 @@ add_library(vgi_sqlite_driver
     src/catalog/catalog_requests.cpp
     src/catalog/catalog_client.cpp
     src/catalog/scan_requests.cpp
+    src/catalog/catalog_table_plan.cpp
     src/catalog/table_scanner.cpp
     src/catalog/scalar_function_caller.cpp
     src/catalog/write_requests.cpp

@@ -30,6 +30,32 @@ namespace vgi_sqlite {
 struct ScanFunction {
     std::string function_name;
     std::vector<uint8_t> arguments_ipc_bytes;
+    // FunctionInfo.supports_splits - opt-in capability, defaults false for
+    // both an older worker that predates the field and an ordinary
+    // non-split function (see catalog_client.cpp's ParseScanFunction: read
+    // via get_optional_bool, not get_bool, specifically so an absent
+    // column - not just an absent/null value - degrades to "no splits"
+    // instead of a parse error). When true, TableScanner plans the scan
+    // into independently-redeemable splits (catalog_table_plan.h) instead
+    // of the ordinary single whole-scan init - see that file's comment for
+    // the full design and the protocol source this was built against.
+    bool supports_splits = false;
+    // When true, arguments_ipc_bytes is ALREADY a wrapped one-row
+    // {args: struct<...>} batch (VGI's BindRequest.arguments wire shape
+    // directly - "positional_N"/"named_<name>" struct fields) and
+    // TableScanner::Bind() must send it as-is instead of running it
+    // through WrapAsArgsStruct, which unconditionally renames every
+    // column "positional_N" by index - correct for every real table's
+    // inlined scan_function today (all observed so far bind purely
+    // positionally), but wrong for a function whose worker-side argument
+    // resolution keys by declared NAME (`Annotated[int, Arg("n", ...)]`-
+    // style, confirmed against vgi-python's splits fixtures - see
+    // tools/split_probe.cpp, the only place this is set true today).
+    // Always false for every catalog-derived ScanFunction (ParseScanFunction
+    // never sets it) - named-argument table functions aren't otherwise
+    // supported by this driver yet, same documented gap as
+    // ScalarFunctionCaller's own "positional arguments only" scope.
+    bool arguments_already_wrapped = false;
 };
 
 ScanFunction ParseScanFunction(const std::shared_ptr<arrow::RecordBatch>& scan_function_info);

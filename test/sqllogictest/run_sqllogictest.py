@@ -26,8 +26,8 @@ and treat closing the largest reason category as the next slice of work.
 Every file was surveyed by category before writing translate.py's rule set
 and this module's STRUCTURAL_SKIP_CATEGORIES - see the plan file's Milestone
 6 status for the category-by-category findings (result-cache tests need a
-query-cache layer this driver doesn't have; table_in_out/splits/secret/
-launcher/macro/view/global_functions/overload/settings all call SQL surface
+query-cache layer this driver doesn't have; table_in_out/secret/launcher/
+macro/view/global_functions/overload/settings all call SQL surface
 this driver's vtab-only, fixed-arguments-at-CREATE-TIME model has no
 equivalent for; COPY TO/FROM has no SQLite statement to map onto).
 Structural skips are reported with a `category: <dir>` reason distinct from
@@ -77,7 +77,12 @@ DEFAULT_BASELINE = Path(__file__).resolve().parent / "baseline.json"
 # file's Milestone 6 status for what each one actually tests and why.
 STRUCTURAL_SKIP_CATEGORIES = {
     "table_in_out": "table-in-out functions have no vgi-sqlite equivalent (explicit gap - see plan file)",
-    "splits": "split/pagination scanning has no vgi-sqlite equivalent",
+    # "splits" was here (whole-category skip) until vgi-sqlite implemented
+    # sequential split redemption - see catalog_table_plan.h. Individual
+    # splits/*.test files may still skip/fail for unrelated reasons
+    # (parallelism-only scenarios this driver's single-reader model can't
+    # exercise the same way, or ordinary untranslated DuckDB syntax), but
+    # the category itself is no longer blanket-skipped.
     "secret": "DuckDB's secrets manager has no vgi-sqlite equivalent",
     "launcher": "the AF_UNIX launcher discovery protocol isn't implemented in vgi-sqlite",
     "cache": "DuckDB-extension-side VGI result cache has no vgi-sqlite equivalent",

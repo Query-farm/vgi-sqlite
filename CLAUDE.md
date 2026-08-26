@@ -331,29 +331,73 @@ the wire protocol in isolation, THEN wire into the SQLite extension, where a
   future use of a shared/pooled worker process from this driver, not just
   the test tooling.
 - **Two real bugs found by running `~/Development/vgi`'s sqllogictest
-  corpus against this driver for the first time** (`test/sqllogictest/` -
-  see its README and the plan file's Milestone 6 status for the full
-  detail) - neither fixed yet, both tracked as concrete next work:
-  1. A process-crashing bug: `terminate called after throwing an instance
-     of 'vgi_rpc::RpcException'` / `what():  IndexError: index out of
-     bounds` - an uncaught C++ exception reaching `std::terminate()`/
-     `abort()`, not a normal SQLite error return. Two precise repro files:
-     `table/filter_pushdown_through_view.test`,
-     `table/late_materialization.test`. Same *class* of worker-side
-     `IndexError` bug already fixed once in Milestone 3
-     (`BindRequest.arguments` needing exactly one row), but this is
-     evidently a distinct trigger specific to late-materialization/
-     filter-pushdown-through-a-view scenarios.
-  2. `ScalarFunctionCaller` locks `arg_types_` from the *first* call's
-     actual argument values and reuses that one locked caller for every
-     later call to the same registered SQL function in a session (its own
-     documented design) - so calling the same scalar function with
-     genuinely different argument types later in the same session silently
-     CASTs the new arguments down to the first call's locked types instead
-     of erroring or re-resolving, producing **silently wrong results**
-     (observed: `add_values(1.5, 2.5)`, after an earlier `add_values(int,
-     int)` call in the same session, computed as `add_values(CAST(1.5 AS
-     locked-int), CAST(2.5 AS locked-int))` = 3, not 4). No existing
-     `test/integration/` test calls one registered function with varying
-     argument types in one session, which is why this was never caught
-     before.
+  corpus against this driver for the first time, both fixed** (see the
+  plan file's Milestone 6/7 status for the full detail):
+  1. **Process-crashing bug, fixed.** `xFilter` (`vgi_vtab.cpp`) wrapped
+     its `Bind()`/`Init()` calls in a try/catch but called
+     `AdvanceBatch(cursor)` - fetching the scan's FIRST batch, an RPC tick
+     that can throw - OUTSIDE that block, right before `return SQLITE_OK`.
+     `xNext`'s own call to the same function was already correctly
+     wrapped; only the first batch was unprotected, so a worker error on
+     that specific tick reached `std::terminate()`/`abort()` (confirmed
+     `vgi_rpc::RpcException` derives from `std::exception`, so the
+     existing catch clause is sufficient once the call is actually inside
+     it) instead of surfacing as a normal SQLite error. Fix: move
+     `AdvanceBatch(cursor)` inside the existing try block.
+  2. **Scalar-function silent-truncation bug, fixed.**
+     `ScalarFunctionCaller` used to lock `arg_types_` from the *first*
+     call's actual argument values and `CastTo` every later call's
+     arguments into that locked schema - and Arrow's `CastTo` between
+     compatible-but-different numeric types (double -> int64) *succeeds*
+     with silent truncation rather than failing, so calling the same
+     scalar function with genuinely different argument types later in a
+     session silently computed the wrong answer instead of erroring or
+     re-resolving (`add_values(1.5, 2.5)` after an earlier
+     `add_values(int, int)` call computed 3, not 4 - the floats got
+     truncated to ints before ever reaching the worker). Fix: removed the
+     locking entirely - `arg_types_` is now derived fresh from every
+     call's own actual values, at no extra cost (a full bind/init/exchange
+     round trip already happened fresh every call regardless). **Not yet
+     checked**: `src/catalog/aggregate_caller.{h,cpp}` has the identical
+     locking pattern for aggregate function arguments - plausibly the same
+     risk, not yet fixed.
+- **VGI splits (sequential redemption) is implemented** - `src/catalog/
+  catalog_table_plan.h`/`table_scanner.{h,cpp}`. Splits is an optional
+  planning phase (`FunctionInfo.supports_splits`) layered on the ordinary
+  bind->init->tick lifecycle: `table_function_plan` divides a scan into N
+  independently-redeemable opaque tokens; `InitRequest.split_tokens`
+  redeems one via an otherwise-ordinary init. A single sequential reader
+  claiming every split one at a time (what `TableScanner` does - entirely
+  transparent to `vgi_vtab.cpp`, which needed zero changes) is a legal,
+  degenerate consumer even though the mechanism exists for real
+  distributed engines to claim splits concurrently. Load-bearing gotchas,
+  confirmed the hard way or by a peer session that shipped this same
+  protocol feature across every other VGI client SDK (reached out before
+  implementing, rather than rediscovering these independently):
+  - **End-of-stream is a `nullopt` tick, never a present-but-0-row batch**
+    - already true for an ordinary scan (`TableScanner::Next()`'s existing
+      loop got this right from Milestone 2), and it matters even more
+      under splits: a 0-row batch mid-split is legitimate (a filter pruned
+      that split to nothing) and must not be read as "this split is done."
+  - **Every `next_cursors` entry a plan response returns must be followed,
+    not just the first** - enumeration is complete only once *every*
+    outstanding cursor has returned none. Taking just the first (what
+    vgi's own DuckDB client does, a deliberate no-fan-out simplification
+    appropriate to its scope) would silently drop everything reachable
+    from the rest if a worker ever returns more than one - missing rows,
+    no error. `PlanTableFunctionSplits` drains a plain queue of every
+    cursor any response returns instead - a few lines, stays entirely
+    single-threaded, closes the risk instead of accepting it.
+  - **A worker's argument resolver can key strictly by declared NAME, not
+    position** - confirmed against vgi-python's own split fixtures
+    (`KeyError: "Argument 'n': not found"` from a naive positional
+    encoding). `ScanFunction::arguments_already_wrapped` is a small escape
+    hatch letting a caller hand `TableScanner::Bind()` an already-wire-
+    shaped `{args: struct<named_n, ...>}` batch instead of going through
+    `WrapAsArgsStruct`'s unconditional positional rename - used today only
+    by `tools/vgi-split-probe`, since no vgi-python fixture exposes a
+    split-capable function as a plain `CREATE VIRTUAL TABLE`-attachable
+    table (every one is a directly-callable table function with SQL
+    arguments - the same table-function-call gap named elsewhere in this
+    file), so there's no real caller of this path through the SQL layer
+    yet.

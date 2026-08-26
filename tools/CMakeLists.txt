@@ -35,3 +35,11 @@ target_link_libraries(vgi-write-probe PRIVATE vgi_sqlite::driver)
 # path, independent of the SQLite xStep/xFinal bridge.
 add_executable(vgi-aggregate-probe aggregate_probe.cpp)
 target_link_libraries(vgi-aggregate-probe PRIVATE vgi_sqlite::driver)
+
+# split_probe: binds a split-capable table function directly (VGI's split
+# fixtures are only exposed as callable functions, not plain tables - see
+# the tool's own file comment) and drains it through TableScanner's split
+# redemption path - the Milestone-6 proof of table_function_plan +
+# per-split init/tick, independent of the SQLite vtab bridge.
+add_executable(vgi-split-probe split_probe.cpp)
+target_link_libraries(vgi-split-probe PRIVATE vgi_sqlite::driver)

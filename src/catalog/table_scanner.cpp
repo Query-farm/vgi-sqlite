@@ -5,6 +5,7 @@
 
 #include <arrow/api.h>
 
+#include "catalog/catalog_table_plan.h"
 #include "catalog/scan_requests.h"
 #include "generated/vgi_request_builders.hpp"
 #include "wire/wire_readers.h"
@@ -115,14 +116,23 @@ TableScanner::~TableScanner() {
 
 void TableScanner::Bind(const ScanFunction& scan_function, const std::optional<std::string>& schema_name,
                         const std::optional<std::vector<uint8_t>>& transaction_opaque_data) {
-    std::string flat_bytes(scan_function.arguments_ipc_bytes.begin(), scan_function.arguments_ipc_bytes.end());
-    auto flat_args = wire::decode_ipc(flat_bytes);
-    // ScanFunctionResultSchema.arguments decodes to a *flat* batch (one
-    // column per argument, possibly zero); BindRequest.arguments needs it
-    // repackaged as a single "args" struct column (see WrapAsArgsStruct).
-    // If it doesn't decode at all, forward the raw bytes unchanged rather
-    // than guess.
-    auto args_bytes = flat_args ? WrapAsArgsStruct(flat_args) : scan_function.arguments_ipc_bytes;
+    std::vector<uint8_t> args_bytes;
+    if (scan_function.arguments_already_wrapped) {
+        // See ScanFunction::arguments_already_wrapped's comment - the
+        // caller already built the exact wire shape BindRequest.arguments
+        // needs (e.g. named_<name> fields), so send it verbatim rather
+        // than running it through WrapAsArgsStruct's positional rename.
+        args_bytes = scan_function.arguments_ipc_bytes;
+    } else {
+        std::string flat_bytes(scan_function.arguments_ipc_bytes.begin(), scan_function.arguments_ipc_bytes.end());
+        auto flat_args = wire::decode_ipc(flat_bytes);
+        // ScanFunctionResultSchema.arguments decodes to a *flat* batch (one
+        // column per argument, possibly zero); BindRequest.arguments needs
+        // it repackaged as a single "args" struct column (see
+        // WrapAsArgsStruct). If it doesn't decode at all, forward the raw
+        // bytes unchanged rather than guess.
+        args_bytes = flat_args ? WrapAsArgsStruct(flat_args) : scan_function.arguments_ipc_bytes;
+    }
     auto inner = BuildBindRequest(scan_function.function_name, args_bytes,
                                    /*function_type=*/"TABLE",
                                    /*input_schema_bytes=*/std::nullopt, /*settings_bytes=*/std::nullopt,
@@ -135,12 +145,41 @@ void TableScanner::Bind(const ScanFunction& scan_function, const std::optional<s
     auto parsed = ParseBindResponse(result);
     bind_.output_schema = parsed.output_schema;
     bind_.opaque_data = parsed.opaque_data;
+    supports_splits_ = scan_function.supports_splits;
 }
 
 void TableScanner::Init(const std::vector<int64_t>& projection_ids,
                         const std::optional<std::string>& pushdown_filters,
                         std::optional<int64_t> row_limit) {
     if (!bind_.output_schema) throw std::runtime_error("TableScanner::Init called before Bind");
+    inited_ = true;
+    init_projection_ids_ = projection_ids;
+    init_pushdown_filters_ = pushdown_filters;
+    init_row_limit_ = row_limit;
+
+    if (supports_splits_) {
+        // Plan the scan into splits instead of one whole-scan init - see
+        // catalog_table_plan.h for the full design. Uses the SAME
+        // projection/pushdown this scan already computed: splits doesn't
+        // change what xBestIndex/xFilter decided to push down, only how
+        // the resulting scan is redeemed.
+        auto plan = PlanTableFunctionSplits(connection_, bind_call_bytes_, bind_.opaque_data, projection_ids,
+                                            pushdown_filters);
+        pending_splits_ = std::move(plan.split_tokens);
+        split_init_opaque_data_ = std::move(plan.init_opaque_data);
+        next_split_index_ = 0;
+        if (pending_splits_.empty()) {
+            // Zero splits is legal (a fully-pruned scan) and means an
+            // empty result, not an error - see catalog_table_plan.h.
+            // Leaving stream_ null here is what tells Next() there's
+            // nothing to tick.
+            stream_.reset();
+            return;
+        }
+        OpenNextSplit();
+        return;
+    }
+
     auto output_schema_bytes = to_bytes(wire::encode_schema(bind_.output_schema));
     auto inner = BuildInitRequest(bind_call_bytes_, output_schema_bytes,
                                    bind_.opaque_data.empty()
@@ -154,16 +193,46 @@ void TableScanner::Init(const std::vector<int64_t>& projection_ids,
     stream_ = connection_.OpenProducer("init", params, bind_.output_schema, /*has_header=*/true);
 }
 
+void TableScanner::OpenNextSplit() {
+    auto output_schema_bytes = to_bytes(wire::encode_schema(bind_.output_schema));
+    auto inner = BuildInitRequest(bind_call_bytes_, output_schema_bytes,
+                                   split_init_opaque_data_.empty()
+                                       ? std::nullopt
+                                       : std::optional<std::vector<uint8_t>>(split_init_opaque_data_),
+                                   init_projection_ids_, init_pushdown_filters_, /*join_keys=*/{}, init_row_limit_,
+                                   /*phase=*/std::nullopt,
+                                   /*split_tokens=*/{pending_splits_[next_split_index_]});
+    auto init_bytes = to_bytes(wire::encode_ipc(inner));
+    auto params = gen::BuildInitParams(init_bytes);
+    stream_ = connection_.OpenProducer("init", params, bind_.output_schema, /*has_header=*/true);
+    ++next_split_index_;
+}
+
 std::optional<std::shared_ptr<arrow::RecordBatch>> TableScanner::Next() {
-    if (!stream_) throw std::runtime_error("TableScanner::Next called before Init");
+    if (!inited_) throw std::runtime_error("TableScanner::Next called before Init");
     // tick() returning nullopt is the real end-of-stream signal (the
     // worker closed its response stream, i.e. called out.finish()). A
     // present-but-0-row batch is a legitimate mid-stream tick, not EOF -
     // skip empty ticks rather than surfacing them as rows, but keep
-    // pulling until the stream actually ends.
+    // pulling until the stream actually ends. Under splits, nullopt means
+    // only *this split* ended - not necessarily the whole scan (a filter
+    // can prune one split to nothing while later splits still have rows,
+    // and a zero-row split must not end the scan any more than a
+    // zero-row tick does) - so advance to the next pending split, if any,
+    // and keep going; only report the whole scan's end once every split
+    // (or the single non-split stream) is exhausted.
     for (;;) {
+        if (!stream_) return std::nullopt;
         auto batch = stream_->Tick();
-        if (!batch) return std::nullopt;
+        if (!batch) {
+            stream_->Close();
+            stream_.reset();
+            if (supports_splits_ && next_split_index_ < pending_splits_.size()) {
+                OpenNextSplit();
+                continue;
+            }
+            return std::nullopt;
+        }
         if (batch->batch && batch->batch->num_rows() > 0) return batch->batch;
     }
 }

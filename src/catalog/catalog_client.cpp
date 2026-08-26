@@ -57,6 +57,12 @@ ScanFunction ParseScanFunction(const std::shared_ptr<arrow::RecordBatch>& scan_f
     ScanFunction fn;
     fn.function_name = wire::get_string(scan_function_info, "function_name");
     fn.arguments_ipc_bytes = to_bytes(wire::get_binary(scan_function_info, "arguments"));
+    // get_optional_bool, not get_bool: an older worker predating the
+    // splits protocol addition won't send this column at all (not merely
+    // a null value) - defaulting to false via the missing-column case is
+    // exactly "no splits", not an error. See catalog_client.h's
+    // ScanFunction::supports_splits comment.
+    fn.supports_splits = wire::get_optional_bool(scan_function_info, "supports_splits").value_or(false);
     return fn;
 }
 

@@ -158,7 +158,8 @@ std::shared_ptr<arrow::RecordBatch> BuildInitRequest(
     const std::vector<uint8_t>& bind_call_bytes, const std::vector<uint8_t>& output_schema_bytes,
     const std::optional<std::vector<uint8_t>>& bind_opaque_data, const std::vector<int64_t>& projection_ids,
     const std::optional<std::string>& pushdown_filters, const std::vector<std::string>& join_keys,
-    std::optional<int64_t> row_limit, const std::optional<std::string>& phase) {
+    std::optional<int64_t> row_limit, const std::optional<std::string>& phase,
+    const std::vector<std::vector<uint8_t>>& split_tokens) {
     static const std::vector<std::string> phase_values = {"INPUT", "FINALIZE", "TABLE_BUFFERING",
                                                             "TABLE_BUFFERING_FINALIZE"};
     static const std::vector<std::string> direction_values = {"ASC", "DESC"};
@@ -235,10 +236,17 @@ std::shared_ptr<arrow::RecordBatch> BuildInitRequest(
         arrays.push_back(finish(list, "join_keys"));
     }
     {
-        // split_tokens: always null - split-based scanning is a later phase.
         auto values = std::make_shared<arrow::LargeBinaryBuilder>();
         arrow::ListBuilder list(arrow::default_memory_pool(), values);
-        check_ok(list.AppendNull(), "append null split_tokens");
+        if (split_tokens.empty()) {
+            check_ok(list.AppendNull(), "append null split_tokens");
+        } else {
+            check_ok(list.Append(), "start split_tokens");
+            for (const auto& token : split_tokens) {
+                check_ok(values->Append(token.data(), static_cast<int64_t>(token.size())),
+                         "append split_tokens entry");
+            }
+        }
         arrays.push_back(finish(list, "split_tokens"));
     }
     {
