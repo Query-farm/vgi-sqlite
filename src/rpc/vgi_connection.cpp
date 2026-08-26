@@ -1,13 +1,75 @@
 // © Copyright 2026 Query Farm LLC - https://query.farm
 #include "rpc/vgi_connection.h"
 
+#include <mutex>
 #include <sstream>
+#include <unordered_map>
 #include <utility>
 
+#include "rpc/launcher.h"
 #include "vgi/generated/vgi_protocol_version.hpp"
 
 namespace vgi_sqlite {
 namespace {
+
+vgi_rpc::RpcClient ConnectUnixPath(const std::string& path) {
+    vgi_rpc::RpcClientOptions options;
+    options.protocol_version = std::string(vgi::generated::VGI_PROTOCOL_VERSION);
+    return vgi_rpc::RpcClient::connect_unix(path, options);
+}
+
+// Per-process cache of launch: location -> resolved socket path, mirroring
+// vgi's own vgi_launcher_cache.cpp: a launch: Connect() would otherwise
+// re-run the whole flock+probe+(maybe spawn) dance on every single call,
+// which for the ALREADY-running-worker case is a real, avoidable cost (a
+// flock acquire plus a connect probe) paid on every ConnectionPool::Acquire().
+// No override-conflict tracking here (unlike the reference) - vgi_attach()
+// has no mechanism yet to pass launcher_idle_timeout/launcher_state_dir
+// overrides per location, so every launch: connection for a given location
+// string uses LaunchConfig's plain defaults; that mechanism can be added
+// later without touching this cache's shape.
+std::mutex g_launch_cache_mutex;
+std::unordered_map<std::string, std::string> g_launch_cache;
+
+std::string ResolveLaunchSocketPathCached(const std::string& location) {
+    {
+        std::lock_guard<std::mutex> lock(g_launch_cache_mutex);
+        auto it = g_launch_cache.find(location);
+        if (it != g_launch_cache.end()) return it->second;
+    }
+    // Launch() outside the lock - a long-running spawn for one location
+    // shouldn't block resolution of every other location.
+    LaunchConfig cfg;
+    cfg.worker_argv = launcher::ParseLaunchArgv(location.substr(std::string("launch:").size()));
+    std::string path = Launch(cfg);
+    std::lock_guard<std::mutex> lock(g_launch_cache_mutex);
+    // First writer wins if a racing caller resolved the same location
+    // concurrently - both computed the same LaunchConfig, so either
+    // path is equally valid; no need to prefer one over the other.
+    return g_launch_cache.try_emplace(location, path).first->second;
+}
+
+void InvalidateLaunchSocketCache(const std::string& location) {
+    std::lock_guard<std::mutex> lock(g_launch_cache_mutex);
+    g_launch_cache.erase(location);
+}
+
+// Resolves a launch: location to a live worker and connects, retrying once
+// on a stale cache entry - mirrors vgi's own ResolveAndConnect: the cached
+// worker is typically gone because its idle timeout expired between the
+// prior call and this one; invalidate and resolve again (which re-probes,
+// and spawns fresh if genuinely dead) rather than failing outright on a
+// merely-stale cache.
+vgi_rpc::RpcClient ConnectViaLauncher(const std::string& location) {
+    std::string path = ResolveLaunchSocketPathCached(location);
+    try {
+        return ConnectUnixPath(path);
+    } catch (const std::exception&) {
+        InvalidateLaunchSocketCache(location);
+        path = ResolveLaunchSocketPathCached(location);
+        return ConnectUnixPath(path);
+    }
+}
 
 std::vector<std::string> SplitWhitespace(const std::string& s) {
     std::vector<std::string> parts;
@@ -79,19 +141,21 @@ VgiConnection VgiConnection::Connect(const std::string& location) {
     // "the raw/subprocess-family transport", just choosing how the other
     // end of that raw byte stream comes to exist; every downstream
     // CallUnary/OpenProducer/OpenExchange call is identical either way.
-    // Not the full launcher-protocol discovery contract (AF_UNIX
-    // auto-spawn-on-demand, docs/launcher-protocol.md) - deliberately
-    // smaller: this driver still expects something else to have started
-    // the worker and bound the socket already, which is enough for reusing
-    // one long-lived worker across many connections (e.g. this repo's own
-    // sqllogictest runner - see test/sqllogictest/README.md) without
-    // taking on auto-discovery/spawn semantics this driver doesn't need
-    // yet. Full launcher-protocol support remains a documented gap (see
-    // the plan file's "Later phases" section).
+    // This driver still expects something else to have started the worker
+    // and bound the socket already - no discovery, no spawn-on-demand.
     if (location.rfind("unix://", 0) == 0) {
-        vgi_rpc::RpcClientOptions options;
-        options.protocol_version = std::string(vgi::generated::VGI_PROTOCOL_VERSION);
-        return VgiConnection(vgi_rpc::RpcClient::connect_unix(location.substr(7), options));
+        return VgiConnection(ConnectUnixPath(location.substr(7)));
+    }
+
+    // launch:<argv...> - the full launcher-discovery protocol
+    // (docs/launcher-protocol.md): brings up, or reuses, a worker
+    // system-wide (across this driver, vgi's own DuckDB extension,
+    // `vgi-rpc launch`, any other client) per (worker_argv, cwd,
+    // VGI_RPC_*-env) tuple, coordinated via a per-hash flock in a
+    // per-user state directory, then connects to it the same way
+    // unix:// does above. See rpc/launcher.h for the full design.
+    if (launcher::IsLaunchLocation(location)) {
+        return VgiConnection(ConnectViaLauncher(location));
     }
 
     auto parsed = ParseLocation(location);

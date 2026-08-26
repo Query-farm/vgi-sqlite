@@ -401,3 +401,47 @@ the wire protocol in isolation, THEN wire into the SQLite extension, where a
     arguments - the same table-function-call gap named elsewhere in this
     file), so there's no real caller of this path through the SQL layer
     yet.
+- **The full launcher discovery protocol (`launch:<argv...>` locations,
+  `docs/launcher-protocol.md`) is implemented** - `src/rpc/launcher.{h,cpp}`,
+  ported from vgi (the DuckDB extension)'s own C++ reference
+  (`src/vgi_launcher{,_internal}.cpp`), POSIX-only (this driver has no
+  Windows build target at all). Brings up, or reuses, a worker
+  system-wide - across this driver, vgi's own DuckDB extension,
+  `vgi-rpc launch` on the CLI, any other client - per (worker_argv, cwd,
+  `VGI_RPC_*`-env) tuple, coordinated via a per-hash flock in a per-user
+  state directory (`$XDG_RUNTIME_DIR/vgi-rpc` or `$TMPDIR/vgi-rpc-$EUID`
+  or `/tmp/vgi-rpc-$EUID`). The hash (16 hex chars, first 8 bytes of
+  `sha256(canonical_json({cmd,cwd,env}))`) MUST match byte-for-byte across
+  every client SDK - this isn't an internal implementation detail free to
+  diverge, it's how two different clients agree they mean the same
+  worker. `VgiConnection::Connect` wires `launch:` in right next to the
+  existing `unix://` path (same `RpcClient::connect_unix` underneath -
+  `Launch()` just resolves which socket path to connect to first), with a
+  small per-process cache (location -> resolved socket path) so repeated
+  `ConnectionPool::Acquire()` calls for the same location don't re-run the
+  whole flock+probe dance every time - invalidated and retried once on a
+  stale cached path (the typical cause: the worker's idle-timeout expired
+  between calls), mirroring vgi's own `ResolveAndConnect`.
+  Verified end-to-end against a real `vgi-fixture-worker`: a fresh
+  `launch:` location spawns and attaches correctly (confirmed real data:
+  `data.numbers` scan returns 100 rows); a SECOND attach to the identical
+  location reuses the already-running worker rather than spawning a
+  second one (confirmed directly via `ps` - same PID pair, same start
+  time, across both attaches); killing the worker and attaching again
+  correctly detects the stale socket (a failed connect probe), unlinks
+  it, and spawns a fresh one (confirmed by a genuine cold-start-length
+  attach time, not a fast reuse). Full pytest suite (46/46) unaffected.
+  Not ported: vgi-rpc-python's `.meta`-file writing and `gc_state_dir`
+  opportunistic cleanup of dead entries - matches vgi's own C++ port,
+  which also skips both (a debugging/introspection convenience, not part
+  of the core wire contract another client strictly needs to
+  interoperate) - so leftover `.lock`/`.sock` files from a worker whose
+  idle-timeout already fired accumulate in the state dir over a long
+  enough session; harmless (tiny, and any future `Launch()` for that same
+  tuple just reuses/replaces them), just not proactively swept.
+  Also not exposed yet: per-location overrides (`launcher_idle_timeout`/
+  `launcher_state_dir`, which vgi's own ATTACH-option syntax supports) -
+  `vgi_attach()` has no general options mechanism to carry them through,
+  so every `launch:` connection uses `LaunchConfig`'s plain defaults
+  (300s idle timeout, 30s connect timeout, 60s worker-startup timeout) -
+  a real, documented scope decision, not an oversight.

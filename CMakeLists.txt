@@ -80,6 +80,7 @@ add_library(SQLite::SQLite3 ALIAS sqlite3)
 # ── The driver: pure VGI client logic, no SQLite dependency ───────────────
 add_library(vgi_sqlite_driver
     src/rpc/vgi_connection.cpp
+    src/rpc/launcher.cpp
     src/wire/wire_builders.cpp
     src/wire/wire_readers.cpp
     src/catalog/catalog_requests.cpp
