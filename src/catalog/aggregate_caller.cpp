@@ -4,6 +4,7 @@
 #include <stdexcept>
 
 #include <arrow/api.h>
+#include <arrow/compute/cast.h>
 
 #include "catalog/aggregate_requests.h"
 #include "generated/vgi_request_builders.hpp"
@@ -125,10 +126,31 @@ void AggregateCaller::Step(const std::vector<std::shared_ptr<arrow::Scalar>>& ar
     std::vector<std::shared_ptr<arrow::Array>> columns = {
         arrow::MakeArrayFromScalar(*arrow::MakeScalar(int64_t{0}), 1).ValueOrDie()};
     for (size_t i = 0; i < args.size(); ++i) {
-        // Cast rather than require an exact type match - same reasoning
-        // as ScalarFunctionCaller: the schema was locked in from
-        // whichever Step() happened to bind first.
-        auto cast_result = args[i]->CastTo(arg_types_->field(static_cast<int>(i))->type());
+        // Cast rather than require an exact type match - unlike
+        // ScalarFunctionCaller (which now re-derives arg_types_ fresh on
+        // every call, see its own file comment), this caller genuinely
+        // can't do that: execution_id-keyed accumulation is bound to one
+        // fixed input_schema for the whole group (see EnsureBound/the
+        // header's file comment on why re-binding mid-group isn't an
+        // option), so a later Step() with a differently-typed argument
+        // than the row that happened to bind first has no choice but to
+        // coerce into the locked type. arrow::Scalar::CastTo alone isn't
+        // safe for that, though: it succeeds (silently truncating) on a
+        // narrowing numeric cast like double->int64 - exactly the
+        // mechanism that produced this driver's earlier scalar-function
+        // bug (`add_values(1.5, 2.5)` silently computing as 1+2=3). Using
+        // arrow::compute::Cast with its default CastOptions::Safe()
+        // instead - allow_float_truncate/allow_int_overflow/
+        // allow_decimal_truncate all default false - makes a genuinely
+        // lossy cast fail loudly here instead, surfacing a clear
+        // mid-aggregation type-mismatch error to the SQL caller rather
+        // than a silently wrong sum/count. A caller mixing incompatible
+        // types across rows of one GROUP BY group now gets an explicit
+        // error instead of wrong results - a real, documented limitation
+        // (unlike ScalarFunctionCaller, this class can't just re-resolve
+        // per call), not a silent one.
+        auto cast_result =
+            arrow::compute::Cast(arrow::Datum(args[i]), arg_types_->field(static_cast<int>(i))->type());
         if (!cast_result.ok()) {
             throw std::runtime_error("aggregate function '" + function_name_ + "': argument " +
                                       std::to_string(i) + " (" + args[i]->type->ToString() +
@@ -136,7 +158,7 @@ void AggregateCaller::Step(const std::vector<std::shared_ptr<arrow::Scalar>>& ar
                                       arg_types_->field(static_cast<int>(i))->type()->ToString() +
                                       "): " + cast_result.status().ToString());
         }
-        auto array_result = arrow::MakeArrayFromScalar(*cast_result.ValueUnsafe(), 1);
+        auto array_result = arrow::MakeArrayFromScalar(*cast_result.ValueUnsafe().scalar(), 1);
         if (!array_result.ok()) {
             throw std::runtime_error("aggregate function '" + function_name_ + "': argument " +
                                       std::to_string(i) + ": " + array_result.status().ToString());

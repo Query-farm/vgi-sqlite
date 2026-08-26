@@ -7,9 +7,18 @@
 // how SQLite's own xStep fires once per row), finalizes, and prints the
 // result - proves the bind/update*/finalize/destructor wire protocol
 // before wiring it into the SQLite extension's xStep/xFinal bridge. Only
-// exercises single-argument integer-typed aggregates (e.g. vgi_sum(x));
-// pass `nullary:<rowcount>` instead of values for a nullary aggregate
-// (e.g. vgi_count()), stepped that many times with no arguments.
+// exercises single-argument aggregates (e.g. vgi_sum(x)); pass
+// `nullary:<rowcount>` instead of values for a nullary aggregate (e.g.
+// vgi_count()), stepped that many times with no arguments.
+//
+// Milestone-9 addition: a value containing '.' is stepped as a double
+// scalar instead of int64 - lets one invocation mix types across rows
+// (e.g. "1" "2.5" "3") to probe AggregateCaller::Step's type-locking
+// behavior (arg_types_ locks from the FIRST Step()'s actual type; every
+// later Step() must safely cast into it or throw - see aggregate_caller.cpp's
+// comment on why arrow::compute::Cast's default Safe() options replaced a
+// plain arrow::Scalar::CastTo here, closing a silent-truncation bug of the
+// same class already fixed once in ScalarFunctionCaller).
 #include <cstdio>
 #include <exception>
 #include <string>
@@ -32,15 +41,17 @@ int main(int argc, char** argv) {
     const std::string schema_name = argv[2];
     const std::string function_name = argv[3];
 
-    std::vector<int64_t> args;
+    std::vector<std::shared_ptr<arrow::Scalar>> args;
     int64_t nullary_rows = -1;
     int i = 4;
     for (; i < argc && std::string(argv[i]) != "--"; ++i) {
         std::string tok = argv[i];
         if (tok.rfind("nullary:", 0) == 0) {
             nullary_rows = std::stoll(tok.substr(8));
+        } else if (tok.find('.') != std::string::npos) {
+            args.push_back(arrow::MakeScalar(std::stod(tok)));
         } else {
-            args.push_back(std::stoll(tok));
+            args.push_back(arrow::MakeScalar(static_cast<int64_t>(std::stoll(tok))));
         }
     }
     if (i >= argc) {
@@ -62,7 +73,7 @@ int main(int argc, char** argv) {
         if (nullary_rows >= 0) {
             for (int64_t r = 0; r < nullary_rows; ++r) caller.Step({});
         } else {
-            for (auto v : args) caller.Step({arrow::MakeScalar(v)});
+            for (auto& v : args) caller.Step({v});
         }
 
         auto result = caller.Finalize();
