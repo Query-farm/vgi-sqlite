@@ -35,11 +35,14 @@
 // vgi_attach() parameter, specifically because `location` is already the
 // one string every one of those call sites threads through unchanged;
 // adding a parallel token channel would mean plumbing it through all of
-// them again. unix:// and tcp:// (RpcClient::connect_unix/connect_tcp) are
-// not implemented - no bearer-auth or TLS need drives them the way HTTP's
-// does, and they were never in this driver's scope (see the plan's
-// Milestone 5 line item, which named HTTP/bearer-auth transport parity
-// specifically).
+// them again. `unix:///path/to.sock` connects to an already-running worker
+// (RpcClient::connect_unix) instead of spawning a new subprocess per
+// connection - see Connect()'s own comment for why this is deliberately
+// smaller than the full launcher-protocol discovery contract
+// (docs/launcher-protocol.md's AF_UNIX auto-spawn-on-demand, still a
+// documented gap - see the plan's "Later phases" section). tcp://
+// (RpcClient::connect_tcp) is not implemented - no bearer-auth or TLS need
+// drives it the way HTTP's does, and it was never in this driver's scope.
 #pragma once
 
 #include <memory>

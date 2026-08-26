@@ -72,6 +72,28 @@ VgiConnection VgiConnection::spawn(const std::vector<std::string>& argv) {
 }
 
 VgiConnection VgiConnection::Connect(const std::string& location) {
+    // unix:///path/to.sock - connects to an already-running worker (e.g.
+    // `vgi-fixture-worker --unix path/to.sock`) instead of spawning a new
+    // subprocess per connection. Lands in the same raw_client_ slot as
+    // spawn() - vgi_rpc::RpcClient::connect_unix and ::spawn are both
+    // "the raw/subprocess-family transport", just choosing how the other
+    // end of that raw byte stream comes to exist; every downstream
+    // CallUnary/OpenProducer/OpenExchange call is identical either way.
+    // Not the full launcher-protocol discovery contract (AF_UNIX
+    // auto-spawn-on-demand, docs/launcher-protocol.md) - deliberately
+    // smaller: this driver still expects something else to have started
+    // the worker and bound the socket already, which is enough for reusing
+    // one long-lived worker across many connections (e.g. this repo's own
+    // sqllogictest runner - see test/sqllogictest/README.md) without
+    // taking on auto-discovery/spawn semantics this driver doesn't need
+    // yet. Full launcher-protocol support remains a documented gap (see
+    // the plan file's "Later phases" section).
+    if (location.rfind("unix://", 0) == 0) {
+        vgi_rpc::RpcClientOptions options;
+        options.protocol_version = std::string(vgi::generated::VGI_PROTOCOL_VERSION);
+        return VgiConnection(vgi_rpc::RpcClient::connect_unix(location.substr(7), options));
+    }
+
     auto parsed = ParseLocation(location);
     if (!parsed.is_http) return spawn(parsed.argv);
 

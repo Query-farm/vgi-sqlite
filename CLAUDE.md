@@ -106,6 +106,20 @@ Override the worker with `VGI_TEST_WORKER` (matches `vgi/Makefile`'s
 convention) or the extension path with `VGI_SQLITE_EXTENSION`. See
 `test/integration/README.md` for the coverage table.
 
+`test/integration/` remains the test source of record (see "Definition of
+done" above) - `test/sqllogictest/` is a separate, complementary tool that
+runs `~/Development/vgi`'s (the DuckDB extension) 327-file sqllogictest
+corpus against this driver, translating what's mechanically translatable
+and reporting pass/fail/skip per record to track *continuously growing*
+coverage of that corpus, not to replace `test/integration/`'s own tests.
+See `test/sqllogictest/README.md` for the full design and how to extend
+it.
+
+```bash
+python3 test/sqllogictest/run_sqllogictest.py                # full corpus
+python3 test/sqllogictest/run_sqllogictest.py --category scalar -v
+```
+
 ## Things worth knowing before changing anything
 
 Each of these cost real debugging time against a live worker, and none is
@@ -294,3 +308,52 @@ the wire protocol in isolation, THEN wire into the SQLite extension, where a
   `sqlite3_log(SQLITE_WARNING, ...)` at attach time rather than fixed by
   a bigger redesign (storing credentials outside the schema) - out of
   scope for now, see the plan file's Milestone 5 status.
+- **`VgiConnection::Connect` also speaks `unix:///path/to.sock`** -
+  connects to an already-running worker (`vgi_rpc::RpcClient::connect_unix`)
+  instead of spawning a new subprocess per connection, landing in the same
+  `raw_client_` slot `spawn()` uses (both are "the raw/subprocess-family
+  transport"). Added for `test/sqllogictest/`'s persistent-worker mechanism
+  (see its README) after spawn-per-`ATTACH` overhead (a fresh `uv run` +
+  Python-interpreter-startup per connection) turned out to dominate that
+  tool's wall-clock time - not the full AF_UNIX launcher-protocol discovery
+  contract (`docs/launcher-protocol.md`, still a documented gap), just
+  connecting to a socket something else already bound.
+- **A single persistent worker process does NOT scale with client-side
+  concurrency**, even with `--unix`'s own `--threaded` default (one daemon
+  thread per connection) - it's still one CPython process, and real
+  request handling mostly holds the GIL, so concurrent connections
+  interleave rather than run in parallel. Measured directly building
+  `test/sqllogictest/`'s persistent-worker pool: 16x client-side
+  concurrency against one persistent worker instance bought ~1.4x
+  wall-clock improvement while CPU time roughly doubled (thread-scheduling/
+  GIL-contention overhead) - a pool of real OS processes (one worker
+  process per pool slot) is what actually parallelizes. Relevant to any
+  future use of a shared/pooled worker process from this driver, not just
+  the test tooling.
+- **Two real bugs found by running `~/Development/vgi`'s sqllogictest
+  corpus against this driver for the first time** (`test/sqllogictest/` -
+  see its README and the plan file's Milestone 6 status for the full
+  detail) - neither fixed yet, both tracked as concrete next work:
+  1. A process-crashing bug: `terminate called after throwing an instance
+     of 'vgi_rpc::RpcException'` / `what():  IndexError: index out of
+     bounds` - an uncaught C++ exception reaching `std::terminate()`/
+     `abort()`, not a normal SQLite error return. Two precise repro files:
+     `table/filter_pushdown_through_view.test`,
+     `table/late_materialization.test`. Same *class* of worker-side
+     `IndexError` bug already fixed once in Milestone 3
+     (`BindRequest.arguments` needing exactly one row), but this is
+     evidently a distinct trigger specific to late-materialization/
+     filter-pushdown-through-a-view scenarios.
+  2. `ScalarFunctionCaller` locks `arg_types_` from the *first* call's
+     actual argument values and reuses that one locked caller for every
+     later call to the same registered SQL function in a session (its own
+     documented design) - so calling the same scalar function with
+     genuinely different argument types later in the same session silently
+     CASTs the new arguments down to the first call's locked types instead
+     of erroring or re-resolving, producing **silently wrong results**
+     (observed: `add_values(1.5, 2.5)`, after an earlier `add_values(int,
+     int)` call in the same session, computed as `add_values(CAST(1.5 AS
+     locked-int), CAST(2.5 AS locked-int))` = 3, not 4). No existing
+     `test/integration/` test calls one registered function with varying
+     argument types in one session, which is why this was never caught
+     before.
