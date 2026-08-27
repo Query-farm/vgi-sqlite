@@ -33,6 +33,30 @@ subsequent ATTACH across the whole run reuses that one long-lived process
 over unix:// instead of spawning a fresh one - the same reuse a real
 launcher-protocol deployment would give this driver, just started
 explicitly by this test runner instead of on-demand-discovered by it.
+
+Go-backed fixtures (_FIXTURE_GO_BINARIES) - user-prompted after a
+--jobs 48 run against a 4-per-fixture vgi-python worker pool mass-timed-out
+(152 files hit the 120s per-file timeout, almost entirely on VGI_TEST_WORKER
+- the "example" catalog nearly every category depends on): a CPython
+`--unix` worker serves each connection on its own thread, but real request
+handling mostly holds the GIL (see PersistentWorkers.start_all's own
+docstring/measurement below) - N concurrent client connections against one
+process don't get N-way real parallelism, and a small process-pool (the
+fix this file already used) only buys back some of that, not all of it,
+once client-side concurrency (--jobs) is high enough. vgi-go's example
+worker binaries (built from ~/Development/vgi-go, `go build ./cmd/<pkg>/`)
+register the SAME catalog names/functions (vgi.WithCatalogName("example"),
+matching vgi-python's vgi-fixture-worker exactly - confirmed by reading
+cmd/vgi-example-worker/main.go) but handle concurrent requests via
+goroutines, not a GIL-bound thread pool - one process gets real multi-core
+concurrency for free. Where a Go binary is available (five of the eight
+fixtures - VGI_TEST_WORKER, VGI_SIMPLE_WRITABLE_WORKER,
+VGI_ATTACH_OPTIONS_WORKER/_REQUIRED_WORKER, VGI_VERSIONED_WORKER,
+VGI_VERSIONED_TABLES_WORKER; VGI_BAD_PROTOCOL_WORKER/VGI_BAD_ENUM_WORKER
+have no vgi-go equivalent and stay on vgi-python), start_all() spawns
+exactly ONE Go process regardless of pool_size instead of pool_size
+Python ones - no process-pool workaround needed when the single process
+itself scales.
 """
 
 from __future__ import annotations
@@ -59,13 +83,44 @@ _FIXTURE_SCRIPTS = {
     "VGI_BAD_ENUM_WORKER": "vgi-fixture-bad-enum-worker",
 }
 
+# {ENV_VAR_NAME: vgi-go binary basename} - the subset of _FIXTURE_SCRIPTS
+# that also has a goroutine-based vgi-go equivalent (see this module's
+# docstring). Two attach-options env vars share one binary, same as their
+# vgi-python entries above. No entry for VGI_BAD_PROTOCOL_WORKER/
+# VGI_BAD_ENUM_WORKER - vgi-go has no error-injection fixture equivalent.
+_FIXTURE_GO_BINARIES = {
+    "VGI_TEST_WORKER": "vgi-example-worker-go",
+    "VGI_SIMPLE_WRITABLE_WORKER": "vgi-example-simple-writable-worker-go",
+    "VGI_ATTACH_OPTIONS_WORKER": "vgi-example-attach-options-worker-go",
+    "VGI_ATTACH_OPTIONS_REQUIRED_WORKER": "vgi-example-attach-options-worker-go",
+    "VGI_VERSIONED_WORKER": "vgi-example-versioned-worker-go",
+    "VGI_VERSIONED_TABLES_WORKER": "vgi-example-versioned-tables-worker-go",
+}
+
 
 def _vgi_python() -> str:
     return os.environ.get("VGI_PYTHON", str(Path.home() / "Development" / "vgi-python"))
 
 
+def _vgi_go() -> str:
+    return os.environ.get("VGI_GO", str(Path.home() / "Development" / "vgi-go"))
+
+
 def _worker_cmd(script: str) -> str:
     return f"uv run --project {_vgi_python()} {script}"
+
+
+def _go_binary_path(var: str) -> Path | None:
+    """The built vgi-go binary for `var`, if _FIXTURE_GO_BINARIES names one
+    AND it actually exists (e.g. `go build ./cmd/<pkg>/` was run in
+    ~/Development/vgi-go - see this module's docstring) - None falls back
+    to the vgi-python spawn-per-connection command, same as any other
+    unresolvable fixture."""
+    name = _FIXTURE_GO_BINARIES.get(var)
+    if name is None:
+        return None
+    path = Path(_vgi_go()) / name
+    return path if path.is_file() else None
 
 
 def resolve_env(extra_scratch_dir: Path | None = None) -> dict[str, str]:
@@ -134,15 +189,27 @@ class PersistentWorkers:
         `uv`/vgi-python checkout, etc.) is simply left out of its var's
         list - if a var's list ends up empty, that var keeps its
         spawn-per-connection command string from base_env instead (slower
-        for that one fixture, not a failure)."""
+        for that one fixture, not a failure).
+
+        A fixture with a built vgi-go binary (_go_binary_path(var) is not
+        None) spawns exactly ONE process here regardless of pool_size,
+        never `pool_size` - see this module's docstring on why a Go
+        process doesn't need the process-pool workaround a GIL-bound
+        CPython one does."""
         pending: list[tuple[str, Path, subprocess.Popen]] = []
         for var, script in _FIXTURE_SCRIPTS.items():
-            cmd = base_env.get(var, _worker_cmd(script)).split()
-            # base_env's value is a full "uv run --project <dir> <script>"
-            # command string - reuse it verbatim (respecting any override
-            # already applied) and just append the --unix/--idle-timeout
-            # flags, rather than re-deriving the command from scratch.
-            for i in range(pool_size):
+            go_binary = _go_binary_path(var)
+            if go_binary is not None:
+                cmd = [str(go_binary)]
+                count = 1
+            else:
+                # base_env's value is a full "uv run --project <dir> <script>"
+                # command string - reuse it verbatim (respecting any override
+                # already applied) and just append the --unix/--idle-timeout
+                # flags, rather than re-deriving the command from scratch.
+                cmd = base_env.get(var, _worker_cmd(script)).split()
+                count = pool_size
+            for i in range(count):
                 sock_path = self._sock_dir / f"{script}.{i}.sock"
                 proc = subprocess.Popen(
                     [*cmd, "--unix", str(sock_path), "--idle-timeout", "0"],
