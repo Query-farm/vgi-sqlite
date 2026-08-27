@@ -661,3 +661,150 @@ the wire protocol in isolation, THEN wire into the SQLite extension, where a
   other probe here which hardcodes `spawn()`) that made isolating each of
   these three bugs from a real worker's actual RPC responses tractable,
   independent of the SQLite layer.
+- **A fourth real bug found via the same live-worker-testing discipline,
+  against the DuckDB `earthquakes` demo this time**:
+  `EncodePushdownFilters` (`src/vtab/filter_pushdown.{h,cpp}`) sent
+  `pushdown_filters.column_index` as the constraint's index into the
+  table's full DECLARED schema. The wire protocol actually wants the
+  column's position within the PROJECTED (narrowed) output - confirmed
+  against `vgi`'s own DuckDB-extension source (`vgi_table_function_impl.cpp`'s
+  own comment: "col_idx is the filter's position in the projected
+  column_ids... the worker applies ConstantFilter/InFilter by INDEX
+  (batch.column(column_index))... this only resolves correctly because the
+  worker emits its output batch in the same projected order"). A narrow
+  `SELECT col` combined with `WHERE col ...` silently returned ZERO rows;
+  `SELECT *` with the identical `WHERE` worked, since declared-index and
+  projected-position coincide when nothing is dropped - masking this for
+  every prior milestone's testing, since a genuinely narrow projection
+  combined with a filter was never exercised until this demo. Fixed by
+  threading `xFilter`'s `projected_columns` through to
+  `EncodePushdownFilters` and translating each constraint's declared index
+  into its position within that list (empty list means "every column,
+  declared order," where the two already coincide). Verified against both
+  the raw repro and the full earthquakes demo query, byte-for-byte
+  matching `haybarn-cli`'s reference output.
+- **Plain, standalone table (generator) functions are supported** - a new
+  `vgi_table_function` SQLite virtual table module
+  (`src/vtab/vgi_table_function_vtab.{h,cpp}`), for the shape `table_in_out`
+  deliberately doesn't cover: no per-row streaming input at all, just
+  ordinary declared arguments, callable as `FROM catalog_fn(args)`
+  (literal or per-outer-row correlated via `FROM t, catalog_fn(t.x)` - the
+  same `json_each`-style implicit correlation `table_in_out` already
+  established needs no LATERAL keyword). Architecturally closer to
+  `vgi_worker` than `vgi_table_in_out`: a fresh `TableScanner` per
+  `xFilter` call (no persistent per-cursor caller), matching a plain
+  table's own scan semantics exactly, since this shape has nothing
+  analogous to `table_in_out`'s "bind once, exchange many times" per-row
+  contract. `catalog_client.{h,cpp}` gained `CatalogPlainTableFunction`
+  discovery (`SchemaContentsPlainTableFunctions`/`PlainTableFunctionGet`),
+  filtered to `input_from_args=false && has_finalize=false &&
+  !HasTableTypedArgument(argument_schema)` - excludes `table_in_out`'s own
+  territory (input_from_args=true) and the classic relation-valued-
+  argument `table_in_out` shape (any argument field carrying `vgi_type:
+  table` metadata), leaving only genuinely plain, positionally-argued
+  table functions. `xBestIndex` requires an EQ constraint on every HIDDEN
+  argument column (same `SQLITE_CONSTRAINT`-on-missing-arg contract
+  `vgi_table_in_out` already uses); output/hidden-column name-collision
+  disambiguation is copied from `vgi_table_in_out_vtab.cpp` verbatim (same
+  risk, same fix). A known, not-yet-handled gap: arity-overloading (e.g.
+  `geo_encode`/`geo_encode3` sharing one SQL name) collides when
+  `vgi_attach()` tries to register the second one under the same generated
+  name - the second attempt fails cleanly and is skipped (matching every
+  other per-function `CREATE VIRTUAL TABLE` failure's handling), but only
+  one overload ends up callable; not fixed, `overload` stays a structural
+  skip category in the sqllogictest corpus for exactly this reason. Two
+  real bugs found and fixed via live testing against the `example`
+  catalog's real `split_sequence` fixture (no synthetic fixture needed -
+  this one was already registered in `vgi-fixture-worker` the whole time,
+  just never reachable via any SQLite construct before this module):
+  1. **`split_sequence(100, 4)` returned 0 rows.** `AdvanceBatch` (as
+     implemented in both `vgi_vtab.cpp` and copied into
+     `vgi_table_function_vtab.cpp`) only ever SETS `cursor->eof = true`
+     on a genuine end-of-stream - it never CLEARS it on a successful
+     fetch. Safe only when a cursor's `eof` field starts `false` and the
+     cursor is used exactly once per scan (true for a plain table's
+     cursor) - the new module's cursor's `eof` field simply defaulted to
+     the wrong value relative to this implicit contract. Fixed by an
+     explicit `bool eof = false;` with a comment explaining exactly why
+     this default matters here specifically.
+  2. **Correlated multi-row scans (`FROM nums, fn(nums.n, ...)`) returned
+     0 rows for every outer row after the first.** Same `AdvanceBatch`
+     contract, a sharper case of it: unlike a plain table's cursor
+     (`xFilter` called once per cursor lifetime), a table-function
+     cursor used for a correlated scan is re-filtered many times on the
+     SAME cursor object (one `xFilter` call per outer row) - a PRIOR
+     scan's own completion (`eof` correctly left `true` by ITS last
+     `AdvanceBatch`) stayed stuck `true` forever without an explicit
+     reset, silently reporting every subsequent correlated row as
+     producing zero results. Fixed by explicitly resetting
+     `cursor->eof = false` at the start of `xFilter`'s real-scan setup,
+     right before the (now try-block-wrapped, matching the earlier
+     Milestone-7 process-crash fix) call to `AdvanceBatch`. Verified via
+     a 3-outer-row test (`n=5,10,20` -> `5,10,20` rows respectively,
+     total 35, all correct) - this is exactly the scenario the module's
+     whole raison d'être (correlated table-function calls) depends on, so
+     this bug would have silently broken the module's primary use case.
+  `test/integration/test_table_function.py` (6 tests) covers both bugs as
+  real, regression-tracked pytest coverage, plus literal calls, splits
+  redemption through this new call path, missing-argument-rejected-at-
+  prepare-time, and a cross-module sanity check that `vgi_table_function`
+  and `vgi_table_in_out` registering side-by-side in one `vgi_attach()`
+  call don't interfere with each other.
+- **The sqllogictest corpus's persistent worker pool now backs the
+  dominant `example` catalog fixture with `vgi-go`, not just
+  `vgi-python`** (`test/sqllogictest/workers.py`) - found necessary the
+  hard way: a `--jobs 48` corpus run against the pre-existing
+  4-process-per-fixture `vgi-python` pool mass-timed-out (152/328 files
+  hit the 120s per-file timeout - GIL contention: a CPython `--unix`
+  worker serves each connection on its own thread, but real request
+  handling mostly holds the GIL, so N client connections against a small
+  fixed pool of GIL-bound processes don't get real N-way parallelism, just
+  queueing once client-side concurrency is high enough - the same class of
+  bottleneck this file's own docstring already measured once for a single
+  worker instance, just hit again at a coarser scale). `vgi-go`'s example
+  worker binaries (`~/Development/vgi-go`, `go build ./cmd/<pkg>/`)
+  register the SAME catalog name (`vgi.WithCatalogName("example")`,
+  confirmed by reading `cmd/vgi-example-worker/main.go`) as `vgi-python`'s
+  fixture, but handle concurrent requests via goroutines, not a GIL-bound
+  thread pool - one process gets real multi-core concurrency for free
+  (confirmed directly: the single Go worker process reached 900%+ CPU
+  during a full-corpus run). `workers.py` now spawns exactly ONE Go
+  process (never a `pool_size`-sized pool - no process-pool workaround
+  needed when the single process itself scales) for the five fixtures
+  with a vgi-go equivalent (`VGI_TEST_WORKER`, `VGI_SIMPLE_WRITABLE_WORKER`,
+  `VGI_ATTACH_OPTIONS_WORKER`/`_REQUIRED_WORKER`, `VGI_VERSIONED_WORKER`,
+  `VGI_VERSIONED_TABLES_WORKER`); `VGI_BAD_PROTOCOL_WORKER`/
+  `VGI_BAD_ENUM_WORKER` have no vgi-go equivalent and stay on
+  `vgi-python`'s `pool_size`-process mechanism. Result: zero timeouts, and
+  the corpus's own passing-record count rose from 616 to 787 (verified
+  twice for determinism). **A real, serious self-inflicted incident along
+  the way, fully resolved**: blindly passing `--update-baseline` on the
+  first (mass-timed-out, garbage 141-passing) run overwrote
+  `baseline.json` with that garbage result, clobbering the good
+  616-passing baseline - caught by reading the actual run output rather
+  than trusting the update silently, fixed by restoring `baseline.json`
+  from the local git-tracked copy (never touched locally, so fully
+  recoverable). Never blindly pass `--update-baseline` without reading the
+  run's own pass/fail/skip numbers and regression list first. One
+  independently real, narrow finding surfaced investigating why 5 records
+  looked like regressions post-switch (they turned out to be confounded
+  by unrelated upstream `~/Development/vgi` corpus drift, not confirmed as
+  caused by the worker switch at all - see the plan file's Milestone 10
+  status for the full investigation): `vgi-go`'s own "products" example
+  fixture (`examples/table/static_data.go`) builds its Arrow schema with
+  no field metadata at all, so it never populates
+  `duckdb_columns().comment` for that table's columns the way
+  `vgi-python`'s equivalent fixture does - `vgi-go`'s `CatalogTable` model
+  DOES support column comments generally (`vgi/catalog_table.go`'s
+  `ColumnComments` field), it's just not wired up for this one example
+  table. A `vgi-go` bug, not a `vgi-sqlite` one; not fixed here.
+  `vgi-sqlite` does NOT implement `duckdb_functions()`/`duckdb_columns()`/
+  any other DuckDB-native introspection view, and `translate.py` does not
+  rewrite calls to them into anything else - a corpus query using them
+  genuinely fails ("no such table"), which is correct and expected
+  (DuckDB-dialect-specific constructs baked into the corpus's own `.test`
+  files; this driver has no reason to reimplement DuckDB's own
+  introspection views under DuckDB's own names - `pragma_*`/
+  `information_schema` conventions, or a `vgi_*`-prefixed function, would
+  be the right shape if this driver ever wants to expose worker-catalog
+  metadata to SQL, never a `duckdb_*` name).
