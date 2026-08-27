@@ -19,6 +19,26 @@ vgi_rpc::RpcClient ConnectUnixPath(const std::string& path) {
     return vgi_rpc::RpcClient::connect_unix(path, options);
 }
 
+// launch:'s own rendezvous address format differs by platform - a real
+// AF_UNIX socket path on POSIX, a Windows named pipe (\\.\pipe\<name>) on
+// Windows (docs/launcher-protocol.md's own "Platform: Windows" section;
+// see launcher.h's file comment for why - CPython's own worker CLI has no
+// socket.AF_UNIX on Windows and serves a named pipe there instead, despite
+// the --unix flag's name). Distinct from ConnectUnixPath above, which is
+// for an EXPLICIT unix:// location the caller wrote themselves - that one
+// always means genuine AF_UNIX, on every platform, and stays connect_unix
+// unconditionally (verified working on Windows too, against a worker that
+// binds real AF_UNIX there, e.g. vgi-go's).
+vgi_rpc::RpcClient ConnectLauncherPath(const std::string& path) {
+#if defined(_WIN32)
+    vgi_rpc::RpcClientOptions options;
+    options.protocol_version = std::string(vgi::generated::VGI_PROTOCOL_VERSION);
+    return vgi_rpc::RpcClient::connect_pipe(path, options);
+#else
+    return ConnectUnixPath(path);
+#endif
+}
+
 // Per-process cache of launch: location -> resolved socket path, mirroring
 // vgi's own vgi_launcher_cache.cpp: a launch: Connect() would otherwise
 // re-run the whole flock+probe+(maybe spawn) dance on every single call,
@@ -64,11 +84,11 @@ void InvalidateLaunchSocketCache(const std::string& location) {
 vgi_rpc::RpcClient ConnectViaLauncher(const std::string& location) {
     std::string path = ResolveLaunchSocketPathCached(location);
     try {
-        return ConnectUnixPath(path);
+        return ConnectLauncherPath(path);
     } catch (const std::exception&) {
         InvalidateLaunchSocketCache(location);
         path = ResolveLaunchSocketPathCached(location);
-        return ConnectUnixPath(path);
+        return ConnectLauncherPath(path);
     }
 }
 

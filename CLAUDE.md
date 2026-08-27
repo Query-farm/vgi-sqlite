@@ -495,39 +495,84 @@ engines to claim splits concurrently.
   (`vgi_attach()` has no general options mechanism to carry them through) -
   every `launch:` connection uses `LaunchConfig`'s plain defaults (300s
   idle timeout, 30s connect timeout, 60s worker-startup timeout).
-  **Windows is now implemented, not just POSIX** - initially ported
-  faithfully from vgi (the DuckDB C++ extension)'s own Windows launcher,
-  which uses a named pipe ("PIPE:" discovery prefix). That turned out to
-  be the wrong reference to match: a live test against a real worker on
-  Windows (`europa`, a real Windows 11/MSVC box) failed because the
-  canonical protocol reference (`vgi_rpc/launcher.py`, confirmed directly
-  in its own source) uses genuine Windows AF_UNIX (Windows 10 1803+ has
-  real kernel AF_UNIX support) with the same "UNIX:" prefix and the same
-  108-byte `sun_path` limit as POSIX - not a named pipe at all - and
-  `vgi-go`'s worker CLI agrees (`--unix`: "Bind to this AF_UNIX socket
-  path"). Corrected to AF_UNIX before ever shipping as canonical; the
-  Windows `Launch()` is structurally close to the POSIX one (same
-  state-dir + hash + `.sock` scheme), differing only in process spawn
-  (`CreateProcess`, no `fork`/`exec`) and spawn election (a named
-  `Mutex`, no `flock`). **A real, initially-blocking gap this same live
-  testing found, since fixed in `vgi-rpc-c++` (not `vgi-sqlite`, its
-  natural home - see that repo's own commit)**: `RpcClient::connect_unix`
-  was a stub on Windows (`client_transport.cpp`'s
-  `ClientTransport::connect_unix` threw unconditionally there) - the
-  low-level `connect_unix_fd` helper it needed was POSIX-only-compiled,
-  and a straight port of it couldn't reuse `FdInputStream`/
-  `FdOutputStream` as-is (their Windows I/O primitives are `_read`/
-  `_write`, CRT file-descriptor calls that do not work on a raw Winsock
-  `SOCKET`). Fixed with a real `send`/`recv`-based `SocketInputStream`/
-  `SocketOutputStream` pair plus a genuine Windows `connect_unix_socket`
-  (Winsock `WSAStartup`/`socket`/`connect`/`afunix.h`, with a
-  `WSAPoll`-based connect-timeout implementation mirroring the POSIX
-  `poll`-based one). **Verified end-to-end on a real Windows/MSVC box**:
-  the exact `launch:` round trip that previously failed with "Unix socket
-  client transport is not available on Windows" right after a real
-  worker announced itself now completes fully - `vgi_attach()` over
-  `launch:` discovers a real catalog (168 objects) and a real scan
-  returns correct data. Also fixed along the way, in `vgi-c++` (not `vgi-sqlite`):
+  **Windows is now implemented, not just POSIX - via a named pipe
+  (`\\.\pipe\vgi-rpc-<hash>`, "PIPE:" discovery prefix), matching
+  `docs/launcher-protocol.md`'s own dedicated "Platform: Windows" section
+  and the real `vgi_rpc` Python worker CLI's actual server-side dispatch
+  (`vgi_rpc/rpc/__init__.py`'s `run_server` calls `serve_named_pipe` when
+  `sys.platform == "win32"` - CPython has no `socket.AF_UNIX` in that code
+  path).** This driver's `launch:` implementation went through TWO
+  Windows designs before landing here, and the mid-course "correction"
+  was itself wrong - worth recording so it isn't repeated: the first
+  version (ported faithfully from vgi's own DuckDB-extension Windows
+  launcher) already used named pipes, and was working. It was then
+  changed to AF_UNIX, reasoning from `vgi_rpc/launcher.py`'s CLIENT-side
+  helper code (which genuinely does use `socket.AF_UNIX`, even on
+  Windows) and a successful live test against `vgi-go`'s worker CLI
+  (which also genuinely implements AF_UNIX on Windows - confirmed, but
+  non-conformant with the documented protocol). That AF_UNIX version was
+  then reverted back to named pipes after a live test against the REAL
+  `vgi_rpc` Python worker CLI - the one this driver's own CI actually
+  spawns - failed outright: `pywintypes.error: (123, 'CreateNamedPipe',
+  'The filename, directory name, or volume label syntax is incorrect.')`,
+  proving that worker's `--unix` flag expects a `\\.\pipe\...`-formatted
+  path on Windows, not a plain filesystem path. `vgi_rpc/launcher.py`'s
+  own AF_UNIX-flavored client helper is a real, separate, not-yet-fixed
+  bug in that file (inconsistent with its own package's `serve_named_pipe`
+  server code) - not something this driver needs to work around, since it
+  has its own independent `Launch()`. `vgi-go`'s Windows AF_UNIX `--unix`
+  implementation is real too, but is itself non-conformant with
+  `docs/launcher-protocol.md`'s documented Windows mechanism - a fact
+  worth knowing if `vgi-go` is ever used as this driver's Windows `launch:`
+  test target instead of the canonical Python worker.
+  Named pipes need no state directory the way an AF_UNIX socket path
+  needs a real on-disk file - `Launch()`'s Windows branch resolves
+  `pipe_name` purely from the hash, with no `ResolveStateDir` call at
+  all; only the spawn-election `Mutex` (unrelated to the AF_UNIX-vs-pipe
+  question, kept unchanged across both revisions) is Windows-specific
+  state. `ValidateRendezvousPathLength` has a real, separate 256-character
+  named-pipe-name limit on Windows, distinct from POSIX's 108-byte
+  `sun_path` cap - different kernel constants, not comparable.
+  The AF_UNIX client-transport work built while chasing the wrong design
+  was not wasted: `vgi-rpc-c++`'s `RpcClient::connect_unix` (previously a
+  stub on Windows - `client_transport.cpp`'s
+  `ClientTransport::connect_unix` threw unconditionally there) is now a
+  real, working, genuine Windows AF_UNIX implementation (`SocketInputStream`/
+  `SocketOutputStream` over `send`/`recv`, `connect_unix_socket` via
+  Winsock `WSAStartup`/`socket`/`connect`/`afunix.h`, `WSAPoll`-based
+  connect-timeout mirroring the POSIX `poll`-based one) - kept and used
+  for the *separate* explicit `unix://` location scheme this driver also
+  supports (verified working against `vgi-go`, which does implement
+  AF_UNIX there). A new `vgi_rpc::RpcClient::connect_pipe`/
+  `ClientTransport::connect_pipe` was added alongside it (POSIX builds
+  throw - AF_UNIX already covers the equivalent POSIX need) specifically
+  for `launch:`'s actual Windows rendezvous, reusing the same
+  `_open_osfhandle`-to-CRT-fd bridging technique already established for
+  child-process anonymous pipes in this file, so no new Arrow IO stream
+  classes were needed the way AF_UNIX's `SOCKET`-vs-CRT-fd mismatch
+  required. `VgiConnection`'s `ConnectLauncherPath` dispatches a
+  `Launch()`-resolved address through `connect_pipe` on Windows and
+  `connect_unix` (genuine AF_UNIX) on POSIX - `Launch()`'s own return
+  value differs by platform (a `\\.\pipe\...` path vs. a `.sock` path)
+  precisely so this dispatch is correct without either side needing to
+  sniff the string's shape.
+  **Verified end-to-end on a real Windows/MSVC box (`europa`)**, against
+  the REAL `vgi_rpc` Python worker CLI (not `vgi-go`) this time: a fresh
+  `launch:` location correctly spawns and attaches (`vgi_attach()`
+  discovered 130 real catalog objects; a `data.numbers` scan returned the
+  correct 100 rows, first 5 matching 0-4); the worker persists correctly
+  as a real detached process for the lifetime of the spawning session
+  (confirmed via `Get-Process` showing the `uv`/`python` processes still
+  alive 3s after the spawning SQL script completed - the only place
+  reuse *doesn't* survive is across two entirely separate SSH sessions,
+  because Windows OpenSSH's own per-session Job Object kills descendant
+  processes on session close; this doesn't affect CI, where the whole
+  pytest run is one continuous process/job the worker stays a child of
+  for the run's full duration - the actual property `launch:` needs).
+  Full `test/integration` suite re-run clean on macOS after this revert
+  (59/59); a matching Windows re-run was in progress on `europa` as this
+  entry was written.
+  Also fixed along the way, in `vgi-c++` (not `vgi-sqlite`):
   `catalog.cpp`/`function_dispatch.cpp`/`storage.cpp` unconditionally
   included `<unistd.h>` for `getpid()`/`getuid()`/a raw POSIX atomic-
   file-claim primitive - a hard Windows build failure, fixed with a new

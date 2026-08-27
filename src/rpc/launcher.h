@@ -93,8 +93,12 @@ constexpr std::size_t MaxUnixPathLen() {
 #endif
 }
 
-// Throws std::runtime_error if `path` is too long for MaxUnixPathLen();
-// returns silently otherwise.
+// Throws std::runtime_error if `path` is too long for the platform's
+// rendezvous-address limit - MaxUnixPathLen() on POSIX (AF_UNIX
+// sun_path), a separate 256-character named-pipe-name limit on Windows
+// (see launcher.cpp's Windows ValidateRendezvousPathLength body - the two
+// limits come from unrelated kernel constants, not a shared one). Returns
+// silently otherwise.
 void ValidateRendezvousPathLength(const std::string& path);
 
 // ---------------------------------------------------------------------------
@@ -112,19 +116,31 @@ std::vector<std::string> ParseLaunchArgv(const std::string& payload);
 // Discovery-line parsing
 // ---------------------------------------------------------------------------
 
-// The worker prints exactly one "UNIX:<path>\n" line on stdout once
+// The worker prints exactly one "<prefix><path>\n" line on stdout once
 // bound, then must never write to stdout again (a launcher closing its
 // read end of that pipe after seeing this line is what enforces that -
-// see launcher.cpp). "UNIX:" unconditionally, including on Windows:
-// Windows 10 (1803+) has genuine AF_UNIX socket support, and the
-// canonical vgi_rpc Python launcher (vgi_rpc/launcher.py) - the actual
-// cross-SDK protocol reference every worker/client must agree with -
-// uses real AF_UNIX on Windows too, not a named pipe. (vgi's own DuckDB-
-// extension C++ launcher has a separate, "PIPE:"-based Windows
-// implementation that does NOT match this - confirmed against the
-// canonical Python reference, not assumed; not ported here for exactly
-// that reason. See launcher.cpp's file comment for the full story.)
+// see launcher.cpp). "UNIX:" on POSIX (an AF_UNIX socket path); "PIPE:"
+// on Windows (a `\\.\pipe\...` named-pipe path) - confirmed authoritative
+// by docs/launcher-protocol.md's own dedicated "Platform: Windows"
+// section, and reproduced live against the real vgi_rpc Python worker
+// CLI: CPython has no socket.AF_UNIX in the code path that worker CLI's
+// server actually runs on Windows (`vgi_rpc/rpc/__init__.py`'s
+// run_server dispatches to serve_named_pipe there), so a plain AF_UNIX
+// path handed to `--unix` on Windows fails outright
+// (`pywintypes.error: (123, 'CreateNamedPipe', ...)` - confirmed by
+// running the real worker CLI directly, not inferred). An earlier version
+// of this file used AF_UNIX unconditionally on Windows too, reasoning
+// from vgi_rpc/launcher.py's CLIENT-side helper code (which does use
+// socket.AF_UNIX) and from vgi-go's worker (which also genuinely
+// implements AF_UNIX) - both real, but neither is what the canonical
+// Python worker CLI this driver's CI actually spawns implements; that
+// was a mistake, corrected after the live repro above. See launcher.cpp's
+// file comment for the full story.
+#if defined(_WIN32)
+inline const char* kDiscoveryLinePrefix = "PIPE:";
+#else
 inline const char* kDiscoveryLinePrefix = "UNIX:";
+#endif
 
 enum class DiscoveryParseResult {
     kNeedMore,  // No complete line yet - keep reading.
