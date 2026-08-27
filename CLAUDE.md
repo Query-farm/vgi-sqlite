@@ -389,12 +389,24 @@ shared/pooled connection use.
   times" contract. Discovery (`catalog_client.{h,cpp}`'s
   `CatalogPlainTableFunction`) is filtered to `input_from_args=false &&
   !has_finalize && !HasTableTypedArgument(...)` to exclude both
-  `table_in_out` shapes. **Known, not-yet-handled gap**: arity-overloading
-  (e.g. `geo_encode`/`geo_encode3` sharing one SQL name) collides when
-  `vgi_attach()` tries to register the second one under the same generated
-  name - the second attempt fails cleanly and is skipped (matching every
-  other per-function `CREATE VIRTUAL TABLE` failure's handling), but only
-  one overload ends up callable; `overload` stays a structural skip
+  `table_in_out` shapes. **Known, not-yet-handled gap, and the actual
+  mechanism is worse than earlier notes here claimed** (corrected after
+  actually reading the registration loop, not from memory): arity-
+  overloading (e.g. `geo_encode`/`geo_encode3` sharing one SQL name)
+  does NOT fail cleanly on the second registration. Every table/function
+  `vgi_attach()` registers goes through an unconditional `DROP TABLE IF
+  EXISTS <name>` immediately followed by `CREATE VIRTUAL TABLE <name>
+  ...`, with no existence check or dedup anywhere in the loop - so when
+  two overloads produce the same generated name, the SECOND one's `DROP`
+  silently removes the FIRST one's already-successfully-registered vtab,
+  then its own `CREATE` succeeds cleanly in its place. Whichever overload
+  the worker's own catalog listing (`catalog_schema_contents_functions`)
+  happens to return LAST for that schema is the one that ends up
+  callable - silently, no error - and that discovery order is entirely
+  worker-defined (passed straight through with no client-side sorting or
+  dedup in `SchemaContentsPlainTableFunctions`/
+  `SchemaContentsTableInOutFunctions`). Not deterministic or documented
+  from this driver's own perspective; `overload` stays a structural skip
   category in the sqllogictest corpus for exactly this reason.
 
 ### VGI splits (sequential redemption)

@@ -106,7 +106,7 @@ see [`test/sqllogictest/README.md`](test/sqllogictest/README.md).
 | Area | Status |
 |---|---|
 | Read scans | ✅ projection, filter (`=` `!=` `<` `<=` `>` `>=` `IS [NOT] NULL`), and `LIMIT` pushdown; cost-based query planning from worker-reported cardinality |
-| Writes | ✅ `INSERT`/`UPDATE`/`DELETE`, row identity from the worker-declared row-id column |
+| Writes | ⚠️ `INSERT`/`UPDATE`/`DELETE` implemented and tested against a synthetic fixture worker, but not yet validated against any real-world VGI worker (unlike reads, which have been) — and writable tables are uncommon in the VGI ecosystem generally, since most workers expose read-only external data sources |
 | Transactions | ✅ one flat VGI transaction shared across every table from a catalog touched in one SQL transaction; no nested `SAVEPOINT` — VGI's protocol has no nested-transaction concept to map it onto |
 | Scalar functions | ✅ registered natively as `<catalog>_<name>` |
 | Aggregate functions | ✅ including `GROUP BY`; windowed (`OVER`) aggregates are not supported — a structurally different RPC family with no incremental step model |
