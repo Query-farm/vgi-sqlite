@@ -105,6 +105,24 @@ version floor from whatever the build image itself ships (not solved via
 an older build container, to match `vgi-c++`'s own CI posture) - see
 `.github/workflows/release.yml`'s own comments for the full reasoning.
 
+**CI/release builds also use two shared, already-warm caches** hosted on
+the same Cloudflare-Worker-fronted R2 bucket
+(`~/Development/haybarn/haybarn-vcpkg-worker`, shared with other Query
+Farm/Haybarn repos): a vcpkg binary cache (anonymous read; write needs a
+bearer token) and a ccache remote-storage backend (`ccache/` key prefix,
+same token/auth). Auth is `QUERY_FARM_VCPKG_TOKEN` (this repo's own
+secret) - the Worker accepts several independently-rotatable tokens, one
+per registered caller, not just Haybarn's own. Both degrade gracefully to
+read-only (vcpkg) / no-remote-storage (ccache) if the secret isn't set,
+rather than failing the build. ccache itself is pinned to a specific
+recent release (installed from the project's own GitHub releases, not
+apt/brew) - a package-manager-installed ccache is not guaranteed new
+enough for the HTTP remote-storage backend to work correctly (a
+chocolatey-packaged 4.9.1 is known to silently fail bearer-token PUTs
+against this exact Worker on Windows, per haybarn-extension-ci-tools's own
+upgrade step - not confirmed broken on Linux/macOS package managers too,
+but pinning removes the question rather than trusting it).
+
 ## Testing
 
 ```bash
