@@ -1,31 +1,60 @@
 // © Copyright 2026 Query Farm LLC - https://query.farm
 //
 // Ported from vgi (the DuckDB extension)'s src/vgi_launcher{,_internal}.cpp
-// (POSIX half only - see launcher.h). Adaptations from that reference,
-// none of which touch wire-visible behavior:
+// - both halves now: POSIX (flock/fork/AF_UNIX) and Windows (named mutex/
+// CreateProcess/named pipe - vgi's own reference file comment: "CPython has
+// no AF_UNIX on Windows, so the launch: worker is reached via a Windows
+// named pipe (\\.\pipe\vgi-rpc-<hash>)" - a genuinely different rendezvous
+// mechanism, not just a POSIX call swapped for a Windows one). Adaptations
+// from that reference, none of which touch wire-visible behavior:
 //   - IOException/InvalidInputException -> std::runtime_error, matching
 //     this driver's uniform exception convention (see CLAUDE.md).
 //   - SHA-256 via vgi_rpc::crypto::Sha256 (already linked - vgi-c++'s own
 //     split_token.cpp uses it) instead of a direct mbedtls dependency
 //     vgi-sqlite doesn't otherwise need.
 //   - The liveness probe and the worker's stdout-pipe plumbing are raw
-//     POSIX socket/fork calls here instead of going through a UnixSocket/
-//     Pipe wrapper class - this driver has no other user for either
-//     abstraction, so introducing them just for this one call site would
-//     be speculative infrastructure, not a real simplification.
+//     platform calls here (POSIX socket/fork, or Win32 CreateProcess/
+//     named pipe) instead of going through a UnixSocket/Pipe wrapper
+//     class - this driver has no other user for either abstraction, so
+//     introducing them just for this one call site would be speculative
+//     infrastructure, not a real simplification.
+//   - Windows verified on a real Windows/MSVC build (europa), not just
+//     compiled - see the plan file's history for what was checked.
 #include "rpc/launcher.h"
 
-#include <arpa/inet.h>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <csignal>
-#include <fcntl.h>
 #include <mutex>
-#include <pthread.h>
 #include <set>
 #include <stdexcept>
+#include <thread>
+
+#include <vgi_rpc/crypto.h>
+
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+// winsock2.h before afunix.h; both after windows.h is safe because
+// WIN32_LEAN_AND_MEAN above already excludes windows.h's own legacy
+// winsock.h. afunix.h (Windows 10 SDK 17063+) declares AF_UNIX/
+// sockaddr_un - genuine AF_UNIX, not a Microsoft-specific type; see
+// kDiscoveryLinePrefix's comment in launcher.h for why this driver
+// rendezvous over that instead of a named pipe.
+#include <winsock2.h>
+
+#include <afunix.h>
+#else
+#include <arpa/inet.h>
+#include <csignal>
+#include <fcntl.h>
+#include <pthread.h>
 #include <sys/file.h>
 #include <sys/select.h>
 #include <sys/socket.h>
@@ -33,12 +62,10 @@
 #include <sys/types.h>
 #include <sys/un.h>
 #include <sys/wait.h>
-#include <thread>
 #include <unistd.h>
 
-#include <vgi_rpc/crypto.h>
-
 extern char** environ;
+#endif
 
 namespace vgi_sqlite {
 namespace launcher {
@@ -168,7 +195,12 @@ std::string ResolveStateDir(const std::string& xdg_runtime_dir, const std::strin
 // ---------------------------------------------------------------------------
 
 void ValidateRendezvousPathLength(const std::string& path) {
-    // `+1` for the trailing NUL the kernel requires.
+    // Same limit on Windows as Linux (both 108) - MaxUnixPathLen() already
+    // resolves that way for any non-Apple platform, Windows included,
+    // since Windows AF_UNIX is genuine AF_UNIX (see launcher.h's
+    // kDiscoveryLinePrefix comment) with the same sockaddr_un.sun_path
+    // capacity, not a separate named-pipe naming rule. `+1` for the
+    // trailing NUL the kernel requires.
     if (path.size() + 1 > MaxUnixPathLen()) {
         throw std::runtime_error("vgi launcher: AF_UNIX socket path too long (" +
                                   std::to_string(path.size()) + " bytes, max " +
@@ -213,11 +245,19 @@ std::vector<std::string> ParseLaunchArgv(const std::string& payload) {
                     state = ShlexState::kInSingle;
                     has_token = true;
                 } else if (c == '\\') {
+#if defined(_WIN32)
+                    // Backslash is a path separator on Windows, not a shell
+                    // escape - keep it literal so `C:\path\to\worker`
+                    // survives intact.
+                    token.push_back(c);
+                    has_token = true;
+#else
                     if (i + 1 >= payload.size()) {
                         throw std::runtime_error("vgi launcher: trailing backslash in launch: argv");
                     }
                     token.push_back(payload[++i]);
                     has_token = true;
+#endif
                 } else {
                     token.push_back(c);
                     has_token = true;
@@ -228,6 +268,10 @@ std::vector<std::string> ParseLaunchArgv(const std::string& payload) {
                 if (c == '"') {
                     state = ShlexState::kDefault;
                 } else if (c == '\\' && i + 1 < payload.size()) {
+#if defined(_WIN32)
+                    // Literal path separator on Windows - never an escape.
+                    token.push_back('\\');
+#else
                     char next = payload[i + 1];
                     // Only a few sequences are special inside double-quotes
                     // per POSIX; everything else preserves the backslash.
@@ -237,6 +281,7 @@ std::vector<std::string> ParseLaunchArgv(const std::string& payload) {
                     } else {
                         token.push_back('\\');
                     }
+#endif
                 } else {
                     token.push_back(c);
                 }
@@ -298,6 +343,377 @@ bool IsLaunchLocation(const std::string& location) {
 // =============================================================================
 // Orchestration: spawn-or-connect
 // =============================================================================
+
+#if defined(_WIN32)
+// ===========================================================================
+// Windows: genuine AF_UNIX rendezvous, NOT a named pipe.
+//
+// Researched rather than assumed: vgi (the DuckDB C++ extension)'s own
+// Windows launcher uses a named pipe ("PIPE:" discovery prefix) - the
+// obvious-looking port target, and what an earlier version of this file
+// implemented. It does NOT match the actual canonical protocol reference
+// (vgi-rpc-python's launcher.py, which CLAUDE.md's own repo table names as
+// the "canonical implementation, protocol source of truth"): that
+// implementation uses `socket.AF_UNIX` unconditionally, INCLUDING on
+// Windows (Windows 10 1803+ has genuine kernel AF_UNIX support), with the
+// same "UNIX:" discovery prefix and the same sockaddr_un length limit
+// (108 bytes) as POSIX - confirmed directly in vgi_rpc/launcher.py's own
+// source and comments, not inferred. vgi-go's worker CLI agrees
+// (`--unix`: "Bind to this AF_UNIX socket path"), and vgi-rpc-c++'s own
+// client_transport.cpp already implements a working Windows
+// `connect_unix` over real AF_UNIX (confirmed: builds and the whole
+// vgi-rpc-c++ test suite compiles clean on Windows/MSVC). The named-pipe
+// version was corrected to this AF_UNIX version before ever being relied
+// on, after a live test against a real vgi-go worker on Windows failed
+// (worker never emitted a discovery line - it doesn't listen on named
+// pipes at all) surfaced the mismatch.
+//
+// Given that, this Windows Launch() is structurally very close to the
+// POSIX one below (same state-dir + hash + ".sock" file scheme, same
+// AF_UNIX socket calls once Winsock is initialized) - only process
+// spawning (CreateProcess, no fork/exec) and cross-process spawn election
+// (a named Mutex, no flock(2) on Windows) are genuinely different.
+// ===========================================================================
+
+namespace {
+
+constexpr std::size_t kDiscoveryBufferLimit = 1u << 20;  // 1 MiB
+
+// Winsock must be initialized once per process before any socket() call.
+// Reference-counted by the OS, so a redundant call from elsewhere in the
+// process (e.g. vgi-rpc-c++'s own client code) is harmless - never paired
+// with WSACleanup, matching common practice for a library that can't know
+// if something else in the process still needs sockets when it's done
+// with its own.
+void EnsureWinsockInitialized() {
+    static bool inited = [] {
+        WSADATA data;
+        int rc = ::WSAStartup(MAKEWORD(2, 2), &data);
+        if (rc != 0) {
+            throw std::runtime_error("vgi launcher: WSAStartup failed (" + std::to_string(rc) + ")");
+        }
+        return true;
+    }();
+    (void)inited;
+}
+
+// The Windows equivalent of SnapshotEnvironment() below (POSIX branch) -
+// GetEnvironmentStringsA instead of `environ`.
+std::vector<std::pair<std::string, std::string>> WinEnvSnapshot() {
+    std::vector<std::pair<std::string, std::string>> out;
+    LPCH env = ::GetEnvironmentStringsA();
+    if (!env) return out;
+    for (LPCH p = env; *p;) {
+        std::string entry(p);
+        p += entry.size() + 1;
+        // Skip the magic "=C:=..." drive-cwd entries (key begins with '=').
+        if (entry.empty() || entry[0] == '=') continue;
+        auto eq = entry.find('=');
+        if (eq == std::string::npos) continue;
+        out.emplace_back(entry.substr(0, eq), entry.substr(eq + 1));
+    }
+    ::FreeEnvironmentStringsA(env);
+    return out;
+}
+
+std::string WinCwd() {
+    DWORD n = ::GetCurrentDirectoryA(0, nullptr);
+    if (n == 0) return std::string();
+    std::vector<char> buf(n);
+    DWORD got = ::GetCurrentDirectoryA(n, buf.data());
+    return std::string(buf.data(), got);
+}
+
+// Creates `path` and every missing parent directory - the Windows
+// equivalent of MkdirRecursive (POSIX branch). No chmod/uid-ownership
+// check here, matching vgi_rpc/launcher.py's own default_state_dir(),
+// which explicitly skips both on Windows (no euid/POSIX permission model
+// to check against).
+void MkdirRecursiveWin(const std::string& path) {
+    if (path.empty()) return;
+    for (size_t i = 1; i <= path.size(); ++i) {
+        if (i < path.size() && path[i] != '\\' && path[i] != '/') continue;
+        std::string sub = path.substr(0, i);
+        if (sub.empty() || (sub.size() == 2 && sub[1] == ':')) continue;  // "C:" alone isn't creatable
+        if (::CreateDirectoryA(sub.c_str(), nullptr)) continue;
+        DWORD err = ::GetLastError();
+        if (err == ERROR_ALREADY_EXISTS) continue;
+        throw std::runtime_error("vgi launcher: CreateDirectory(" + sub +
+                                  ") failed (GetLastError=" + std::to_string(err) + ")");
+    }
+}
+
+std::string ResolveAndEnsureStateDirWin(const std::optional<std::string>& override_dir) {
+    // ResolveStateDir's own Windows branch ignores its first/third args
+    // (no XDG_RUNTIME_DIR/euid concept there) and falls back to "." if
+    // `tmpdir` is empty - pass the real %TEMP% so that fallback is never
+    // actually hit in practice.
+    const char* temp_env = std::getenv("TEMP");
+    std::string dir =
+        override_dir.value_or(launcher::ResolveStateDir("", temp_env ? temp_env : "", 0));
+    MkdirRecursiveWin(dir);
+    return dir;
+}
+
+// Quotes one argv element for a Windows command line per the
+// CommandLineToArgvW parsing rules (the inverse of how CreateProcess's
+// child will re-split the string it receives).
+std::string QuoteArg(const std::string& arg) {
+    if (!arg.empty() && arg.find_first_of(" \t\"") == std::string::npos) {
+        return arg;  // no quoting needed
+    }
+    std::string out = "\"";
+    std::size_t backslashes = 0;
+    for (char c : arg) {
+        if (c == '\\') {
+            ++backslashes;
+            out.push_back(c);
+        } else if (c == '"') {
+            out.append(backslashes + 1, '\\');  // escape the run of backslashes + the quote
+            out.push_back('"');
+            backslashes = 0;
+        } else {
+            backslashes = 0;
+            out.push_back(c);
+        }
+    }
+    out.append(backslashes, '\\');  // double trailing backslashes before the closing quote
+    out.push_back('"');
+    return out;
+}
+
+std::string BuildCommandLine(const std::vector<std::string>& argv) {
+    std::string cmd;
+    for (std::size_t i = 0; i < argv.size(); ++i) {
+        if (i) cmd.push_back(' ');
+        cmd += QuoteArg(argv[i]);
+    }
+    return cmd;
+}
+
+// Per docs/launcher-protocol.md: decimal seconds in plain notation, no
+// scientific - "%g" switches to "%e" past 1e6, which would silently
+// mangle a large idle-timeout. "%.3f" keeps millisecond precision;
+// trailing zeros are stripped to match the other client SDKs' formatting.
+// (Identical logic to the POSIX Launch()'s own inline version below -
+// duplicated rather than factored out, so the two platform branches stay
+// independently readable and neither risks the other's edit.)
+std::string FormatIdleTimeoutSeconds(std::chrono::milliseconds ms) {
+    double sec = static_cast<double>(ms.count()) / 1000.0;
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%.3f", sec);
+    std::string s(buf);
+    auto dot = s.find('.');
+    if (dot != std::string::npos) {
+        while (s.size() > dot + 1 && s.back() == '0') s.pop_back();
+        if (s.back() == '.') s.pop_back();
+    }
+    return s;
+}
+
+// RAII named mutex for system-wide spawn election - the Windows
+// equivalent of FlockGuard (POSIX branch). Prefers the Global\ namespace
+// (visible across Terminal Services sessions, matching flock's whole-
+// system scope); falls back to Local\ if the caller's session can't
+// create global kernel objects (no SeCreateGlobalPrivilege - e.g. a
+// locked-down service account).
+class WinMutexGuard {
+public:
+    static WinMutexGuard Acquire(const std::string& name, std::chrono::milliseconds timeout) {
+        HANDLE h = ::CreateMutexA(nullptr, FALSE, ("Global\\" + name).c_str());
+        if (!h) {
+            h = ::CreateMutexA(nullptr, FALSE, ("Local\\" + name).c_str());
+        }
+        if (!h) {
+            throw std::runtime_error("vgi launcher: CreateMutex(" + name +
+                                      ") failed (GetLastError=" + std::to_string(::GetLastError()) + ")");
+        }
+        DWORD r = ::WaitForSingleObject(h, static_cast<DWORD>(timeout.count()));
+        if (r != WAIT_OBJECT_0 && r != WAIT_ABANDONED) {
+            ::CloseHandle(h);
+            throw std::runtime_error("vgi launcher: timed out acquiring spawn mutex " + name);
+        }
+        return WinMutexGuard(h);
+    }
+    WinMutexGuard(WinMutexGuard&& o) noexcept : h_(o.h_) { o.h_ = nullptr; }
+    WinMutexGuard(const WinMutexGuard&) = delete;
+    WinMutexGuard& operator=(const WinMutexGuard&) = delete;
+    ~WinMutexGuard() {
+        if (h_) {
+            ::ReleaseMutex(h_);
+            ::CloseHandle(h_);
+        }
+    }
+
+private:
+    explicit WinMutexGuard(HANDLE h) : h_(h) {}
+    HANDLE h_ = nullptr;
+};
+
+// Best-effort connect probe over genuine AF_UNIX - true iff a worker is
+// currently accepting on `path`. A bare connect+closesocket, not a real
+// RPC handshake - liveness only, mirroring ProbeAlive (POSIX branch)
+// exactly, just via Winsock calls instead of raw POSIX ones.
+bool ProbeAliveWin(const std::string& path) {
+    if (path.size() + 1 > launcher::MaxUnixPathLen()) return false;
+    EnsureWinsockInitialized();
+    SOCKET fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd == INVALID_SOCKET) return false;
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    std::memcpy(addr.sun_path, path.c_str(), path.size() + 1);
+    bool alive = ::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0;
+    ::closesocket(fd);
+    return alive;
+}
+
+// Spawns the worker detached, reads its "UNIX:<sock_path>" discovery
+// line, then lets it run as a daemon (self-shuts-down via
+// --idle-timeout). Windows reclaims an unreferenced detached process
+// automatically - unlike POSIX, no PidReaper equivalent is needed here.
+// The stdout-capture pipe here is an ordinary Windows anonymous pipe
+// (CreatePipe) for redirecting the CHILD PROCESS's stdout stream to this
+// process - unrelated to the AF_UNIX rendezvous socket the worker itself
+// binds for RPC; every child process's stdout redirection on Windows
+// works this way regardless of what the child does with its own sockets.
+void SpawnWorkerWin(const std::vector<std::string>& argv, const std::string& sock_path,
+                     const std::optional<std::string>& stderr_path,
+                     std::chrono::milliseconds startup_timeout) {
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+
+    HANDLE rd = nullptr, wr = nullptr;
+    if (!::CreatePipe(&rd, &wr, &sa, 0)) {
+        throw std::runtime_error("vgi launcher: CreatePipe failed (GetLastError=" +
+                                  std::to_string(::GetLastError()) + ")");
+    }
+    ::SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);  // our read end is not inherited
+    HANDLE nul_in = ::CreateFileA("NUL", GENERIC_READ, FILE_SHARE_READ, &sa, OPEN_EXISTING, 0, nullptr);
+    HANDLE err_h;
+    if (stderr_path.has_value()) {
+        err_h = ::CreateFileA(stderr_path->c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
+                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    } else {
+        err_h = ::CreateFileA("NUL", GENERIC_WRITE, FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, nullptr);
+    }
+
+    STARTUPINFOA si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = nul_in;
+    si.hStdOutput = wr;
+    si.hStdError = err_h;
+
+    std::string cmdline = BuildCommandLine(argv);
+    std::vector<char> mutable_cmd(cmdline.begin(), cmdline.end());
+    mutable_cmd.push_back('\0');
+
+    PROCESS_INFORMATION pi{};
+    BOOL ok = ::CreateProcessA(nullptr, mutable_cmd.data(), nullptr, nullptr, /*bInheritHandles=*/TRUE,
+                                CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+    ::CloseHandle(wr);
+    if (nul_in) ::CloseHandle(nul_in);
+    if (err_h) ::CloseHandle(err_h);
+    if (!ok) {
+        ::CloseHandle(rd);
+        throw std::runtime_error("vgi launcher: CreateProcess failed (GetLastError=" +
+                                  std::to_string(::GetLastError()) + ")");
+    }
+    ::CloseHandle(pi.hThread);
+
+    const std::string prefix = launcher::kDiscoveryLinePrefix;  // "UNIX:"
+    std::string buffer;
+    char chunk[4096];
+    auto deadline = std::chrono::steady_clock::now() + startup_timeout;
+    bool found = false;
+    while (std::chrono::steady_clock::now() < deadline) {
+        DWORD avail = 0;
+        if (!::PeekNamedPipe(rd, nullptr, 0, nullptr, &avail, nullptr)) {
+            break;  // worker closed stdout
+        }
+        if (avail == 0) {
+            if (::WaitForSingleObject(pi.hProcess, 0) == WAIT_OBJECT_0) {
+                break;  // worker exited before announcing
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            continue;
+        }
+        DWORD nread = 0;
+        if (!::ReadFile(rd, chunk, sizeof(chunk), &nread, nullptr) || nread == 0) {
+            break;
+        }
+        buffer.append(chunk, nread);
+        auto res = launcher::ParseDiscoveryLine(buffer, sock_path, prefix);
+        if (res == launcher::DiscoveryParseResult::kFound) {
+            found = true;
+            break;
+        }
+        if (res == launcher::DiscoveryParseResult::kMismatch) {
+            ::TerminateProcess(pi.hProcess, 1);
+            ::CloseHandle(rd);
+            ::CloseHandle(pi.hProcess);
+            throw std::runtime_error("vgi launcher: worker announced an unexpected path (expected " +
+                                      sock_path + ")");
+        }
+        if (buffer.size() > kDiscoveryBufferLimit) break;
+    }
+    ::CloseHandle(rd);
+    // Detach: closing our process handle leaves the worker running
+    // independently; it self-terminates via --idle-timeout.
+    ::CloseHandle(pi.hProcess);
+    if (!found) {
+        throw std::runtime_error("vgi launcher: worker did not emit " + prefix + sock_path +
+                                  " within startup timeout");
+    }
+}
+
+}  // namespace
+
+std::string Launch(const LaunchConfig& cfg) {
+    if (cfg.worker_argv.empty()) {
+        throw std::runtime_error("vgi launcher: worker_argv must be non-empty");
+    }
+
+    std::string sock_path;
+    std::string mutex_name;
+    if (cfg.socket_path_override) {
+        sock_path = *cfg.socket_path_override;
+        mutex_name = "vgi-rpc-override-" + std::to_string(std::hash<std::string>{}(sock_path));
+    } else {
+        std::string state_dir = ResolveAndEnsureStateDirWin(cfg.state_dir_override);
+        auto env_subset = launcher::FilterVgiRpcEnv(WinEnvSnapshot());
+        auto hash = launcher::ComputeLauncherHash(cfg.worker_argv, WinCwd(), env_subset);
+        // Socket path + mutex name both derive from the hash, so every
+        // process pointing at the same (argv, cwd, VGI_RPC_*-env) tuple
+        // agrees on the rendezvous and serializes spawns against the
+        // same mutex.
+        sock_path = state_dir + "\\" + hash + ".sock";
+        mutex_name = "vgi-rpc-" + hash;
+    }
+
+    launcher::ValidateRendezvousPathLength(sock_path);
+
+    auto guard = WinMutexGuard::Acquire(mutex_name, cfg.connect_timeout);
+
+    // Inside the lock: probe for an existing healthy worker, else spawn.
+    if (ProbeAliveWin(sock_path)) {
+        return sock_path;
+    }
+    ::DeleteFileA(sock_path.c_str());  // stale socket file (worker crashed / never bound) - best-effort
+
+    std::vector<std::string> argv = cfg.worker_argv;
+    argv.emplace_back("--unix");
+    argv.push_back(sock_path);
+    argv.emplace_back("--idle-timeout");
+    argv.push_back(FormatIdleTimeoutSeconds(cfg.idle_timeout));
+
+    SpawnWorkerWin(argv, sock_path, cfg.worker_stderr_path, cfg.worker_startup_timeout);
+    // WinMutexGuard releases as `guard` goes out of scope on return.
+    return sock_path;
+}
+
+#else  // !defined(_WIN32)
 
 namespace {
 
@@ -726,5 +1142,7 @@ std::string Launch(const LaunchConfig& cfg) {
     // FlockGuard releases as `guard` goes out of scope on return.
     return sock_path;
 }
+
+#endif  // defined(_WIN32)
 
 }  // namespace vgi_sqlite

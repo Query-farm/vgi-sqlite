@@ -1,17 +1,20 @@
 // © Copyright 2026 Query Farm LLC - https://query.farm
 //
-// AF_UNIX worker launcher: brings up - or reuses - a long-running worker
-// process that VgiConnection can connect to via unix://, for a
+// Worker launcher: brings up - or reuses - a long-running worker process
+// that VgiConnection can connect to via unix:// (POSIX: an AF_UNIX socket
+// path) or the equivalent Windows named-pipe address, for a
 // `launch:<argv...>` location. Concurrency contract: at most one worker
 // exists per (worker_argv, cwd, VGI_RPC_*-env) tuple, system-wide and
 // across every process (this driver, vgi's own DuckDB extension,
 // `vgi-rpc launch` on the CLI, any other client) - coordination is via a
-// per-hash flock in a per-user state directory, not anything specific to
-// this driver.
+// per-hash flock (POSIX) or named mutex (Windows) in a per-user state
+// directory, not anything specific to this driver.
 //
-// POSIX only (this driver has no Windows build target at all - see
-// CLAUDE.md - so unlike vgi's own cross-platform port, this one doesn't
-// carry a named-pipe/Windows half).
+// Both POSIX and Windows are implemented (launcher.cpp's own file comment
+// has the detail) - the two use genuinely different rendezvous mechanisms
+// (AF_UNIX vs. named pipes), not just different syscalls for the same
+// concept, since Windows has no AF_UNIX equivalent this driver's transport
+// layer (vgi-rpc-c++) can rendezvous through the same way.
 //
 // Ported from vgi (the DuckDB C++ extension)'s own launcher
 // (src/vgi_launcher{,_internal}.{hpp,cpp}), the reference C++
@@ -112,7 +115,15 @@ std::vector<std::string> ParseLaunchArgv(const std::string& payload);
 // The worker prints exactly one "UNIX:<path>\n" line on stdout once
 // bound, then must never write to stdout again (a launcher closing its
 // read end of that pipe after seeing this line is what enforces that -
-// see launcher.cpp).
+// see launcher.cpp). "UNIX:" unconditionally, including on Windows:
+// Windows 10 (1803+) has genuine AF_UNIX socket support, and the
+// canonical vgi_rpc Python launcher (vgi_rpc/launcher.py) - the actual
+// cross-SDK protocol reference every worker/client must agree with -
+// uses real AF_UNIX on Windows too, not a named pipe. (vgi's own DuckDB-
+// extension C++ launcher has a separate, "PIPE:"-based Windows
+// implementation that does NOT match this - confirmed against the
+// canonical Python reference, not assumed; not ported here for exactly
+// that reason. See launcher.cpp's file comment for the full story.)
 inline const char* kDiscoveryLinePrefix = "UNIX:";
 
 enum class DiscoveryParseResult {

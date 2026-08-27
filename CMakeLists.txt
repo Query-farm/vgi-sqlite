@@ -68,11 +68,19 @@ set(VGI_SQLITE_THIRD_PARTY_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/sqlite")
 if(NOT EXISTS "${VGI_SQLITE_THIRD_PARTY_DIR}/sqlite3.h")
     message(FATAL_ERROR
         "Local SQLite not found at ${VGI_SQLITE_THIRD_PARTY_DIR}.\n"
-        "Run scripts/fetch_sqlite.sh first.")
+        "Run scripts/fetch_sqlite.sh first (or fetch_sqlite.ps1 on Windows).")
 endif()
 add_library(sqlite3 STATIC IMPORTED)
+# scripts/fetch_sqlite.sh (cc/ar) produces libsqlite3.a; fetch_sqlite.ps1
+# (cl.exe/lib.exe - no "lib" prefix, no static-library convention shared
+# with Unix ar archives) produces sqlite3.lib instead.
+if(MSVC)
+    set(VGI_SQLITE_STATIC_LIB_NAME "sqlite3.lib")
+else()
+    set(VGI_SQLITE_STATIC_LIB_NAME "libsqlite3.a")
+endif()
 set_target_properties(sqlite3 PROPERTIES
-    IMPORTED_LOCATION "${VGI_SQLITE_THIRD_PARTY_DIR}/libsqlite3.a"
+    IMPORTED_LOCATION "${VGI_SQLITE_THIRD_PARTY_DIR}/${VGI_SQLITE_STATIC_LIB_NAME}"
     INTERFACE_INCLUDE_DIRECTORIES "${VGI_SQLITE_THIRD_PARTY_DIR}"
 )
 add_library(SQLite::SQLite3 ALIAS sqlite3)
@@ -105,6 +113,12 @@ target_include_directories(vgi_sqlite_driver PUBLIC
 # vgi::vgi carries vgi-rpc-c++'s RpcClient (transport) and vgi-c++'s public
 # include/vgi/generated/ protocol schemas as PUBLIC transitive dependencies.
 target_link_libraries(vgi_sqlite_driver PUBLIC vgi::vgi nlohmann_json::nlohmann_json)
+if(WIN32)
+    # src/rpc/launcher.cpp's Windows branch talks genuine AF_UNIX sockets
+    # (WSAStartup/socket/connect/closesocket) - see launcher.h's
+    # kDiscoveryLinePrefix comment for why AF_UNIX, not a named pipe.
+    target_link_libraries(vgi_sqlite_driver PRIVATE ws2_32)
+endif()
 
 # ── The loadable extension itself (.load ./vgi in a sqlite3 session) ──────
 #
@@ -132,6 +146,31 @@ set_target_properties(vgi_extension PROPERTIES
     OUTPUT_NAME vgi
     PREFIX ""              # SQLite's .load expects "vgi", not "libvgi"
 )
+
+if(WIN32)
+    # vcpkg's default Windows triplet (unlike Linux/macOS's default, which
+    # is static - see CLAUDE.md's ABI-contract note) builds Arrow and its
+    # own transitive dependencies (abseil, boost, re2, utf8proc, libevent,
+    # ...) as DLLs - vgi.dll needs these to actually LOAD, not just link
+    # against, and a loadable extension must work from an arbitrary host
+    # process's working directory, not just one that happens to be
+    # colocated with vcpkg's own output tree. CMake's automatic runtime-DLL
+    # copying (the VS-generator feature that copies some dependency DLLs
+    # next to a target automatically) only follows the direct/known target
+    # link graph and misses several of Arrow's own transitive dependencies
+    # in practice - confirmed the hard way, a real `.load` failure ("the
+    # specified module could not be found") with several vcpkg-built DLLs
+    # sitting right next to the ones that DID get copied. Brute-force
+    # instead: copy every DLL vcpkg built for this triplet/config next to
+    # vgi.dll - simpler and more reliable than chasing the exact
+    # transitive set by hand.
+    add_custom_command(TARGET vgi_extension POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "$<IF:$<CONFIG:Debug>,${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/debug/bin,${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/bin>"
+            "$<TARGET_FILE_DIR:vgi_extension>"
+        COMMENT "Copying vcpkg runtime DLLs next to vgi.dll"
+    )
+endif()
 
 # ── Dev tools (proof-of-connection binaries, not shipped) ─────────────────
 add_subdirectory(tools)

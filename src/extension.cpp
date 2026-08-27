@@ -408,7 +408,17 @@ void VgiAttachFunc(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
 }  // namespace
 }  // namespace vgi_sqlite
 
+// A loadable extension's init function must be visible from outside the
+// DLL for SQLite's .load to find it via GetProcAddress - unlike ELF/
+// Mach-O shared libraries, a Windows DLL exports nothing by default.
+// __declspec(dllexport) is SQLite's own documented convention for this
+// (no .def file needed for a single symbol).
+#if defined(_WIN32)
+extern "C" __declspec(dllexport) int sqlite3_vgi_init(sqlite3* db, char** pzErrMsg,
+                                                        const sqlite3_api_routines* pApi) {
+#else
 extern "C" int sqlite3_vgi_init(sqlite3* db, char** pzErrMsg, const sqlite3_api_routines* pApi) {
+#endif
     SQLITE_EXTENSION_INIT2(pApi);
     (void)pzErrMsg;
 

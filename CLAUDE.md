@@ -466,13 +466,13 @@ engines to claim splits concurrently.
   connects to an already-running worker (`vgi_rpc::RpcClient::connect_unix`)
   instead of spawning a new subprocess per connection, and `launch:<argv...>`
   - the full AF_UNIX launcher discovery protocol (`docs/launcher-protocol.md`,
-  `src/rpc/launcher.{h,cpp}`, ported from vgi's own C++ reference,
-  POSIX-only). `launch:` brings up, or reuses, a worker system-wide across
-  this driver, vgi's own DuckDB extension, `vgi-rpc launch` on the CLI, and
-  any other client, keyed per `(worker_argv, cwd, VGI_RPC_*-env)` tuple via
-  a per-hash flock in a per-user state directory. **The hash (16 hex
-  chars, first 8 bytes of `sha256(canonical_json({cmd,cwd,env}))`) MUST
-  match byte-for-byte across every client SDK** - this isn't an internal
+  `src/rpc/launcher.{h,cpp}`). `launch:` brings up, or reuses, a worker
+  system-wide across this driver, vgi's own DuckDB extension, `vgi-rpc
+  launch` on the CLI, and any other client, keyed per `(worker_argv, cwd,
+  VGI_RPC_*-env)` tuple via a per-hash flock (POSIX) or named mutex
+  (Windows) in a per-user state directory. **The hash (16 hex chars, first
+  8 bytes of `sha256(canonical_json({cmd,cwd,env}))`) MUST match
+  byte-for-byte across every client SDK** - this isn't an internal
   implementation detail free to diverge, it's how two different clients
   agree they mean the same worker. A small per-process cache (location ->
   resolved socket path) avoids re-running the whole flock+probe dance on
@@ -483,6 +483,40 @@ engines to claim splits concurrently.
   (`vgi_attach()` has no general options mechanism to carry them through) -
   every `launch:` connection uses `LaunchConfig`'s plain defaults (300s
   idle timeout, 30s connect timeout, 60s worker-startup timeout).
+  **Windows is now implemented, not just POSIX** - initially ported
+  faithfully from vgi (the DuckDB C++ extension)'s own Windows launcher,
+  which uses a named pipe ("PIPE:" discovery prefix). That turned out to
+  be the wrong reference to match: a live test against a real worker on
+  Windows (`europa`, a real Windows 11/MSVC box) failed because the
+  canonical protocol reference (`vgi_rpc/launcher.py`, confirmed directly
+  in its own source) uses genuine Windows AF_UNIX (Windows 10 1803+ has
+  real kernel AF_UNIX support) with the same "UNIX:" prefix and the same
+  108-byte `sun_path` limit as POSIX - not a named pipe at all - and
+  `vgi-go`'s worker CLI agrees (`--unix`: "Bind to this AF_UNIX socket
+  path"). Corrected to AF_UNIX before ever shipping as canonical; the
+  Windows `Launch()` is now structurally close to the POSIX one (same
+  state-dir + hash + `.sock` scheme), differing only in process spawn
+  (`CreateProcess`, no `fork`/`exec`) and spawn election (a named
+  `Mutex`, no `flock`). **Known, currently-blocking gap, found via this
+  same live testing, not yet fixed**: `vgi-rpc-c++`'s OWN client-side
+  `RpcClient::connect_unix` is a stub on Windows
+  (`client_transport.cpp`'s `ClientTransport::connect_unix` throws
+  unconditionally there) - the low-level `connect_unix_fd` helper it
+  would need is POSIX-only-compiled, and even a Windows port of it can't
+  reuse `FdInputStream`/`FdOutputStream` as-is (their Windows I/O
+  primitives are `_read`/`_write`, CRT file-descriptor calls that do not
+  work on a raw Winsock `SOCKET` - a `send`/`recv`-based stream pair is
+  the correct fix, not yet built). This is why `vgi.dll` builds and
+  *loads* correctly on Windows (verified: `.load` succeeds, `vgi_attach()`
+  runs, spawns a real worker via the new AF_UNIX `Launch()`) but a full
+  `launch:` round trip against a real worker doesn't complete yet - a
+  real, separate, well-scoped piece of work in `vgi-rpc-c++`, not
+  `vgi-sqlite`. Also fixed along the way, in `vgi-c++` (not `vgi-sqlite`):
+  `catalog.cpp`/`function_dispatch.cpp`/`storage.cpp` unconditionally
+  included `<unistd.h>` for `getpid()`/`getuid()`/a raw POSIX atomic-
+  file-claim primitive - a hard Windows build failure, fixed with a new
+  `vgi-cpp/src/portable.{h,cpp}` (`current_process_id`/`current_user_tag`/
+  `TryClaimFile`), verified building clean on both macOS and Windows/MSVC.
 - **A single persistent worker process does NOT scale with client-side
   concurrency**, even with a thread-per-connection model - a CPython
   worker's real request handling mostly holds the GIL, so concurrent
