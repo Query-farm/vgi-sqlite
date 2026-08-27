@@ -785,26 +785,47 @@ the wire protocol in isolation, THEN wire into the SQLite extension, where a
   than trusting the update silently, fixed by restoring `baseline.json`
   from the local git-tracked copy (never touched locally, so fully
   recoverable). Never blindly pass `--update-baseline` without reading the
-  run's own pass/fail/skip numbers and regression list first. One
-  independently real, narrow finding surfaced investigating why 5 records
-  looked like regressions post-switch (they turned out to be confounded
-  by unrelated upstream `~/Development/vgi` corpus drift, not confirmed as
-  caused by the worker switch at all - see the plan file's Milestone 10
-  status for the full investigation): `vgi-go`'s own "products" example
-  fixture (`examples/table/static_data.go`) builds its Arrow schema with
-  no field metadata at all, so it never populates
-  `duckdb_columns().comment` for that table's columns the way
-  `vgi-python`'s equivalent fixture does - `vgi-go`'s `CatalogTable` model
-  DOES support column comments generally (`vgi/catalog_table.go`'s
-  `ColumnComments` field), it's just not wired up for this one example
-  table. A `vgi-go` bug, not a `vgi-sqlite` one; not fixed here.
-  `vgi-sqlite` does NOT implement `duckdb_functions()`/`duckdb_columns()`/
-  any other DuckDB-native introspection view, and `translate.py` does not
-  rewrite calls to them into anything else - a corpus query using them
-  genuinely fails ("no such table"), which is correct and expected
-  (DuckDB-dialect-specific constructs baked into the corpus's own `.test`
-  files; this driver has no reason to reimplement DuckDB's own
-  introspection views under DuckDB's own names - `pragma_*`/
-  `information_schema` conventions, or a `vgi_*`-prefixed function, would
-  be the right shape if this driver ever wants to expose worker-catalog
-  metadata to SQL, never a `duckdb_*` name).
+  run's own pass/fail/skip numbers and regression list first.
+  **The 5 "regressed" records are corpus drift, not a vgi-go fixture
+  difference - checked and corrected, not just suspected.** First guess
+  was that `vgi-go`'s own "products" example fixture
+  (`examples/table/static_data.go`) builds its Arrow schema with no field
+  metadata at all, so it never populates `duckdb_columns().comment` the
+  way `vgi-python`'s equivalent fixture does (`vgi-go`'s `CatalogTable`
+  model DOES support column comments generally via
+  `vgi/catalog_table.go`'s `ColumnComments` field - true, but a red
+  herring here). Directly disproven by checking `vgi-go`'s own real CI
+  (`gh run view` against its `integration.yml` workflow, which runs the
+  IDENTICAL pinned `Query-farm/vgi` corpus against a real DuckDB extension
+  via `haybarn-unittest`, not this driver's own translated harness): all 5
+  files (`table/comments.test`, `table/column_statistics.test`,
+  `table/function_registration.test`, `scalar/function_registration.test`,
+  `catalog/window_self_join.test`) run there and are NOT among that run's
+  failures (320/322 test cases pass; only 2 unrelated files fail - see
+  below). The real explanation is `baseline.json` predating ~5 days of
+  upstream `~/Development/vgi` corpus commits (confirmed via `git log`
+  on that sibling checkout - a `refactor!: remove vgi_table_function()...`
+  commit alone could shift which query a stored `file.test:LINE` id refers
+  to), not any behavioral difference from switching the worker backend.
+  **`vgi-go`'s own CI does have a real, currently-failing gap, found
+  answering a direct question about whether its test suite is
+  sufficient**: its `integration.yml` (4 transport lanes: stdio/launch/
+  shm/http, gated per a recent "gate the integration lane on executed
+  count and expected skips" commit) is RED on `main` right now, on 2
+  files unrelated to anything `vgi-sqlite` touches -
+  `cache/secret_ineligible.test:85` and `macro/macros.test:171`, both
+  `count_star()` row-count mismatches (`cache`/`macro` are both
+  structurally-skipped categories here regardless, no query-cache layer
+  or macro-expansion support in this driver). Not `vgi-sqlite`'s problem
+  to fix, but real and worth knowing before assuming "the CI is green" -
+  it currently isn't. `vgi-sqlite` does NOT implement
+  `duckdb_functions()`/`duckdb_columns()`/any other DuckDB-native
+  introspection view, and `translate.py` does not rewrite calls to them
+  into anything else - a corpus query using them genuinely fails ("no
+  such table"), which is correct and expected (DuckDB-dialect-specific
+  constructs baked into the corpus's own `.test` files; this driver has
+  no reason to reimplement DuckDB's own introspection views under
+  DuckDB's own names - `pragma_*`/`information_schema` conventions, or a
+  `vgi_*`-prefixed function, would be the right shape if this driver ever
+  wants to expose worker-catalog metadata to SQL, never a `duckdb_*`
+  name).
