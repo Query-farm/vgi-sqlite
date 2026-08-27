@@ -1,0 +1,191 @@
+# © Copyright 2026 Query Farm LLC - https://query.farm
+#
+# Builds the loadable extension (vgi.{so,dylib}) for every supported
+# (OS, architecture) pair and publishes them to a GitHub Release.
+#
+# Windows is NOT in this matrix: the launcher/subprocess transport
+# (src/rpc/launcher.{h,cpp}) is POSIX-only by design (fork/exec, flock,
+# AF_UNIX) - see CLAUDE.md. A Windows build needs real portability work
+# first, not just another matrix row.
+#
+# Every dependency vcpkg builds (Arrow, OpenSSL, etc.) is statically linked
+# by vcpkg's own default triplet on Linux/macOS (x64-linux/arm64-linux/
+# x64-osx/arm64-osx are all VCPKG_LIBRARY_LINKAGE=static) - this is what
+# makes a single .so/.dylib actually redistributable: a dynamically-linked
+# Arrow/OpenSSL would require the loading machine to already have
+# compatible shared libraries installed at the right versions, which
+# defeats the point of shipping a binary at all. See the "ABI contract"
+# note in CLAUDE.md for the full reasoning, including the real, accepted
+# limits this doesn't solve (a glibc version floor from the build
+# environment's own libc; no musl/Alpine build).
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:  # manual trigger, for testing the matrix before tagging
+
+env:
+  VCPKG_COMMIT: 05442024c3fda64320bd25d2251cc9807b84fb6f
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            platform: linux-x86_64
+          - os: ubuntu-24.04-arm
+            platform: linux-arm64
+          - os: macos-14
+            platform: macos-arm64
+          - os: macos-15-intel
+            platform: macos-x86_64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out vgi-cpp
+        uses: actions/checkout@v4
+        with:
+          repository: Query-farm/vgi-cpp
+          path: vgi-cpp
+
+      - name: Check out vgi-rpc-cpp
+        uses: actions/checkout@v4
+        with:
+          repository: Query-farm/vgi-rpc-cpp
+          path: vgi-rpc-c++
+
+      - name: Clone and bootstrap vcpkg
+        run: |
+          git clone https://github.com/microsoft/vcpkg.git
+          git -C vcpkg checkout "$VCPKG_COMMIT"
+          ./vcpkg/bootstrap-vcpkg.sh -disableMetrics
+          echo "VCPKG_ROOT=$(pwd)/vcpkg" >> "$GITHUB_ENV"
+
+      - name: Cache vcpkg binary archives
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/vcpkg/archives
+          key: vcpkg-release-${{ matrix.platform }}-${{ env.VCPKG_COMMIT }}-${{ hashFiles('vcpkg.json') }}
+          restore-keys: |
+            vcpkg-release-${{ matrix.platform }}-${{ env.VCPKG_COMMIT }}-
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y autoconf automake libtool autoconf-archive flex bison
+
+      - name: Install system dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install autoconf automake libtool autoconf-archive bison
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: release-${{ matrix.platform }}
+          max-size: 500M
+
+      - name: Fetch pinned SQLite
+        run: scripts/fetch_sqlite.sh
+
+      # -static-libgcc/-static-libstdc++ (Linux only) removes this build's
+      # single biggest remaining portability risk: without it, the .so
+      # dynamically requires whatever libstdc++.so.6 version this specific
+      # build environment shipped, which can be newer than what an older-
+      # but-still-common distro has installed ("version `GLIBCXX_3.4.32'
+      # not found"). This does NOT remove the glibc floor itself (glibc is
+      # never statically linkable in a way that's safe to redistribute) -
+      # a binary built on ubuntu-24.04 still requires glibc >= what that
+      # image ships (2.39) at minimum. Documented as a real, accepted v1
+      # limitation rather than solved via an older build container - see
+      # CLAUDE.md.
+      # Split by OS rather than one conditional cmake invocation: the
+      # static-link flags need to be one quoted argument
+      # (CMAKE_MODULE_LINKER_FLAGS="-static-libgcc -static-libstdc++"), and
+      # a GitHub Actions expression ternary embedded in a shell command line
+      # doesn't preserve that quoting reliably.
+      - name: Configure (Release, Linux)
+        if: runner.os == 'Linux'
+        run: >
+          cmake --preset release
+          -DVGI_CPP_SOURCE_DIR=${{ github.workspace }}/vgi-cpp
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          -DCMAKE_MODULE_LINKER_FLAGS="-static-libgcc -static-libstdc++"
+
+      - name: Configure (Release, macOS)
+        if: runner.os == 'macOS'
+        run: >
+          cmake --preset release
+          -DVGI_CPP_SOURCE_DIR=${{ github.workspace }}/vgi-cpp
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0
+
+      - name: Build
+        run: cmake --build build-release --parallel
+
+      # Prints exactly what the shipped binary dynamically depends on -
+      # every run's log is a real record that nothing beyond expected
+      # system libraries snuck in as a dynamic dependency (vcpkg's static
+      # triplet is the mechanism; this is the verification that it
+      # actually held for this specific build).
+      - name: Verify dynamic dependencies
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            otool -L build-release/vgi.dylib || otool -L build-release/vgi.so
+          else
+            ldd build-release/vgi.so
+          fi
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME:-dev}"
+          STAGE="vgi-sqlite-${VERSION}-${{ matrix.platform }}"
+          mkdir -p "$STAGE"
+          # CMake's MODULE library type on macOS actually produces .so by
+          # default (see test/integration/conftest.py's own comment on
+          # this same quirk) - ship whichever extension file exists.
+          cp build-release/vgi.so "$STAGE/" 2>/dev/null || cp build-release/vgi.dylib "$STAGE/"
+          cp LICENSE README.md "$STAGE/"
+          tar czf "${STAGE}.tar.gz" "$STAGE"
+          shasum -a 256 "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vgi-sqlite-${{ matrix.platform }}
+          path: |
+            vgi-sqlite-*.tar.gz
+            vgi-sqlite-*.tar.gz.sha256
+          if-no-files-found: error
+
+  publish:
+    # Only on an actual tag push - workflow_dispatch is for validating the
+    # build matrix itself without cutting a release.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: artifacts/*
