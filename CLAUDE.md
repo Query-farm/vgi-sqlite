@@ -787,26 +787,34 @@ the wire protocol in isolation, THEN wire into the SQLite extension, where a
   recoverable). Never blindly pass `--update-baseline` without reading the
   run's own pass/fail/skip numbers and regression list first.
   **The 5 "regressed" records are corpus drift, not a vgi-go fixture
-  difference - checked and corrected, not just suspected.** First guess
-  was that `vgi-go`'s own "products" example fixture
+  difference - checked and corrected twice over, not just suspected.**
+  First guess was that `vgi-go`'s own "products" example fixture
   (`examples/table/static_data.go`) builds its Arrow schema with no field
   metadata at all, so it never populates `duckdb_columns().comment` the
-  way `vgi-python`'s equivalent fixture does (`vgi-go`'s `CatalogTable`
-  model DOES support column comments generally via
-  `vgi/catalog_table.go`'s `ColumnComments` field - true, but a red
-  herring here). Directly disproven by checking `vgi-go`'s own real CI
-  (`gh run view` against its `integration.yml` workflow, which runs the
-  IDENTICAL pinned `Query-farm/vgi` corpus against a real DuckDB extension
-  via `haybarn-unittest`, not this driver's own translated harness): all 5
-  files (`table/comments.test`, `table/column_statistics.test`,
-  `table/function_registration.test`, `scalar/function_registration.test`,
-  `catalog/window_self_join.test`) run there and are NOT among that run's
-  failures (320/322 test cases pass; only 2 unrelated files fail - see
-  below). The real explanation is `baseline.json` predating ~5 days of
-  upstream `~/Development/vgi` corpus commits (confirmed via `git log`
-  on that sibling checkout - a `refactor!: remove vgi_table_function()...`
-  commit alone could shift which query a stored `file.test:LINE` id refers
-  to), not any behavioral difference from switching the worker backend.
+  way `vgi-python`'s equivalent fixture does. First correction: `gh run
+  view` against `vgi-go`'s own `integration.yml` CI (runs the IDENTICAL
+  pinned `Query-farm/vgi` corpus against a real DuckDB extension via
+  `haybarn-unittest`) showed all 5 flagged files, including
+  `table/comments.test`, are NOT among that run's failures (320/322 test
+  cases pass). Final confirmation, at the user's direct suggestion,
+  connecting `uvx haybarn-cli` straight to a locally-built
+  `vgi-example-worker-go` and querying `duckdb_columns()` for
+  `data.products` live: the comments ARE genuinely present and correct
+  (`id -> "Unique product identifier"`, `name -> "Product display name"`,
+  `price -> "Unit price in USD"`, `quantity -> NULL`, exactly matching
+  what the corpus expects). The original grep simply looked in the wrong
+  file - `RegisterCatalogTable`'s `ColumnComments` field for the
+  `products` table is actually set in
+  `cmd/vgi-example-worker/main.go:583-591`, a separate catalog-assembly
+  layer entirely independent of `examples/table/static_data.go`'s own
+  scan-function schema (which genuinely does carry no field metadata, but
+  that's irrelevant - `ColumnComments` at registration time is what
+  `duckdb_columns().comment` actually reports). There was no vgi-go bug at
+  any point; the real (and only) explanation for the 5 "regressed" records
+  is `baseline.json` predating ~5 days of upstream `~/Development/vgi`
+  corpus commits (confirmed via `git log` on that sibling checkout - a
+  `refactor!: remove vgi_table_function()...` commit alone could shift
+  which query a stored `file.test:LINE` id refers to).
   **`vgi-go`'s own CI does have a real, currently-failing gap, found
   answering a direct question about whether its test suite is
   sufficient**: its `integration.yml` (4 transport lanes: stdio/launch/
