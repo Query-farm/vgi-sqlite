@@ -24,31 +24,56 @@ Rules implemented, in the order they matter:
    detach/cleanup mechanism (see connection_pool.h) and this runner gives
    every test file its own fresh sqlite3 connection anyway, so there's
    nothing for DETACH to actually do.
-4. `<alias>.<function>(` -> `<alias>_<function>(` for every catalog alias
-   attached so far in this file (vgi-sqlite's flat `<catalog>_<name>`
-   scalar/aggregate function namespace - see extension.cpp's vgi_attach()).
-5. `<alias>.<schema>.<table>` (not followed by `(`, i.e. not rule 4's
+4. `<alias>.<function>(` and `<alias>.<schema>.<function>(` (DuckDB's
+   fully-qualified form) both -> `<alias>_<function>(` for every catalog
+   alias attached so far in this file - vgi-sqlite's flat
+   `<catalog>_<name>` namespace covers scalar/aggregate functions
+   (extension.cpp), blended table_in_out functions
+   (vtab/vgi_table_in_out_vtab.h), and plain standalone table functions
+   (vtab/vgi_table_function_vtab.h) all alike, so this ONE rewrite serves
+   every call shape uniformly - `FROM alias.fn(...)`/`SELECT alias.fn(...)`
+   look identical to this translator either way, and which module (if
+   any) actually backs the rewritten name is resolved by SQLite/
+   vgi_attach() at EXECUTION time, not here. A function this driver
+   genuinely can't represent (the classic, relation-valued-argument
+   table_in_out shape; anything vgi_attach() skipped for its own reasons)
+   isn't specially detected - the rewritten SQL just fails to execute
+   ("no such table"/"no such function"), a real FAIL rather than a
+   pre-emptive SKIP, which is the more honest signal once this driver
+   actually supports SOME table-function calls: pretending every one is
+   equally unsupported would hide real regressions. (Was a hardcoded
+   Untranslatable("table-function call...") raised unconditionally,
+   before this driver had any table-valued-function-call support at
+   all - removed once that stopped being true; see the plan file's
+   Milestone 10 notes.)
+5. `LATERAL` - stripped outright (a bare keyword removal, always
+   `, LATERAL <call>` in this corpus). SQLite has no such keyword and
+   needs none: rule 4's rewritten table-valued-function calls already
+   correlate per outer row via SQLite's own ordinary constraint-pushdown
+   machinery, with no LATERAL syntax required (confirmed directly against
+   `FROM t, json_each(t.x)` - see the plan file's Milestone 9 notes).
+6. `<alias>.<schema>.<table>` (not followed by `(`, i.e. not rule 4's
    function-call form) -> `"<schema>.<table>"` (vgi-sqlite's own
    double-quoted vtab identifier convention - see extension.cpp's
    vgi_attach()). A bare 2-part `<alias>.<table>` (DuckDB's implicit-`main`-
    schema form) is NOT rewritten - not observed as a real need in the files
    this was built against, and guessing which schema "main" or no-schema
    means for a given table would be more likely wrong than useful.
-6. `<expr>::<TYPE>` -> `CAST(<expr> AS <TYPE>)` (SQLite has no `::` cast
+7. `<expr>::<TYPE>` -> `CAST(<expr> AS <TYPE>)` (SQLite has no `::` cast
    operator at all). Implemented as a small hand-written scanner, not a
    single regex - the preceding operand can be a parenthesized expression,
    a quoted string, or a dotted identifier/number run, and `::` binds only
    to that immediate operand (the same postfix precedence Postgres/DuckDB
    give it), not to a looser surrounding expression.
-7. `SET <name> ...;` -> a no-op. SQLite has no SET statement AT ALL (every
+8. `SET <name> ...;` -> a no-op. SQLite has no SET statement AT ALL (every
    occurrence in this corpus would otherwise be a hard syntax error) and
    every SET in this corpus is test-harness configuration (threads, VGI's
    DuckDB-extension-side result-cache tuning, etc.), never an assertion in
    its own right - the assertion is always a later statement/query.
-8. `CALL {enable_logging,disable_logging,truncate_duckdb_logs}(...)` -> a
+9. `CALL {enable_logging,disable_logging,truncate_duckdb_logs}(...)` -> a
    no-op - DuckDB log-instrumentation calls with no vgi-sqlite equivalent
    and, like SET, never an assertion in themselves.
-9. `(VALUES (...), ...) [AS] alias(col1, col2, ...)` -> `(SELECT column1 AS
+10. `(VALUES (...), ...) [AS] alias(col1, col2, ...)` -> `(SELECT column1 AS
    col1, column2 AS col2, ... FROM (VALUES (...), ...)) AS alias`. Confirmed
    by testing directly against the built extension: SQLite's VALUES clause
    works standalone (default column names `column1`, `column2`, ...) but
@@ -61,7 +86,7 @@ Rules implemented, in the order they matter:
    general `(<any subquery>) AS t(cols)` form is not attempted (would need
    inspecting the subquery's own column list to rename positionally, a
    bigger and much rarer need in this corpus).
-10. A DuckDB STRUCT/LIST literal (`{...}`, `[...]::sometype`, `::STRUCT(...)`,
+11. A DuckDB STRUCT/LIST literal (`{...}`, `[...]::sometype`, `::STRUCT(...)`,
     `::LIST`) -> Untranslatable. SQLite has no analog of either type at all
     (see docs/type-mapping.md's struct/list -> JSON-text mapping - that's
     this driver's *scan-result* representation, not something a test can
@@ -153,6 +178,20 @@ def _translate_attach(sql: str, ctx: TranslationContext) -> str:
 def _rewrite_catalog_refs(sql: str, aliases: set[str]) -> str:
     for alias in sorted(aliases, key=len, reverse=True):
         esc = re.escape(alias)
+        # Schema-qualified function CALL (`alias.schema.fn(...)`, DuckDB's
+        # fully-qualified form - the open-meteo/earthquakes-style demo
+        # queries this was built against both use it) - matched and
+        # rewritten BEFORE the plain 2-part function-call rule below, or
+        # that rule would instead match its own `alias.schema(` prefix and
+        # mangle the schema name into a bogus function call.
+        sql = re.sub(rf"\b{esc}\.[A-Za-z_]\w*\.([A-Za-z_]\w*)\s*\(", rf"{alias}_\1(", sql)
+        # Plain function CALL (`alias.fn(...)`) - vgi-sqlite's flat
+        # "<catalog>_<name>" namespace covers scalar/aggregate functions
+        # (extension.cpp), table_in_out functions (vgi_table_in_out_vtab.h),
+        # and plain table functions (vgi_table_function_vtab.h) all alike -
+        # one rewrite rule serves every one of them; which module (if any)
+        # actually backs `alias_fn` is resolved by SQLite/vgi_attach() at
+        # execution time, not by this translator.
         sql = re.sub(rf"\b{esc}\.([A-Za-z_]\w*)\s*\(", rf"{alias}_\1(", sql)
         sql = re.sub(rf'\b{esc}\.([A-Za-z_]\w*)\.([A-Za-z_]\w*)\b(?!\s*\()', r'"\1.\2"', sql)
     return sql
@@ -313,15 +352,17 @@ def translate_sql(sql: str, ctx: TranslationContext) -> str:
     if _CALL_NOOP_RE.match(sql):
         return "SELECT 1"
 
-    # A DuckDB catalog-qualified *table function call* (`FROM alias.foo(...)`)
-    # has no vgi-sqlite equivalent - this driver's vtabs take fixed module
-    # arguments at CREATE VIRTUAL TABLE time, never per-query SQL arguments -
-    # so surface that clearly rather than mistranslating it as a scalar
-    # function call (rule 4 above would otherwise mangle it: `alias.foo(`
-    # looks identical to a scalar-function call syntactically).
-    for alias in ctx.aliases:
-        if re.search(rf"\bFROM\s+{re.escape(alias)}\.[A-Za-z_]\w*\s*\(", sql, re.IGNORECASE):
-            raise Untranslatable("table-function call (no vgi-sqlite equivalent)")
+    # `LATERAL` - SQLite has no such keyword at all (a hard syntax error if
+    # left in) and needs none: a correlated table-valued-function call
+    # (`FROM t, fn(t.x)`) already re-invokes xFilter once per outer row via
+    # SQLite's own ordinary constraint-pushdown machinery - confirmed
+    # directly (see the plan file's Milestone 9 research notes on
+    # `FROM t, json_each(t.x)`), the discovery that made table_in_out/
+    # plain-table-function support representable in this driver at all.
+    # Simple keyword removal is safe here: every occurrence in this corpus
+    # is `, LATERAL <call>`, and dropping the keyword leaves an ordinary
+    # comma-join the parser accepts unchanged.
+    sql = re.sub(r"\bLATERAL\s+", "", sql, flags=re.IGNORECASE)
 
     _check_no_struct_or_list(sql)
 

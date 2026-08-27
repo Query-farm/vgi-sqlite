@@ -123,6 +123,7 @@ add_library(vgi_extension MODULE
     src/types/type_mapping.cpp
     src/vtab/vgi_vtab.cpp
     src/vtab/vgi_table_in_out_vtab.cpp
+    src/vtab/vgi_table_function_vtab.cpp
     src/vtab/filter_pushdown.cpp
 )
 target_link_libraries(vgi_extension PRIVATE vgi_sqlite::driver)

@@ -430,7 +430,8 @@ int xFilter(sqlite3_vtab_cursor* base_cursor, int, const char* idxStr, int argc,
     // decoded.constraints and argv line up positionally.
     std::optional<std::string> pushdown_filters;
     if (!decoded.constraints.empty() && static_cast<int>(decoded.constraints.size()) <= argc) {
-        pushdown_filters = EncodePushdownFilters(vtab->table.columns, decoded.constraints, argv);
+        pushdown_filters =
+            EncodePushdownFilters(vtab->table.columns, decoded.constraints, argv, decoded.projected_columns);
     }
     // Mutually exclusive with the constraints branch above (xBestIndex
     // only claims LIMIT when `constraints` was empty), so argv[0] is never

@@ -76,23 +76,54 @@ DEFAULT_BASELINE = Path(__file__).resolve().parent / "baseline.json"
 # fixture worker is available - see this module's docstring and the plan
 # file's Milestone 6 status for what each one actually tests and why.
 STRUCTURAL_SKIP_CATEGORIES = {
-    "table_in_out": "table-in-out functions have no vgi-sqlite equivalent (explicit gap - see plan file)",
-    # "splits" was here (whole-category skip) until vgi-sqlite implemented
-    # sequential split redemption - see catalog_table_plan.h. Individual
-    # splits/*.test files may still skip/fail for unrelated reasons
-    # (parallelism-only scenarios this driver's single-reader model can't
-    # exercise the same way, or ordinary untranslated DuckDB syntax), but
-    # the category itself is no longer blanket-skipped.
+    # "table_in_out" was here (whole-category skip) until vgi-sqlite
+    # implemented the blended/RowTransformFunction call shape (per-row-
+    # correlated table-valued functions, vtab/vgi_table_in_out_vtab.h) and
+    # translate.py learned to rewrite `alias.fn(...)`/LATERAL calls into
+    # it - see the plan file's Milestone 9/10 status. The category is no
+    # longer blanket-skipped: a file whose functions are still genuinely
+    # unrepresentable (the classic, relation-valued-TABLE-argument shape)
+    # now gets real per-statement fails/skips instead, which is a more
+    # honest signal than a blanket file-level skip once SOME of the
+    # category is actually supported.
+    #
+    # "splits" was here too, until vgi-sqlite implemented sequential split
+    # redemption - see catalog_table_plan.h. Individual splits/*.test
+    # files may still skip/fail for unrelated reasons (parallelism-only
+    # scenarios this driver's single-reader model can't exercise the same
+    # way, or ordinary untranslated DuckDB syntax), but the category
+    # itself is no longer blanket-skipped.
+    #
+    # "launcher" was here too, claiming "the AF_UNIX launcher discovery
+    # protocol isn't implemented in vgi-sqlite" - stale the moment
+    # Milestone 8 shipped it (rpc/launcher.h) and never revisited since,
+    # the same kind of oversight "table_in_out" above had. Removed - a
+    # launcher/*.test file's own ATTACH-option syntax (launcher_idle_timeout
+    # and friends) still isn't translatable (rule 2 in translate.py only
+    # accepts LOCATION/bearer_token), so this doesn't unlock new passes by
+    # itself, but the resulting per-statement skip reason is accurate
+    # instead of a blanket, now-wrong category claim.
     "secret": "DuckDB's secrets manager has no vgi-sqlite equivalent",
-    "launcher": "the AF_UNIX launcher discovery protocol isn't implemented in vgi-sqlite",
     "cache": "DuckDB-extension-side VGI result cache has no vgi-sqlite equivalent",
     "copy_to": "SQL COPY has no vgi-sqlite/SQLite equivalent",
     "copy_from": "SQL COPY has no vgi-sqlite/SQLite equivalent",
     "macro": "SQL CREATE MACRO has no vgi-sqlite/SQLite equivalent",
-    "overload": "catalog-qualified table-function-call syntax has no vgi-sqlite equivalent",
     "global_functions": "vgi_global_functions() introspection has no vgi-sqlite equivalent",
     "view": "duckdb_views()-based assertions have no vgi-sqlite equivalent",
-    "settings": "these tests call table-in-out functions with SQL arguments - see table_in_out",
+    # "overload"/"settings" stay skipped: each hinges on a capability this
+    # driver still genuinely lacks independent of today's table-function-
+    # call work - "overload" needs same-arity/different-TYPE scalar
+    # function overload resolution (SQLite's own sqlite3_create_function
+    # is keyed by name+argcount only, never by type - a real SQLite
+    # limitation, not a vgi-sqlite one); "settings" mostly exercises the
+    # classic (TABLE-arg) table_in_out shape and DuckDB `SET`-based
+    # worker configuration (translated to a no-op by rule 8 in
+    # translate.py, which would silently produce wrong results here if
+    # the category weren't already skipped for the TABLE-arg reason
+    # first). Revisit each independently if either capability is ever
+    # added - not a package deal with plain table-function-call support.
+    "overload": "same-arity/different-type scalar function overload resolution has no vgi-sqlite equivalent",
+    "settings": "mostly exercises the classic (TABLE-arg) table_in_out shape and DuckDB SET-based worker config",
 }
 
 # require values this environment can always satisfy - DuckDB extension

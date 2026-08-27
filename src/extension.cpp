@@ -27,6 +27,7 @@ SQLITE_EXTENSION_INIT1
 #include "sql_quote.h"
 #include "types/type_mapping.h"
 #include "vtab/connection_pool.h"
+#include "vtab/vgi_table_function_vtab.h"
 #include "vtab/vgi_table_in_out_vtab.h"
 #include "vtab/vgi_vtab.h"
 
@@ -359,6 +360,40 @@ void VgiAttachFunc(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
                 }
                 ++table_count;
             }
+
+            // Plain, standalone table (generator) functions - e.g.
+            // split_sequence - each become their own vgi_table_function
+            // virtual table, callable both as a literal call
+            // (`SELECT * FROM "<catalog>_<function>"(1, 2)`) and, per-outer-
+            // row correlated, the same way vgi_table_in_out's functions are
+            // (see vtab/vgi_table_function_vtab.h). Same flat naming/
+            // failure-handling as table_in_out functions above.
+            for (const auto& fn :
+                 catalog.SchemaContentsPlainTableFunctions(checkout->attach_opaque_data, schema.name)) {
+                std::string vtab_name = catalog_name + "_" + fn.function_name;
+                std::string quoted_vtab_name = SqlQuoteIdentifier(vtab_name);
+                std::string drop_sql = "DROP TABLE IF EXISTS " + quoted_vtab_name + ";";
+                std::string create_sql = "CREATE VIRTUAL TABLE " + quoted_vtab_name + " USING vgi_table_function(" +
+                                          "location=" + SqlQuote(location) +
+                                          ", catalog=" + SqlQuote(catalog_name) +
+                                          ", schema=" + SqlQuote(fn.schema_name) +
+                                          ", function=" + SqlQuote(fn.function_name) + ");";
+                char* err = nullptr;
+                if (sqlite3_exec(db, drop_sql.c_str(), nullptr, nullptr, &err) != SQLITE_OK) {
+                    std::string msg = "vgi_attach: " + (err ? std::string(err) : "drop failed");
+                    if (err) sqlite3_free(err);
+                    sqlite3_result_error(ctx, msg.c_str(), -1);
+                    return;
+                }
+                if (sqlite3_exec(db, create_sql.c_str(), nullptr, nullptr, &err) != SQLITE_OK) {
+                    sqlite3_log(SQLITE_WARNING, "vgi_attach: skipping table function \"%s\": %s",
+                                vtab_name.c_str(), err ? err : "create failed");
+                    if (err) sqlite3_free(err);
+                    ++skip_count;
+                    continue;
+                }
+                ++table_count;
+            }
         }
     } catch (const std::exception& e) {
         sqlite3_result_error(ctx, e.what(), -1);
@@ -388,6 +423,7 @@ extern "C" int sqlite3_vgi_init(sqlite3* db, char** pzErrMsg, const sqlite3_api_
     // RegisterVgiTableInOutModule doc comment on why this module doesn't
     // own/destroy it itself.
     if (int rc = vgi_sqlite::RegisterVgiTableInOutModule(db, pool); rc != SQLITE_OK) return rc;
+    if (int rc = vgi_sqlite::RegisterVgiTableFunctionModule(db, pool); rc != SQLITE_OK) return rc;
 
     int rc = sqlite3_create_function(db, "vgi_attach", 2, SQLITE_UTF8, pool, vgi_sqlite::VgiAttachFunc,
                                       nullptr, nullptr);

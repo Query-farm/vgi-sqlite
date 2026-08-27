@@ -285,4 +285,62 @@ CatalogTableInOutFunction VgiCatalogClient::TableInOutFunctionGet(const std::str
     throw std::runtime_error("no such table_in_out function '" + schema_name + "." + function_name + "'");
 }
 
+namespace {
+// True iff any field of `argument_schema` carries `vgi_type: table`
+// metadata - the classic table_in_out shape's genuinely relation-valued
+// argument marker (vgi-python's argument_spec.py: VGI_TYPE_KEY="vgi_type",
+// VGI_TYPE_TABLE="table"). A plain table (generator) function never has
+// one; excluding a function that does is what keeps this listing from
+// trying to represent the one table_in_out shape SQLite's calling
+// convention genuinely can't express (see CatalogPlainTableFunction's
+// file comment).
+bool HasTableTypedArgument(const std::shared_ptr<arrow::Schema>& argument_schema) {
+    if (!argument_schema) return false;
+    for (int i = 0; i < argument_schema->num_fields(); ++i) {
+        auto metadata = argument_schema->field(i)->metadata();
+        if (!metadata) continue;
+        auto value = metadata->Get("vgi_type");
+        if (value.ok() && *value == "table") return true;
+    }
+    return false;
+}
+
+std::vector<CatalogPlainTableFunction> ParsePlainTableFunctions(
+    const std::vector<std::shared_ptr<arrow::RecordBatch>>& items, const std::string& schema_name_fallback) {
+    std::vector<CatalogPlainTableFunction> functions;
+    for (const auto& item : items) {
+        bool input_from_args = wire::get_optional_bool(item, "input_from_args").value_or(false);
+        bool has_finalize = wire::get_optional_bool(item, "has_finalize").value_or(false);
+        if (input_from_args || has_finalize) continue;  // those are CatalogTableInOutFunction's territory
+        auto argument_schema = wire::get_schema(item, "arguments");
+        if (HasTableTypedArgument(argument_schema)) continue;  // classic table_in_out - not representable
+        CatalogPlainTableFunction fn;
+        fn.function_name = wire::get_string(item, "name");
+        fn.schema_name = wire::get_optional_string(item, "schema_name").value_or(schema_name_fallback);
+        fn.argument_schema = argument_schema;
+        fn.supports_splits = wire::get_optional_bool(item, "supports_splits").value_or(false);
+        functions.push_back(std::move(fn));
+    }
+    return functions;
+}
+}  // namespace
+
+std::vector<CatalogPlainTableFunction> VgiCatalogClient::SchemaContentsPlainTableFunctions(
+    const std::string& attach_opaque_data, const std::string& schema_name) {
+    auto params = gen::BuildCatalogSchemaContentsFunctionsParams(to_bytes(attach_opaque_data), schema_name,
+                                                                  "TABLE_FUNCTION",
+                                                                  /*transaction_opaque_data=*/std::nullopt);
+    auto result = Call(connection_, "catalog_schema_contents_functions", params);
+    return ParsePlainTableFunctions(Items(result), schema_name);
+}
+
+CatalogPlainTableFunction VgiCatalogClient::PlainTableFunctionGet(const std::string& attach_opaque_data,
+                                                                   const std::string& schema_name,
+                                                                   const std::string& function_name) {
+    for (auto& fn : SchemaContentsPlainTableFunctions(attach_opaque_data, schema_name)) {
+        if (fn.function_name == function_name) return fn;
+    }
+    throw std::runtime_error("no such table function '" + schema_name + "." + function_name + "'");
+}
+
 }  // namespace vgi_sqlite

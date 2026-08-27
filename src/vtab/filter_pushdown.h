@@ -50,8 +50,31 @@ std::vector<PushableConstraint> SelectPushableConstraints(sqlite3_index_info* in
 // declared Arrow schema, used to type each value column exactly like its
 // target column (docs/filter-pushdown.md: "Arrow columns store filter
 // values (preserves exact types)"). Call from xFilter.
+//
+// `projected_columns` is xFilter's own decoded projection list (empty
+// means "every column, in declared order" - the same convention
+// cursor->projected_columns/xColumn's FetchedPosition already use).
+// Required to get `column_index` right: the wire format's
+// pushdown_filters.column_index isn't the table's declared column index
+// at all - it's that column's POSITION WITHIN THE PROJECTED OUTPUT the
+// worker is about to emit (confirmed against vgi's own DuckDB extension,
+// vgi_table_function_impl.cpp: "`col_idx` is the filter's position in the
+// projected column_ids and is sent as the wire `column_index`. The
+// worker applies ConstantFilter/InFilter by INDEX (`batch.column
+// (column_index)`)... this only resolves correctly because the worker
+// emits its output batch in the same projected order"). Found the hard
+// way against a real deployed worker (earthquakes, a Cloudflare Worker):
+// `SELECT mag, time FROM t WHERE mag >= 0` silently returned zero rows -
+// column_index was sent as 2 (mag's DECLARED index in a ~30-column
+// table) when the worker's own 2-column projected response only has
+// positions 0/1, so the filter compared the wrong column (or an
+// out-of-range one) against every row and never matched. `SELECT *`
+// (no narrowing - projected order coincides with declared order)
+// accidentally "worked" the whole time, which is why this went
+// unnoticed until a genuinely narrow projection exercised it.
 std::optional<std::string> EncodePushdownFilters(const std::shared_ptr<arrow::Schema>& columns,
                                                   const std::vector<PushableConstraint>& constraints,
-                                                  sqlite3_value** argv);
+                                                  sqlite3_value** argv,
+                                                  const std::vector<int>& projected_columns);
 
 }  // namespace vgi_sqlite

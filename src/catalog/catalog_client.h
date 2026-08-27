@@ -114,6 +114,36 @@ struct CatalogTableInOutFunction {
     bool projection_pushdown = false;
 };
 
+// A plain, standalone table (generator) function - callable directly via
+// SQL table-valued-function syntax (`FROM catalog_fn(args)`, literal or
+// correlated) with NO per-row streaming input at all - the shape
+// `split_sequence` and similar functions use (`TableFunctionGenerator` in
+// vgi-python), architecturally identical to a regular vgi_worker table's
+// own backing scan_function except that its arguments come from the SQL
+// call site instead of being inlined once by TableInfo. Discovered the
+// same way CatalogTableInOutFunction is (catalog_schema_contents_functions,
+// type="TABLE_FUNCTION"), filtered to the complementary shape:
+// input_from_args=false (not a blended/RowTransformFunction - those are
+// CatalogTableInOutFunction's own territory) AND no declared argument
+// carries `vgi_type: table` metadata (excludes the classic, genuinely
+// relation-valued-argument table_in_out shape, which SQLite's calling
+// convention has no way to express regardless of input_from_args).
+struct CatalogPlainTableFunction {
+    std::string function_name;
+    std::string schema_name;
+    // Declared argument names+types (FunctionInfo.arguments, a SCHEMA -
+    // same shape as CatalogTableInOutFunction::input_schema, but here it's
+    // purely bind()-time call arguments, never a streaming input_schema at
+    // all; the vtab this backs (vgi_table_function) drives an ordinary
+    // TableScanner bind->init->tick scan per xFilter call, using these
+    // as real, per-call argument VALUES via ScanFunction::arguments_ipc_bytes
+    // (arguments_already_wrapped=true) - see tools/split_probe.cpp, which
+    // already proved this exact call shape works before any vtab existed
+    // for it.
+    std::shared_ptr<arrow::Schema> argument_schema;
+    bool supports_splits = false;  // mirrors ScanFunction::supports_splits
+};
+
 // A worker's registered function, as much of FunctionInfo as calling a
 // plain (non-const-argument) scalar function needs.
 struct CatalogFunction {
@@ -208,6 +238,25 @@ public:
     // optional - matches VgiCatalogClient::TableGet's own contract for
     // an unknown table).
     CatalogTableInOutFunction TableInOutFunctionGet(const std::string& attach_opaque_data,
+                                                     const std::string& schema_name,
+                                                     const std::string& function_name);
+
+    // Every plain, standalone table (generator) function registered in
+    // `schema_name` that this driver can represent (see
+    // CatalogPlainTableFunction's file comment). Same
+    // catalog_schema_contents_functions RPC/type="TABLE_FUNCTION" filter
+    // as SchemaContentsTableInOutFunctions - the two listings are
+    // complementary subsets of the same underlying call, not separate
+    // RPCs. vgi_attach()'s data source for registering each qualifying
+    // function as a vgi_table_function virtual table.
+    std::vector<CatalogPlainTableFunction> SchemaContentsPlainTableFunctions(
+        const std::string& attach_opaque_data, const std::string& schema_name);
+
+    // Fallback for a vgi_table_function vtab's xConnect/xCreate - same
+    // re-list-and-find-by-name contract as TableInOutFunctionGet (no
+    // dedicated single-function catalog RPC exists). Throws if no such
+    // eligible function is found.
+    CatalogPlainTableFunction PlainTableFunctionGet(const std::string& attach_opaque_data,
                                                      const std::string& schema_name,
                                                      const std::string& function_name);
 

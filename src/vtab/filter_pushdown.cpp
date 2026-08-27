@@ -1,6 +1,8 @@
 // © Copyright 2026 Query Farm LLC - https://query.farm
 #include "vtab/filter_pushdown.h"
 
+#include <algorithm>
+
 #include <arrow/api.h>
 #include <nlohmann/json.hpp>
 
@@ -110,7 +112,8 @@ std::vector<PushableConstraint> SelectPushableConstraints(sqlite3_index_info* in
 
 std::optional<std::string> EncodePushdownFilters(const std::shared_ptr<arrow::Schema>& columns,
                                                   const std::vector<PushableConstraint>& constraints,
-                                                  sqlite3_value** argv) {
+                                                  sqlite3_value** argv,
+                                                  const std::vector<int>& projected_columns) {
     if (!columns || constraints.empty()) return std::nullopt;
 
     auto filter_spec = nlohmann::json::array();
@@ -122,9 +125,20 @@ std::optional<std::string> EncodePushdownFilters(const std::shared_ptr<arrow::Sc
         if (constraint.column_index >= columns->num_fields()) continue;
         const auto& field = columns->field(constraint.column_index);
 
+        // See the header's file comment: the wire format wants this
+        // column's position within the PROJECTED output, not its
+        // declared table index - identical when nothing was narrowed
+        // (empty projected_columns means "every column, declared order").
+        int wire_column_index = constraint.column_index;
+        if (!projected_columns.empty()) {
+            auto it = std::find(projected_columns.begin(), projected_columns.end(), constraint.column_index);
+            if (it == projected_columns.end()) continue;  // shouldn't happen - colUsed already covers WHERE columns
+            wire_column_index = static_cast<int>(it - projected_columns.begin());
+        }
+
         nlohmann::json entry;
         entry["column_name"] = field->name();
-        entry["column_index"] = constraint.column_index;
+        entry["column_index"] = wire_column_index;
 
         if (IsNullCheck(constraint.op)) {
             entry["type"] = constraint.op == SQLITE_INDEX_CONSTRAINT_ISNULL ? "is_null" : "is_not_null";
