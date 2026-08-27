@@ -62,6 +62,16 @@ jobs:
           repository: Query-farm/vgi-rpc-cpp
           path: vgi-rpc-c++
 
+      # See ci.yml's matching step for the full reasoning (GCC 13 breaks
+      # libsodium's ARM-NEON crypto acceleration on this runner).
+      - name: Use gcc-12 (linux-arm64 only - GCC 13 breaks libsodium's ARM crypto)
+        if: matrix.platform == 'linux-arm64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-12 g++-12
+          echo "CC=gcc-12" >> "$GITHUB_ENV"
+          echo "CXX=g++-12" >> "$GITHUB_ENV"
+
       - name: Clone and bootstrap vcpkg
         run: |
           git clone https://github.com/microsoft/vcpkg.git
@@ -177,6 +187,14 @@ jobs:
           -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
           -DCMAKE_MODULE_LINKER_FLAGS="-static-libgcc -static-libstdc++"
 
+      # 13.3, not a rounder-looking 12.0/13.0: vgi-cpp's arg_schema.cpp uses
+      # std::to_chars's floating-point overload, which Apple's libc++ only
+      # marks available from macOS 13.3 onward (an Apple-specific libc++
+      # availability gate, not a real language/library-version requirement)
+      # - a real build failure this same job's first attempt hit at 12.0,
+      # not a guess. This is exactly the macOS deployment-target floor this
+      # dependency actually needs, not an arbitrarily safe-sounding round
+      # number.
       - name: Configure (Release, macOS)
         if: runner.os == 'macOS'
         run: >
@@ -184,7 +202,7 @@ jobs:
           -DVGI_CPP_SOURCE_DIR=${{ github.workspace }}/vgi-cpp
           -DCMAKE_C_COMPILER_LAUNCHER=ccache
           -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
-          -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0
+          -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3
 
       - name: Build
         run: cmake --build build-release --parallel

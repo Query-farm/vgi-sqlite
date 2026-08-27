@@ -64,6 +64,23 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v5
 
+      # ubuntu-24.04-arm's default GCC (13.3.0) fails to compile libsodium's
+      # ARM-NEON crypto acceleration (crypto_ipcrypt/ipcrypt_armcrypto.c) -
+      # stricter NEON-intrinsic type checking than the port's `BlockVec`
+      # aliasing (uint64x2_t/uint8x16_t) accounts for. A real, environment-
+      # specific bug (this port built fine on GCC 11, e.g. the EC2 boxes
+      # used earlier in this repo's development), not anything project code
+      # can fix - use gcc-12 for this platform's whole job (vcpkg's own
+      # autotools-built ports respect ambient CC/CXX) rather than patching
+      # around one port.
+      - name: Use gcc-12 (linux-arm64 only - GCC 13 breaks libsodium's ARM crypto)
+        if: matrix.platform == 'linux-arm64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-12 g++-12
+          echo "CC=gcc-12" >> "$GITHUB_ENV"
+          echo "CXX=g++-12" >> "$GITHUB_ENV"
+
       - name: Clone and bootstrap vcpkg
         run: |
           git clone https://github.com/microsoft/vcpkg.git
