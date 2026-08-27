@@ -31,10 +31,23 @@ def _extension_path() -> Path:
     # CMake's MODULE library type on macOS actually produces .so by
     # default (BUNDLE/MACOSX_RPATH quirks) - try both, .load() only cares
     # that the file exists and is Mach-O/ELF-loadable, not its suffix.
-    for name in (f"vgi{suffix}", "vgi.so", "vgi.dylib"):
-        candidate = REPO_ROOT / "build" / name
-        if candidate.exists():
-            return candidate
+    names = (f"vgi{suffix}", "vgi.so", "vgi.dylib")
+    # Windows: neither suffix above ever matches - MSVC produces vgi.dll,
+    # and CMake's multi-config (Visual Studio) generator nests build
+    # output under build/<Config>/ rather than build/ directly, unlike
+    # the single-config Makefile/Ninja generators Linux/macOS use.
+    dirs = (REPO_ROOT / "build",) if platform.system() != "Windows" else (
+        REPO_ROOT / "build",
+        REPO_ROOT / "build" / "Debug",
+        REPO_ROOT / "build" / "Release",
+    )
+    if platform.system() == "Windows":
+        names = ("vgi.dll",)
+    for d in dirs:
+        for name in names:
+            candidate = d / name
+            if candidate.exists():
+                return candidate
     raise FileNotFoundError(
         f"vgi extension not found under {REPO_ROOT / 'build'} - build it first "
         "(cmake --build build), or set VGI_SQLITE_EXTENSION"
@@ -62,7 +75,23 @@ def _default_worker() -> str:
 
 @pytest.fixture(scope="session")
 def extension_path() -> Path:
-    return _extension_path()
+    path = _extension_path()
+    if platform.system() == "Windows":
+        # Windows does not search a loaded DLL's own directory for ITS
+        # dependencies by default (unlike POSIX .so/.dylib RPATH-style
+        # resolution) - sqlite3.connect().load_extension() found vgi.dll
+        # fine (an absolute path resolves directly) but then failed to
+        # resolve vgi.dll's own imports (arrow.dll and the rest of the
+        # vcpkg runtime DLLs CMake copies next to it - see CMakeLists.txt's
+        # POST_BUILD step) with a generic "the specified module could not
+        # be found", regardless of them being copied right next to it.
+        # PATH is one of the directories Windows's DLL search order does
+        # consult, and unlike cd-ing into the directory first (which also
+        # works, confirmed manually), doesn't require changing the
+        # process's cwd for every test. Prepending (not appending) so it
+        # wins over anything same-named already on PATH.
+        os.environ["PATH"] = str(path.parent) + os.pathsep + os.environ.get("PATH", "")
+    return path
 
 
 @pytest.fixture(scope="session")
@@ -102,11 +131,17 @@ def row_transform_worker_location() -> str:
     the classic relation-valued-argument shape this driver can't
     represent at all - see catalog/table_in_out_caller.h). VGI_PYTHON
     overrides which vgi-python checkout supplies the interpreter/SDK,
-    matching every other worker fixture's convention here."""
+    matching every other worker fixture's convention here.
+    VGI_ROW_TRANSFORM_WORKER overrides the whole location - this fixture
+    was missing that override entirely until found while scoping Windows
+    CI (which needs to bypass launch:, currently blocked there - see
+    CLAUDE.md - by pointing every worker fixture at a plain, non-launch:
+    location), inconsistent with worker_location/writable_worker_location
+    just above, which both already support one."""
     vgi_python = os.environ.get("VGI_PYTHON", str(Path.home() / "Development" / "vgi-python"))
     script = REPO_ROOT / "test" / "integration" / "fixtures" / "row_transform_worker.py"
     # launch: - same rationale as _default_worker() above.
-    return f"launch:uv run --project {vgi_python} python {script}"
+    return os.environ.get("VGI_ROW_TRANSFORM_WORKER", f"launch:uv run --project {vgi_python} python {script}")
 
 
 def _free_port() -> int:

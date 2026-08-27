@@ -506,24 +506,28 @@ engines to claim splits concurrently.
   108-byte `sun_path` limit as POSIX - not a named pipe at all - and
   `vgi-go`'s worker CLI agrees (`--unix`: "Bind to this AF_UNIX socket
   path"). Corrected to AF_UNIX before ever shipping as canonical; the
-  Windows `Launch()` is now structurally close to the POSIX one (same
+  Windows `Launch()` is structurally close to the POSIX one (same
   state-dir + hash + `.sock` scheme), differing only in process spawn
   (`CreateProcess`, no `fork`/`exec`) and spawn election (a named
-  `Mutex`, no `flock`). **Known, currently-blocking gap, found via this
-  same live testing, not yet fixed**: `vgi-rpc-c++`'s OWN client-side
-  `RpcClient::connect_unix` is a stub on Windows
-  (`client_transport.cpp`'s `ClientTransport::connect_unix` throws
-  unconditionally there) - the low-level `connect_unix_fd` helper it
-  would need is POSIX-only-compiled, and even a Windows port of it can't
-  reuse `FdInputStream`/`FdOutputStream` as-is (their Windows I/O
-  primitives are `_read`/`_write`, CRT file-descriptor calls that do not
-  work on a raw Winsock `SOCKET` - a `send`/`recv`-based stream pair is
-  the correct fix, not yet built). This is why `vgi.dll` builds and
-  *loads* correctly on Windows (verified: `.load` succeeds, `vgi_attach()`
-  runs, spawns a real worker via the new AF_UNIX `Launch()`) but a full
-  `launch:` round trip against a real worker doesn't complete yet - a
-  real, separate, well-scoped piece of work in `vgi-rpc-c++`, not
-  `vgi-sqlite`. Also fixed along the way, in `vgi-c++` (not `vgi-sqlite`):
+  `Mutex`, no `flock`). **A real, initially-blocking gap this same live
+  testing found, since fixed in `vgi-rpc-c++` (not `vgi-sqlite`, its
+  natural home - see that repo's own commit)**: `RpcClient::connect_unix`
+  was a stub on Windows (`client_transport.cpp`'s
+  `ClientTransport::connect_unix` threw unconditionally there) - the
+  low-level `connect_unix_fd` helper it needed was POSIX-only-compiled,
+  and a straight port of it couldn't reuse `FdInputStream`/
+  `FdOutputStream` as-is (their Windows I/O primitives are `_read`/
+  `_write`, CRT file-descriptor calls that do not work on a raw Winsock
+  `SOCKET`). Fixed with a real `send`/`recv`-based `SocketInputStream`/
+  `SocketOutputStream` pair plus a genuine Windows `connect_unix_socket`
+  (Winsock `WSAStartup`/`socket`/`connect`/`afunix.h`, with a
+  `WSAPoll`-based connect-timeout implementation mirroring the POSIX
+  `poll`-based one). **Verified end-to-end on a real Windows/MSVC box**:
+  the exact `launch:` round trip that previously failed with "Unix socket
+  client transport is not available on Windows" right after a real
+  worker announced itself now completes fully - `vgi_attach()` over
+  `launch:` discovers a real catalog (168 objects) and a real scan
+  returns correct data. Also fixed along the way, in `vgi-c++` (not `vgi-sqlite`):
   `catalog.cpp`/`function_dispatch.cpp`/`storage.cpp` unconditionally
   included `<unistd.h>` for `getpid()`/`getuid()`/a raw POSIX atomic-
   file-claim primitive - a hard Windows build failure, fixed with a new

@@ -237,3 +237,141 @@ jobs:
         run: |
           uv sync
           uv run pytest -v
+
+  # A separate job, not a 4th matrix entry above: Windows needs PowerShell
+  # syntax throughout (a mixed bash/pwsh matrix job would need per-step
+  # if:/shell: branching on nearly every step, less readable than one job
+  # that's Windows-flavored end to end) and a genuinely different toolchain
+  # (cl.exe/lib.exe via vswhere, no autotools - vcpkg's libsodium/thrift
+  # ports build via MSBuild on Windows, confirmed no autoconf/automake/
+  # libtool/flex/bison needed there, unlike Linux/macOS).
+  #
+  # Verified real, not just "should work": both transports this driver
+  # supports were checked end-to-end on a real Windows 11/MSVC box before
+  # this job was written - plain subprocess spawn (the full existing
+  # pytest suite, 52 passed/7 skipped, 0 failed) and `launch:`/AF_UNIX
+  # (vgi_attach() over launch: against a real worker, real catalog
+  # discovery, real data) - see CLAUDE.md's Windows entries for the full
+  # history, including the vgi-rpc-c++ fix (Windows AF_UNIX client
+  # transport, previously a stub) `launch:` needed.
+  build-and-test-windows:
+    runs-on: windows-2022
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out vgi-cpp
+        uses: actions/checkout@v4
+        with:
+          repository: Query-farm/vgi-cpp
+          path: vgi-cpp
+
+      - name: Check out vgi-rpc-cpp
+        uses: actions/checkout@v4
+        with:
+          repository: Query-farm/vgi-rpc-cpp
+          path: vgi-rpc-c++
+
+      - name: Check out vgi-python
+        uses: actions/checkout@v4
+        with:
+          repository: Query-farm/vgi-python
+          path: vgi-python
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Clone and bootstrap vcpkg
+        run: |
+          git clone https://github.com/microsoft/vcpkg.git
+          git -C vcpkg checkout $env:VCPKG_COMMIT
+          .\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+          echo "VCPKG_ROOT=$(Resolve-Path vcpkg)" >> $env:GITHUB_ENV
+
+      # See the Linux/macOS job's matching step for the full reasoning -
+      # same shared Haybarn cache, same graceful read-only fallback.
+      - name: Configure vcpkg binary cache
+        env:
+          QUERY_FARM_VCPKG_TOKEN: ${{ secrets.QUERY_FARM_VCPKG_TOKEN }}
+        run: |
+          if ($env:QUERY_FARM_VCPKG_TOKEN) {
+            $remote = "http,https://haybarn-vcpkg-cache.rusty-bb6.workers.dev,readwrite,Authorization: Bearer $env:QUERY_FARM_VCPKG_TOKEN"
+          } else {
+            $remote = "http,https://haybarn-vcpkg-cache.rusty-bb6.workers.dev,read"
+          }
+          $archives = Join-Path $env:GITHUB_WORKSPACE "vcpkg-archives"
+          echo "VCPKG_BINARY_SOURCES=clear;files,$archives,readwrite;$remote" >> $env:GITHUB_ENV
+
+      - name: Cache vcpkg binary archives (local)
+        uses: actions/cache@v4
+        with:
+          path: vcpkg-archives
+          key: vcpkg-windows-x86_64-${{ env.VCPKG_COMMIT }}-${{ hashFiles('vcpkg.json') }}
+          restore-keys: |
+            vcpkg-windows-x86_64-${{ env.VCPKG_COMMIT }}-
+
+      # See the Linux/macOS job's matching step - pinned rather than
+      # whatever chocolatey/winget currently ship, for confirmed HTTP
+      # remote-storage support (a chocolatey-packaged 4.9.1 is known to
+      # silently fail bearer-token PUTs against this exact Worker on
+      # Windows - haybarn-extension-ci-tools's own upgrade-to-4.13.6 step,
+      # the actual finding this pin is based on, not a guess for this
+      # platform).
+      - name: Install ccache (pinned, for HTTP remote-storage support)
+        run: |
+          $CCACHE_VERSION = "4.14"
+          $asset = "ccache-$CCACHE_VERSION-windows-x86_64.zip"
+          Invoke-WebRequest -Uri "https://github.com/ccache/ccache/releases/download/v$CCACHE_VERSION/$asset" -OutFile ccache.zip
+          Expand-Archive -Path ccache.zip -DestinationPath ccache-extract -Force
+          $dir = (Get-ChildItem -Recurse -Path ccache-extract -Filter ccache.exe | Select-Object -First 1).DirectoryName
+          echo $dir >> $env:GITHUB_PATH
+          & "$dir\ccache.exe" --version
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@main
+        with:
+          key: windows-x86_64
+          max-size: 500M
+          install: 'no'
+
+      - name: Configure ccache remote storage
+        env:
+          QUERY_FARM_VCPKG_TOKEN: ${{ secrets.QUERY_FARM_VCPKG_TOKEN }}
+        run: |
+          @(
+            "CCACHE_BASEDIR=$env:GITHUB_WORKSPACE"
+            "CCACHE_NOHASHDIR=1"
+            "CCACHE_SLOPPINESS=time_macros,include_file_mtime,pch_defines"
+            "CCACHE_COMPILERCHECK=content"
+          ) | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          if ($env:QUERY_FARM_VCPKG_TOKEN) {
+            "CCACHE_REMOTE_STORAGE=http://haybarn-vcpkg-cache.rusty-bb6.workers.dev/ccache|bearer-token=$env:QUERY_FARM_VCPKG_TOKEN|connect-timeout=10000|operation-timeout=30000" |
+              Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          }
+
+      - name: Fetch pinned SQLite
+        run: .\scripts\fetch_sqlite.ps1
+
+      # No -G: letting CMake auto-detect the installed Visual Studio
+      # generator (rather than hardcoding one, e.g. "Visual Studio 17
+      # 2022") is what keeps this from silently breaking whenever GitHub
+      # updates the windows-2022 image's bundled VS version. -A x64 is
+      # still explicit - the VS generator's own default architecture
+      # isn't guaranteed to be x64 without it.
+      - name: Configure
+        run: >
+          cmake --preset default -A x64
+          -DVGI_CPP_SOURCE_DIR="$env:GITHUB_WORKSPACE\vgi-cpp"
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+      - name: Build
+        run: cmake --build build --config Debug --parallel
+
+      - name: Run integration tests
+        working-directory: test/integration
+        env:
+          VGI_PYTHON: ${{ github.workspace }}\vgi-python
+        run: |
+          uv sync
+          uv run pytest -v
