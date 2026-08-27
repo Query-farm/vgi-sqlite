@@ -368,6 +368,23 @@ jobs:
       - name: Build
         run: cmake --build build --config Debug --parallel
 
+      # A `launch:` worker's own `uv run --project vgi-python ...` does its
+      # OWN implicit dependency install/sync on its first-ever invocation,
+      # same as any uv project - fine on Linux/macOS (fast enough there
+      # not to matter), but on a cold Windows runner pyarrow/numpy's first
+      # install can run long enough to blow LaunchConfig's 60s
+      # worker_startup_timeout, so the VERY FIRST test in the whole run
+      # would see "worker did not emit UNIX:<path> within startup
+      # timeout" - not a launcher bug, a slow first uv run racing a tight
+      # timeout. Confirmed as the actual cause: every worker location
+      # (vgi-fixture-worker, vgi-fixture-simple-writable-worker, the
+      # row_transform fixture) failed this exact way, together, on this
+      # job's first real GitHub-hosted run - a systemic first-run cost,
+      # not anything specific to one fixture. Pre-syncing here, before any
+      # launch: call happens, removes that race entirely.
+      - name: Pre-sync vgi-python dependencies
+        run: uv sync --project "${{ github.workspace }}\vgi-python"
+
       - name: Run integration tests
         working-directory: test/integration
         env:
