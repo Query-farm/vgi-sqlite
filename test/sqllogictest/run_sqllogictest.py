@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import hashlib
 import json
 import os
 import platform
@@ -139,6 +140,39 @@ class RecordResult:
     status: str  # "pass" | "fail" | "skip"
     line: int
     reason: str = ""
+    # Stable identity for THIS record, independent of its line number - see
+    # _content_key's docstring. baseline.json matches on this (plus an
+    # occurrence index for duplicate content within one file, added in
+    # passing_ids), never on `line` alone; `line` stays purely for
+    # human-readable output.
+    content_key: str = ""
+
+
+def _record_identity(rec: Statement | Query | Directive) -> tuple[str, str]:
+    if isinstance(rec, (Statement, Query)):
+        return (rec.kind, rec.sql)
+    return (f"directive:{rec.kind}", rec.value)
+
+
+def _content_key(kind: str, text: str) -> str:
+    """Stable identity for one corpus record, independent of its line number.
+
+    ~/Development/vgi is a sibling repo we don't control, and it edits its
+    own .test files over time (lines added/removed, files restructured) -
+    confirmed happening mid-session via that repo's own git log, including a
+    real `refactor!: remove vgi_table_function()...` commit. A `file:line`-
+    only baseline id silently attributes a record's whole pass/fail history
+    to whatever *different* query now happens to sit at that line after such
+    an edit - producing a false "regression" that costs real investigation
+    time to rule out (this is exactly what happened chasing a vgi-go
+    column-comments red herring - see CLAUDE.md's Milestone 10 status).
+    Hashing the record's own original (pre-translation) SQL text instead
+    means identity tracks the query itself, not its position in the file -
+    a corpus edit that moves a query is a no-op for this id; a corpus edit
+    that genuinely changes a query's text is correctly treated as a new
+    record with no stale baseline entry to compare against."""
+    digest = hashlib.sha256(f"{kind}\n{text.strip()}".encode()).hexdigest()
+    return digest[:16]
 
 
 @dataclass
@@ -152,39 +186,43 @@ class FileResult:
 
 
 def run_statement(conn: sqlite3.Connection, stmt: Statement, ctx: TranslationContext) -> RecordResult:
+    key = _content_key(*_record_identity(stmt))
     try:
         sql = translate_sql(stmt.sql, ctx)
     except Untranslatable as e:
-        return RecordResult("skip", stmt.line, str(e))
+        return RecordResult("skip", stmt.line, str(e), key)
     try:
         conn.execute(sql)
         conn.commit()
     except sqlite3.Error as e:
         if stmt.kind == "statement_error":
             if stmt.expected_error and stmt.expected_error not in str(e):
-                return RecordResult("fail", stmt.line, f"error text mismatch: expected {stmt.expected_error!r}, got {e!r}")
-            return RecordResult("pass", stmt.line)
-        return RecordResult("fail", stmt.line, f"unexpected error: {e}")
+                return RecordResult(
+                    "fail", stmt.line, f"error text mismatch: expected {stmt.expected_error!r}, got {e!r}", key
+                )
+            return RecordResult("pass", stmt.line, content_key=key)
+        return RecordResult("fail", stmt.line, f"unexpected error: {e}", key)
     if stmt.kind == "statement_error":
-        return RecordResult("fail", stmt.line, "expected an error, statement succeeded")
-    return RecordResult("pass", stmt.line)
+        return RecordResult("fail", stmt.line, "expected an error, statement succeeded", key)
+    return RecordResult("pass", stmt.line, content_key=key)
 
 
 def run_query(conn: sqlite3.Connection, q: Query, ctx: TranslationContext) -> RecordResult:
+    key = _content_key(*_record_identity(q))
     try:
         sql = translate_sql(q.sql, ctx)
     except Untranslatable as e:
-        return RecordResult("skip", q.line, str(e))
+        return RecordResult("skip", q.line, str(e), key)
     try:
         cur = conn.execute(sql)
         rows = cur.fetchall()
     except sqlite3.Error as e:
-        return RecordResult("fail", q.line, f"query error: {e}")
+        return RecordResult("fail", q.line, f"query error: {e}", key)
     actual = [comparison.format_actual_row(row, q.type_string) for row in rows]
     ok, diff = comparison.rows_match(q, actual)
     if ok:
-        return RecordResult("pass", q.line)
-    return RecordResult("fail", q.line, diff)
+        return RecordResult("pass", q.line, content_key=key)
+    return RecordResult("fail", q.line, diff, key)
 
 
 def run_file(path: Path, source_root: Path, ext_path: Path, env: dict[str, str]) -> FileResult:
@@ -215,7 +253,9 @@ def run_file(path: Path, source_root: Path, ext_path: Path, env: dict[str, str])
 
         for rec in tf.records:
             if file_skip_reason is not None:
-                results.append(RecordResult("skip", rec.line, file_skip_reason))
+                results.append(
+                    RecordResult("skip", rec.line, file_skip_reason, _content_key(*_record_identity(rec)))
+                )
                 continue
             if isinstance(rec, Directive):
                 if rec.kind == "require_env" and rec.value not in env:
@@ -359,12 +399,50 @@ def summarize(file_results: list[FileResult]) -> dict:
 
 
 def passing_ids(file_results: list[FileResult]) -> set[str]:
+    """One id per passing record: `{relpath}#{content_key}#{occurrence}`, NOT
+    `{relpath}:{line}` - see _content_key's docstring for why line number is
+    the wrong identity to persist in baseline.json. `occurrence` (this
+    record's 0-based index among every record in this file sharing the same
+    content_key, counted over ALL records regardless of status - not just
+    passing ones, so the same query appearing verbatim more than once in a
+    file still gets distinct, stable ids) disambiguates the rare case of a
+    file containing the literal same statement/query text more than once."""
     ids = set()
     for fr in file_results:
+        occurrence: dict[str, int] = {}
         for r in fr.records:
+            n = occurrence.get(r.content_key, 0)
+            occurrence[r.content_key] = n + 1
             if r.status == "pass":
-                ids.add(f"{fr.relpath}:{r.line}")
+                ids.add(f"{fr.relpath}#{r.content_key}#{n}")
     return ids
+
+
+def _describe_id(record_id: str, file_results: list[FileResult]) -> str:
+    """Human-readable description of a baseline id for regression output -
+    `relpath#content_key#occurrence` isn't meant for a person to read
+    directly. Resolves back to the record's CURRENT line (if the same
+    content still exists somewhere in the file - it may have moved) or a
+    clear note that it's gone, so a real regression and a corpus-drift
+    false-positive stay distinguishable at a glance instead of both just
+    printing an opaque id."""
+    try:
+        relpath, key, occ_str = record_id.rsplit("#", 2)
+        target = int(occ_str)
+    except ValueError:
+        return record_id
+    for fr in file_results:
+        if fr.relpath != relpath:
+            continue
+        n = 0
+        for r in fr.records:
+            if r.content_key != key:
+                continue
+            if n == target:
+                return f"{relpath}:{r.line} (currently: {r.status}{', ' + r.reason if r.reason else ''})"
+            n += 1
+        return f"{relpath} (this exact record no longer found in the file - likely edited/removed upstream)"
+    return f"{relpath} (file no longer present in this run)"
 
 
 def print_summary(summary: dict, verbose: bool) -> None:
@@ -535,14 +613,29 @@ def main() -> int:
         baseline = json.loads(args.baseline.read_text())
 
     if baseline and not args.allow_regression:
-        regressed = sorted(set(baseline.get("passing_ids", [])) - current_ids)
-        if regressed:
-            exit_code = 1
-            print(f"\nREGRESSION: {len(regressed)} previously-passing record(s) no longer pass:")
-            for rid in regressed[:30]:
-                print(f"  {rid}")
-            if len(regressed) > 30:
-                print(f"  ... and {len(regressed) - 30} more")
+        if baseline.get("id_scheme") != "content-v1":
+            # Pre-existing baseline used `{relpath}:{line}` ids (see
+            # _content_key's docstring for why that was replaced) - every one
+            # of those ids is guaranteed to mismatch the new content-based
+            # ids regardless of whether anything actually regressed, so
+            # comparing against it here would report a mass false
+            # regression, not a real one. Skip the comparison once; the next
+            # --update-baseline adopts the new scheme for good.
+            print(
+                "\nNOTE: baseline.json predates the content-based record-id "
+                "scheme (see _content_key's docstring) - skipping regression "
+                "comparison this run. Run with --update-baseline once to "
+                "adopt the new scheme."
+            )
+        else:
+            regressed = sorted(set(baseline.get("passing_ids", [])) - current_ids)
+            if regressed:
+                exit_code = 1
+                print(f"\nREGRESSION: {len(regressed)} previously-passing record(s) no longer pass:")
+                for rid in regressed[:30]:
+                    print(f"  {_describe_id(rid, file_results)}")
+                if len(regressed) > 30:
+                    print(f"  ... and {len(regressed) - 30} more")
 
     executed = summary["total"]["pass"] + summary["total"]["fail"]
     if args.min_executed and executed < args.min_executed:
@@ -568,7 +661,10 @@ def main() -> int:
                         "category": fr.category,
                         "file_skip_reason": fr.file_skip_reason,
                         "error": fr.error,
-                        "records": [{"status": r.status, "line": r.line, "reason": r.reason} for r in fr.records],
+                        "records": [
+                            {"status": r.status, "line": r.line, "reason": r.reason, "content_key": r.content_key}
+                            for r in fr.records
+                        ],
                     }
                     for fr in file_results
                 ],
@@ -581,6 +677,10 @@ def main() -> int:
         args.baseline.write_text(json.dumps(
             {
                 "generated_by": "test/sqllogictest/run_sqllogictest.py",
+                # "{relpath}#{content_key}#{occurrence}" ids, stable across
+                # upstream corpus line-number drift - see _content_key's
+                # docstring. Bump this if the id format ever changes again.
+                "id_scheme": "content-v1",
                 "total": summary["total"],
                 "passing_ids": sorted(current_ids),
                 "skip_reasons": sorted(summary["skip_reasons"]),

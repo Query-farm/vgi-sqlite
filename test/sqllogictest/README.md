@@ -228,13 +228,39 @@ python3 test/sqllogictest/run_sqllogictest.py \
   expects. An **unlisted** reason fails the run, so a newly-gated test (or
   a translation regression that suddenly can't translate something it used
   to) can't quietly leave the counted set.
-- **`baseline.json`** (checked in) records every currently-passing
-  record's `relpath:line` id. Every run compares against it and **fails on
-  regression** (a previously-passing record now failing or skipping) unless
+- **`baseline.json`** (checked in) records every currently-passing record's
+  id. Every run compares against it and **fails on regression** (a
+  previously-passing record now failing or skipping) unless
   `--allow-regression` is passed. Run with `--update-baseline` to
   intentionally accept the current run's results as the new baseline (do
   this in the same commit as any translate.py change that changes the
   passing set, exactly like updating a snapshot test).
+
+  **Record identity is content-based, not `relpath:line`** - an id is
+  `{relpath}#{content_key}#{occurrence}`, where `content_key` is a hash of
+  the record's own original SQL text (`_content_key` in
+  `run_sqllogictest.py`) and `occurrence` disambiguates the rare case of the
+  literal same statement appearing more than once in one file. `relpath:line`
+  was the original scheme and it broke silently: `~/Development/vgi` (the
+  corpus source) is a sibling repo we don't control, and it edits its own
+  `.test` files over time - a line-number-only id then attributes a
+  record's whole pass/fail history to whatever *different* query now
+  happens to sit at that line after such an edit, reporting a false
+  "regression" that costs real investigation time to rule out (this
+  actually happened - see CLAUDE.md's Milestone 10 status for the
+  vgi-go/column-comments red herring it produced). The content-based id
+  makes a corpus edit that only moves a query a no-op for regression
+  tracking, while a corpus edit that genuinely changes a query's text is
+  correctly treated as a brand-new record with no stale baseline entry to
+  compare against. `line` is still recorded on every result and used for
+  human-readable output (`_describe_id` resolves a regressed id back to its
+  current line, or reports plainly that the record's no longer found in the
+  file at all) - it's just not part of the matching key anymore. A baseline
+  written before this change (no `"id_scheme": "content-v1"` field) is
+  detected and the regression comparison is skipped once with a note,
+  rather than reporting a mass false regression from every id's format
+  simply not matching - run `--update-baseline` once to adopt the new
+  scheme.
 
 GitHub Actions wiring is **not** set up yet - `~/Development/vgi` is a
 private, secrets-gated sibling repo the same way `vgi-c++`/`vgi-rpc-c++`
