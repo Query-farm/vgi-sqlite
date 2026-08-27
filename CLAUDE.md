@@ -570,8 +570,33 @@ engines to claim splits concurrently.
   pytest run is one continuous process/job the worker stays a child of
   for the run's full duration - the actual property `launch:` needs).
   Full `test/integration` suite re-run clean on macOS after this revert
-  (59/59); a matching Windows re-run was in progress on `europa` as this
-  entry was written.
+  (59/59). The first real Windows CI run after this fix surfaced a
+  SEPARATE, genuinely different bug, this time in `vgi-python` itself
+  (not this driver): 17/59 tests failed, all in the `simple_writable`-
+  and `row_transform`-backed test files, with the SAME generic "worker
+  did not emit ... within startup timeout" message this driver's own
+  `SpawnWorkerWin` reported for every early-exit case, indistinguishable
+  from a genuine slow-start timeout. Fixed the diagnostic gap first
+  (`SpawnWorkerWin` now reports the worker's actual exit code, or "closed
+  its stdout pipe", distinctly from a real timeout - and calls
+  `TerminateProcess` on a genuine timeout instead of leaving the child
+  orphaned, matching the POSIX reference's own `fail()` lambda) - this
+  turned an unhelpful blanket message into "worker closed its stdout pipe"
+  in under 2 seconds, immediately proving it was a startup crash, not
+  slowness. Root cause: `vgi.worker.Worker`'s `_run()` classmethod (the
+  CLI every `Worker` subclass's `main()` goes through) called
+  `serve_unix()` unconditionally for `--unix`, crashing outright on
+  Windows (`AttributeError: module 'socket' has no attribute 'AF_UNIX'`)
+  - `vgi_rpc.rpc.run_server` already has the correct
+  `sys.platform == "win32"` dispatch to `serve_named_pipe`, but this
+  separate, parallel serving path (used by every `Worker`-subclass
+  fixture - `simple_writable`, and this driver's own `row_transform`
+  fixture - but NOT `vgi-fixture-worker`, which is built directly against
+  `run_server` and so was unaffected) never got the same fix. Fixed
+  upstream in `vgi-python` (not `vgi-sqlite` - see that repo's own
+  commit), mirroring `run_server`'s dispatch exactly. Full Windows suite
+  re-run clean after both fixes: 52 passed, 7 skipped (HTTP transport,
+  needs the optional extra - same skip reason as macOS/Linux), 0 failed.
   Also fixed along the way, in `vgi-c++` (not `vgi-sqlite`):
   `catalog.cpp`/`function_dispatch.cpp`/`storage.cpp` unconditionally
   included `<unistd.h>` for `getpid()`/`getuid()`/a raw POSIX atomic-

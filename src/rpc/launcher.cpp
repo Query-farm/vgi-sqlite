@@ -593,20 +593,36 @@ void SpawnWorkerWin(const std::vector<std::string>& argv, const std::string& pip
     char chunk[4096];
     auto deadline = std::chrono::steady_clock::now() + startup_timeout;
     bool found = false;
+    // Distinguishes *why* the loop below ends without `found` - mirrors
+    // the POSIX reference's own fail()/exited-early split (see
+    // WaitForReadinessAndDetach): "genuinely never announced within the
+    // timeout" (a real slow-worker problem) reads very differently from
+    // "the worker process exited/closed its pipe almost immediately" (a
+    // worker-side crash/misconfiguration) - collapsing both into one
+    // generic "startup timeout" message, as an earlier version of this
+    // function did, hides which one actually happened from whoever reads
+    // the error.
+    std::optional<std::string> exit_reason;
     while (std::chrono::steady_clock::now() < deadline) {
         DWORD avail = 0;
         if (!::PeekNamedPipe(rd, nullptr, 0, nullptr, &avail, nullptr)) {
-            break;  // worker closed stdout
+            exit_reason = "worker closed its stdout pipe";
+            break;
         }
         if (avail == 0) {
-            if (::WaitForSingleObject(pi.hProcess, 0) == WAIT_OBJECT_0) {
-                break;  // worker exited before announcing
+            DWORD wait = ::WaitForSingleObject(pi.hProcess, 0);
+            if (wait == WAIT_OBJECT_0) {
+                DWORD exit_code = 0;
+                ::GetExitCodeProcess(pi.hProcess, &exit_code);
+                exit_reason = "worker exited before announcing (exit code " + std::to_string(exit_code) + ")";
+                break;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
             continue;
         }
         DWORD nread = 0;
         if (!::ReadFile(rd, chunk, sizeof(chunk), &nread, nullptr) || nread == 0) {
+            exit_reason = "worker closed its stdout pipe";
             break;
         }
         buffer.append(chunk, nread);
@@ -622,15 +638,31 @@ void SpawnWorkerWin(const std::vector<std::string>& argv, const std::string& pip
             throw std::runtime_error("vgi launcher: worker announced an unexpected path (expected " +
                                       pipe_name + ")");
         }
-        if (buffer.size() > kDiscoveryBufferLimit) break;
+        if (buffer.size() > kDiscoveryBufferLimit) {
+            exit_reason = "worker emitted >1 MiB of pre-discovery output without the " + prefix +
+                          "<path> line; aborting";
+            break;
+        }
+    }
+    if (!found && !exit_reason) {
+        // The while condition's own deadline check is what ended the loop -
+        // a genuine timeout, worker still running. Terminate it rather
+        // than leaving it orphaned (matching the POSIX reference's own
+        // fail() lambda, which SIGTERMs the stuck child) - an earlier
+        // version of this function left this out entirely.
+        ::TerminateProcess(pi.hProcess, 1);
+        exit_reason = "startup timeout (" + std::to_string(startup_timeout.count()) + "ms) elapsed";
     }
     ::CloseHandle(rd);
-    // Detach: closing our process handle leaves the worker running
-    // independently; it self-terminates via --idle-timeout.
+    // Detach: closing our process handle leaves a genuinely-announced
+    // worker running independently; it self-terminates via
+    // --idle-timeout. For every other exit_reason above the process is
+    // already exited or was just forcibly terminated, so this simply
+    // releases our own handle to it either way.
     ::CloseHandle(pi.hProcess);
     if (!found) {
-        throw std::runtime_error("vgi launcher: worker did not emit " + prefix + pipe_name +
-                                  " within startup timeout");
+        throw std::runtime_error("vgi launcher: worker did not emit " + prefix + pipe_name + " (" +
+                                  *exit_reason + ")");
     }
 }
 
