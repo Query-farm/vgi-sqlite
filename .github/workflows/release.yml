@@ -62,15 +62,14 @@ jobs:
           repository: Query-farm/vgi-rpc-cpp
           path: vgi-rpc-c++
 
-      # See ci.yml's matching step for the full reasoning (GCC 13 breaks
-      # libsodium's ARM-NEON crypto acceleration on this runner).
-      - name: Use gcc-12 (linux-arm64 only - GCC 13 breaks libsodium's ARM crypto)
+      # See ci.yml's matching step for the full reasoning - gcc-12 does NOT
+      # fix this (tried and confirmed still broken); GCC's own suggested
+      # -flax-vector-conversions workaround does.
+      - name: Work around libsodium/GCC ARM-NEON strictness (linux-arm64 only)
         if: matrix.platform == 'linux-arm64'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-12 g++-12
-          echo "CC=gcc-12" >> "$GITHUB_ENV"
-          echo "CXX=g++-12" >> "$GITHUB_ENV"
+          echo "CFLAGS=-flax-vector-conversions" >> "$GITHUB_ENV"
+          echo "CXXFLAGS=-flax-vector-conversions" >> "$GITHUB_ENV"
 
       - name: Clone and bootstrap vcpkg
         run: |
