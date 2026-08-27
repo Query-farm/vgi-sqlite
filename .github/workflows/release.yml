@@ -69,10 +69,24 @@ jobs:
           ./vcpkg/bootstrap-vcpkg.sh -disableMetrics
           echo "VCPKG_ROOT=$(pwd)/vcpkg" >> "$GITHUB_ENV"
 
-      - name: Cache vcpkg binary archives
+      # See ci.yml's matching step for the full reasoning - same shared
+      # Haybarn cache, same graceful read-only fallback if
+      # QUERY_FARM_VCPKG_TOKEN isn't set.
+      - name: Configure vcpkg binary cache
+        env:
+          QUERY_FARM_VCPKG_TOKEN: ${{ secrets.QUERY_FARM_VCPKG_TOKEN }}
+        run: |
+          if [ -n "$QUERY_FARM_VCPKG_TOKEN" ]; then
+            REMOTE="http,https://haybarn-vcpkg-cache.rusty-bb6.workers.dev,readwrite,Authorization: Bearer $QUERY_FARM_VCPKG_TOKEN"
+          else
+            REMOTE="http,https://haybarn-vcpkg-cache.rusty-bb6.workers.dev,read"
+          fi
+          echo "VCPKG_BINARY_SOURCES=clear;files,${{ github.workspace }}/vcpkg-archives,readwrite;$REMOTE" >> "$GITHUB_ENV"
+
+      - name: Cache vcpkg binary archives (local)
         uses: actions/cache@v4
         with:
-          path: ~/.cache/vcpkg/archives
+          path: vcpkg-archives
           key: vcpkg-release-${{ matrix.platform }}-${{ env.VCPKG_COMMIT }}-${{ hashFiles('vcpkg.json') }}
           restore-keys: |
             vcpkg-release-${{ matrix.platform }}-${{ env.VCPKG_COMMIT }}-

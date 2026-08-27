@@ -1,14 +1,30 @@
-# vgi-sqlite
+<p align="center">
+  <img src="https://raw.githubusercontent.com/Query-farm/vgi-sqlite/main/docs/vgi-logo.png" alt="Vector Gateway Interface logo" width="320">
+</p>
 
-A **SQLite driver for VGI** (Vector Gateway Interface) — attach a VGI worker
-to a SQLite connection and query its tables and functions like they were
-native. VGI is [Query Farm](https://query.farm)'s protocol for exposing
-external data sources as query-engine catalogs over Apache Arrow IPC; this
-repo is the *client* side for SQLite, playing the same role
-[`vgi`](https://github.com/Query-farm/vgi) (the DuckDB extension) plays for
-DuckDB — new, from-scratch client code, not a fork of it. SQLite has no Arrow
-bridge, no native `ATTACH` extension point, and a much simpler
-constraint-pushdown model than DuckDB, so nothing here is a straight port.
+<h1 align="center">VGI for SQLite</h1>
+
+<p align="center">
+  Attach a VGI worker to a SQLite connection and query its tables and functions like they were native.<br>
+  Built by <a href="https://query.farm">🚜 Query.Farm</a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/Query-farm/vgi-sqlite/actions/workflows/ci.yml"><img src="https://github.com/Query-farm/vgi-sqlite/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/Query-farm/vgi-sqlite/releases"><img src="https://img.shields.io/github/v/release/Query-farm/vgi-sqlite" alt="Latest release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Query%20Farm%20Source--Available-blue" alt="License"></a>
+</p>
+
+---
+
+A **SQLite driver for VGI** (Vector Gateway Interface) — VGI is [Query
+Farm](https://query.farm)'s protocol for exposing external data sources as
+query-engine catalogs over Apache Arrow IPC. This repo is the *client* side
+for SQLite, playing the same role [`vgi`](https://github.com/Query-farm/vgi)
+(the DuckDB extension) plays for DuckDB — new, from-scratch client code, not
+a fork of it. SQLite has no Arrow bridge, no native `ATTACH` extension point,
+and a much simpler constraint-pushdown model than DuckDB, so nothing here is
+a straight port.
 
 It builds a single loadable extension (`vgi.{so,dylib}`) exposing:
 
@@ -24,6 +40,9 @@ It builds a single loadable extension (`vgi.{so,dylib}`) exposing:
   `<catalog>_<name>`.
 - Subprocess, `unix://`, AF_UNIX launcher-discovery, and HTTP (bearer-auth)
   transports.
+
+- Sibling reference port (Python): [`vgi-python`](https://github.com/Query-farm/vgi-python)
+- DuckDB extension: [`vgi`](https://github.com/Query-farm/vgi)
 
 ## Build
 
@@ -82,14 +101,26 @@ that runs `vgi`'s DuckDB-dialect sqllogictest corpus against this driver to
 track continuously growing coverage of what's mechanically translatable —
 see [`test/sqllogictest/README.md`](test/sqllogictest/README.md).
 
-## Status
+## Feature coverage
 
-All 5 originally-planned milestones are done (read/write tables,
-projection/filter/LIMIT pushdown, scalar and aggregate functions, per-row
-correlated table functions, transactions, subprocess/unix/launcher/HTTP
-transports, a security review), plus real-world validation against
-third-party VGI workers and 5 further milestones of bug fixes and new
-capabilities on top. See [`CLAUDE.md`](CLAUDE.md) for the full history.
+| Area | Status |
+|---|---|
+| Read scans | ✅ projection, filter (`=` `!=` `<` `<=` `>` `>=` `IS [NOT] NULL`), and `LIMIT` pushdown; cost-based query planning from worker-reported cardinality |
+| Writes | ✅ `INSERT`/`UPDATE`/`DELETE`, row identity from the worker-declared row-id column |
+| Transactions | ✅ one flat VGI transaction shared across every table from a catalog touched in one SQL transaction; no nested `SAVEPOINT` — VGI's protocol has no nested-transaction concept to map it onto |
+| Scalar functions | ✅ registered natively as `<catalog>_<name>` |
+| Aggregate functions | ✅ including `GROUP BY`; windowed (`OVER`) aggregates are not supported — a structurally different RPC family with no incremental step model |
+| Correlated table functions | ✅ `vgi_table_in_out` (row-transform functions) and `vgi_table_function` (plain generator functions), called via `FROM t, fn(t.x)` — no `LATERAL` keyword needed |
+| VGI splits | ✅ sequential single-reader redemption — SQLite has no parallel-scan-worker concept, so splits are claimed one at a time rather than concurrently |
+| Transports | ✅ subprocess, `unix://`, AF_UNIX `launch:` discovery, `http(s)://` with bearer auth |
+| Classic `table_in_out` (relation-valued argument) | ❌ SQLite's table-valued-function calling convention has no equivalent of a whole-relation argument |
+| Multi-branch (union-of-sources) tables | ❌ no natural multi-source union at the SQLite virtual-table level |
+| Function overloading (same name, different arity) | ❌ only one overload can register under a given generated SQL name |
+| Windows | ❌ the launcher/subprocess transport is POSIX-only (fork/exec, `flock`, AF_UNIX) |
+
+See [`CLAUDE.md`](CLAUDE.md) for the full design, every non-obvious protocol
+contract, and the real bugs found building each of these against live
+workers.
 
 ## License
 

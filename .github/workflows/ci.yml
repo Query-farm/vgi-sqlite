@@ -71,15 +71,46 @@ jobs:
           ./vcpkg/bootstrap-vcpkg.sh -disableMetrics
           echo "VCPKG_ROOT=$(pwd)/vcpkg" >> "$GITHUB_ENV"
 
-      # No S3-backed binary cache (that needs org credentials this repo
-      # doesn't have - see CLAUDE.md's corrected note on Milestone 11).
-      # actions/cache on vcpkg's own local archive dir gets most of the
-      # same benefit for free, keyed on vcpkg.json + the pinned vcpkg
-      # commit so a dependency bump invalidates it correctly.
-      - name: Cache vcpkg binary archives
+      # The shared Haybarn vcpkg binary cache (Cloudflare Worker in front of
+      # R2 - see ~/Development/haybarn/haybarn-extension-ci-tools's
+      # _extension_distribution.yml, the org's DuckDB-extension CI template).
+      # It's already warm from every other Query-Farm/Haybarn C++ build
+      # resolving overlapping ports (Arrow, OpenSSL, etc.) through the same
+      # pinned vcpkg commit, which is most of this repo's own vcpkg install
+      # time. Reads are anonymous; writes (populating whatever this repo
+      # needs that ISN'T already warm upstream) need a bearer token - the
+      # Worker (~/Development/haybarn/haybarn-vcpkg-worker) accepts any of
+      # several independently-rotatable tokens, one per registered caller;
+      # QUERY_FARM_VCPKG_TOKEN (this repo's own secret, not Haybarn's) is
+      # ours. Built into VCPKG_BINARY_SOURCES in a run step, not a static
+      # top-level env value, so the secret is never written as a literal
+      # into the workflow file and so a missing secret degrades to
+      # read-only instead of sending a broken empty "Authorization: Bearer "
+      # header. Combined with a same-run/same-PR local `files` cache
+      # (actions/cache below) so a genuinely cold port still only builds
+      # from source once per (platform, vcpkg.json) key, not on every
+      # single run.
+      - name: Configure vcpkg binary cache
+        env:
+          QUERY_FARM_VCPKG_TOKEN: ${{ secrets.QUERY_FARM_VCPKG_TOKEN }}
+        run: |
+          if [ -n "$QUERY_FARM_VCPKG_TOKEN" ]; then
+            REMOTE="http,https://haybarn-vcpkg-cache.rusty-bb6.workers.dev,readwrite,Authorization: Bearer $QUERY_FARM_VCPKG_TOKEN"
+          else
+            REMOTE="http,https://haybarn-vcpkg-cache.rusty-bb6.workers.dev,read"
+          fi
+          echo "VCPKG_BINARY_SOURCES=clear;files,${{ github.workspace }}/vcpkg-archives,readwrite;$REMOTE" >> "$GITHUB_ENV"
+
+      # Local half of VCPKG_BINARY_SOURCES's `files,` source above - a
+      # same-key restore lands here before any port needs building, and a
+      # cold miss (not on the shared Haybarn cache either) still gets
+      # written back for the NEXT run of this exact (platform, vcpkg.json)
+      # combination, same as the old direct-archive-dir approach, just
+      # composed with the shared read source instead of standing alone.
+      - name: Cache vcpkg binary archives (local)
         uses: actions/cache@v4
         with:
-          path: ~/.cache/vcpkg/archives
+          path: vcpkg-archives
           key: vcpkg-${{ matrix.platform }}-${{ env.VCPKG_COMMIT }}-${{ hashFiles('vcpkg.json') }}
           restore-keys: |
             vcpkg-${{ matrix.platform }}-${{ env.VCPKG_COMMIT }}-

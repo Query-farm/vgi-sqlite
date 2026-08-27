@@ -14,13 +14,16 @@ of `vgi`. SQLite has no Arrow bridge, no native ATTACH extension point, and
 a much simpler constraint-pushdown model than DuckDB, so nothing here is a
 straight port.
 
+See [`README.md`](README.md) for the feature-coverage summary and quickstart;
+this file is the deeper design/gotcha reference for anyone changing the code.
+
 ## The repos this sits between
 
 | path | what it is | how it matters here |
 |---|---|---|
 | `~/Development/vgi-python` | the **canonical** implementation, protocol source of truth, and codegen | `scripts/regenerate_protocol.sh` generates this repo's own client-only request builders from it; the fixture worker (`vgi-fixture-worker`) is this repo's primary test target |
-| `~/Development/vgi-c++` | the C++ **worker SDK** (server-side) | this repo links its `vgi::vgi` target for the public generated protocol schemas (`include/vgi/generated/`) - not for anything worker-shaped |
-| `~/Development/vgi-rpc-c++` | the Arrow-IPC RPC transport | `vgi_rpc::RpcClient` (spawn/unix/tcp) is what `VgiConnection` wraps directly; `vgi_rpc::HttpClient` (a structurally separate type, no shared base with `RpcClient`) is not yet integrated - see the plan file's Milestone 3 status on why bearer-auth/HTTP is deferred to Milestone 5 |
+| `~/Development/vgi-c++` (GitHub: `Query-farm/vgi-cpp`, public) | the C++ **worker SDK** (server-side) | this repo links its `vgi::vgi` target for the public generated protocol schemas (`include/vgi/generated/`) - not for anything worker-shaped |
+| `~/Development/vgi-rpc-c++` (GitHub: `Query-farm/vgi-rpc-cpp`, public) | the Arrow-IPC RPC transport | `vgi_rpc::RpcClient` (spawn/unix/tcp) and `vgi_rpc::HttpClient` are both wrapped by `VgiConnection` - see "Transports" below |
 | `~/Development/vgi` | the DuckDB C++ extension (client-side reference) | design/wire-format reference only, never linked; several of this repo's hand-ported helpers (`wire/wire_builders.h`, inner bind/init request builders) were ported from its `vgi_rpc_types.{hpp,cpp}` field layout, with the DuckDB dependency stripped |
 
 ## Definition of done
@@ -34,10 +37,11 @@ to port those files directly (confirmed by reading representative ones; see
 of record. Track category-level parity in `test/integration/README.md`'s
 coverage table, not file-level parity.
 
-The full implementation plan and its live status (what's done/verified,
-what's deferred and why) lives at
+The full implementation history and plan lives at
 `/Users/rusty/.claude/plans/i-want-to-use-twinkly-phoenix.md` - read its
 Status section before starting new work, and update it as work completes.
+This file (CLAUDE.md) is the current-state reference; that file is the
+narrative history of how it got there.
 
 ## Protocol code: two different provenances
 
@@ -52,10 +56,9 @@ Status section before starting new work, and update it as work completes.
   (`--namespace vgi::generated --schemas-include ... --helpers-include
   wire/wire_builders.h --exception-include <stdexcept> --exception-type
   std::runtime_error`) so the emitted code is engine-neutral instead of
-  DuckDB-coupled. **Never hand-edit it** - see the user's explicit
-  directive in the plan file: hand-written protocol marshalling code is
-  not acceptable here; extend the codegen (with new flags defaulting to
-  today's behavior, so `vgi`'s own regeneration stays unaffected) instead.
+  DuckDB-coupled. **Never hand-edit it** - hand-written protocol marshalling
+  code is not acceptable here; extend the codegen (with new flags defaulting
+  to today's behavior, so `vgi`'s own regeneration stays unaffected) instead.
 - **Namespace matters for lookup, not just style**: generated code lives in
   `vgi::generated` and calls `Build<Type>Scalar` helpers unqualified - they
   must live in `namespace vgi` (not `vgi_sqlite`), or C++'s enclosing-
@@ -86,13 +89,21 @@ copy. `tools/*` (standalone probe binaries, their own process) link the
 real `SQLite::SQLite3` static library directly. Two independently-
 initialized copies of SQLite's process-global state (allocator, PRNG, VFS
 registry, mutexes) in one process crash immediately on `.load` even at
-identical versions - this was the first real bug found in Milestone 2, not
-a hypothetical.
+identical versions - a real bug found early on, not a hypothetical.
 
 `connection_pool.cpp` lives under `src/vtab/` but is built into
 `vgi_sqlite_driver` (the pure-client-logic target), not `vgi_extension` -
 it makes no `sqlite3_*` call despite the directory, and `ScalarFunctionCaller`
 (part of the driver) depends on it directly.
+
+**CI/release builds link everything vcpkg builds statically** (Arrow,
+OpenSSL, etc. - the default triplet on Linux/macOS already does this) plus
+`-static-libgcc -static-libstdc++` on Linux, so the shipped `.so`/`.dylib`
+loads without the target machine needing a matching shared-library
+environment. Real, accepted limits: no musl/Alpine build, and a glibc
+version floor from whatever the build image itself ships (not solved via
+an older build container, to match `vgi-c++`'s own CI posture) - see
+`.github/workflows/release.yml`'s own comments for the full reasoning.
 
 ## Testing
 
@@ -108,12 +119,14 @@ convention) or the extension path with `VGI_SQLITE_EXTENSION`. See
 
 `test/integration/` remains the test source of record (see "Definition of
 done" above) - `test/sqllogictest/` is a separate, complementary tool that
-runs `~/Development/vgi`'s (the DuckDB extension) 327-file sqllogictest
-corpus against this driver, translating what's mechanically translatable
-and reporting pass/fail/skip per record to track *continuously growing*
+runs `~/Development/vgi`'s (the DuckDB extension) sqllogictest corpus
+against this driver, translating what's mechanically translatable and
+reporting pass/fail/skip per record to track *continuously growing*
 coverage of that corpus, not to replace `test/integration/`'s own tests.
-See `test/sqllogictest/README.md` for the full design and how to extend
-it.
+Its persistent worker pool backs the dominant fixture with `vgi-go` (real
+multi-core concurrency via goroutines) rather than a pool of GIL-bound
+CPython processes - see `test/sqllogictest/workers.py`'s docstring. See
+`test/sqllogictest/README.md` for the full design and how to extend it.
 
 ```bash
 python3 test/sqllogictest/run_sqllogictest.py                # full corpus
@@ -122,19 +135,20 @@ python3 test/sqllogictest/run_sqllogictest.py --category scalar -v
 
 ## Things worth knowing before changing anything
 
-Each of these cost real debugging time against a live worker, and none is
-guessable from reading the protocol docs first - the pattern established in
-this repo is: build a standalone `tools/vgi-*-probe` binary first, verify
-the wire protocol in isolation, THEN wire into the SQLite extension, where a
-*different* class of bug often shows up from shared/pooled connection use.
+None of these are guessable from reading the protocol docs alone - the
+pattern established in this repo is: build a standalone `tools/vgi-*-probe`
+binary first, verify the wire protocol in isolation, THEN wire into the
+SQLite extension, where a *different* class of bug often shows up from
+shared/pooled connection use.
+
+### Connection lifecycle & pooling
 
 - **`vgi_rpc::RpcClient` allows exactly one live call/stream per
   connection.** A `ClientStream` reserves the connection until explicitly
   `.close()`d - even one that already reached natural end-of-stream via
-  `tick()` returning `nullopt`; destroying an unclosed stream "aborts its
-  connection instead of draining" (`vgi_rpc/client.h`). Broke every query
-  after the first on a shared connection with "RPC client is closed" until
-  `TableScanner` grew an explicit destructor.
+  `tick()` returning `nullopt`; destroying an unclosed stream aborts its
+  connection instead of draining (`vgi_rpc/client.h`). `TableScanner` needs
+  an explicit destructor for this reason.
 - **A table scan's producer stream stays open for the entire scan** (every
   `xNext` up to `xEof`), not just around one call - so a *shared* connection
   can't also serve a scalar function evaluated mid-scan, or a second
@@ -142,24 +156,45 @@ the wire protocol in isolation, THEN wire into the SQLite extension, where a
   checkout/release pool for exactly this reason (`connection_pool.h`'s file
   comment) - it is not safe to go back to "one connection per (location,
   catalog)".
-- **`catalog_attach`'s `attach_opaque_data` is not reliably safe to reuse
-  across independently spawned worker processes** - commonly backed by
-  process-local session state (a token in a private dict, in the reference
-  implementation), not guaranteed self-contained. Every new physical
-  connection does its own `catalog_attach`; `ScalarFunctionCaller`
-  deliberately binds fresh on every call on whichever connection that
-  call's own init/exchange runs on, rather than caching and replaying a
-  bind result across connections.
+- **`catalog_attach`'s `attach_opaque_data` must be minted once per
+  (location, catalog) and reused, not re-minted per physical connection.**
+  A worker can derive real state identity from those bytes directly (a
+  fixture worker's backing SQLite file's path was `{attach_opaque_data.
+  hex()}.sqlite`) - two independently-attached connections that each mint
+  their own value can end up looking at two unrelated, empty databases with
+  no error anywhere to say so. `ConnectionPool` caches the first successful
+  attach's value per key and has every later connection for that key skip
+  `catalog_attach` and reuse it directly. This is also why
+  `ScalarFunctionCaller` deliberately binds fresh on every call on
+  whichever connection that call's own init/exchange runs on, rather than
+  caching and replaying a bind result across *different* connections -
+  `attach_opaque_data` reuse is only safe within the pool's own bookkeeping,
+  not as a general assumption about the wire format.
+
+### Scan protocol details
+
 - **`FunctionInfo.arguments` (the catalog-declared scalar function
   signature) can carry Arrow's `null`/"any" type**, not the real
   per-argument types - VGI resolves those dynamically per call site.
-  `ScalarFunctionCaller` infers argument types from the first real call's
-  actual values instead of trusting catalog metadata.
+  `ScalarFunctionCaller` infers argument types fresh from every call's own
+  actual values (not locked from the first call - a real bug once locked
+  types from call 1 and silently truncated later calls with different
+  types, e.g. `add_values(1.5, 2.5)` computing 3 instead of 4).
+  `AggregateCaller` has a narrower version of the same risk it can't fully
+  avoid: one `execution_id` accumulates state across many `Step()` calls
+  for a whole `GROUP BY` group, and VGI's wire protocol fixes the input
+  schema at `aggregate_bind` time - no way to re-derive types mid-group
+  without resetting the accumulator. Fixed to the extent possible by using
+  `arrow::compute::Cast` with `CastOptions::Safe()` instead of plain
+  `arrow::Scalar::CastTo` - a lossy cast now throws instead of silently
+  truncating, though mixing genuinely incompatible types across rows of one
+  group still errors rather than working.
 - **`ScanFunctionResultSchema.arguments` decodes to a *zero-row* batch for
   a genuinely zero-argument function** - not the more obvious
   one-row-of-nothing. But `BindRequest.arguments` must always decode to
-  exactly one row (the worker indexes row 0 unconditionally). `WrapAsArgsStruct`
-  always builds exactly one struct row regardless of the source's row count.
+  exactly one row (the worker indexes row 0 unconditionally).
+  `WrapAsArgsStruct` always builds exactly one struct row regardless of the
+  source's row count.
 - **A table's backing scan function isn't necessarily registered in the
   same schema as the table itself.** `Bind()` passes `schema_name` as
   `nullopt` deliberately, to trigger VGI's own cross-schema fallback lookup
@@ -169,6 +204,17 @@ the wire protocol in isolation, THEN wire into the SQLite extension, where a
   `xColumn` checks the *actual returned batch's width* against the
   requested projection size before trusting its own column-index mapping -
   trusting the request blindly reads the wrong column outright.
+- **`pushdown_filters.column_index` must be the constraint's position
+  within the PROJECTED (narrowed) output, not its index into the table's
+  full declared schema.** Confirmed against `vgi`'s own DuckDB-extension
+  source: the worker applies a filter by indexing its own output batch,
+  which is already in projected order. `EncodePushdownFilters` translates
+  each constraint's declared index into its position within
+  `xFilter`'s `projected_columns` (empty list means "every column, declared
+  order," where the two coincide). `SELECT *` masks this bug entirely,
+  since declared-index and projected-position are identical when nothing's
+  dropped - only a narrow `SELECT col` combined with `WHERE col ...`
+  exposes it (silently zero rows instead of an error).
 - **This driver never sets `aConstraintUsage[i].omit`** for a pushed WHERE
   constraint (or the LIMIT constraint) - SQLite always re-verifies every
   row itself regardless of whether the worker actually applied the
@@ -179,47 +225,43 @@ the wire protocol in isolation, THEN wire into the SQLite extension, where a
   comment for the full correctness argument.
 - **SQLite's `xBestIndex` cost/row estimate matters for join ordering, not
   just cosmetically.** `CatalogTable.cardinality_estimate`/`cardinality_max`
-  drive it; without a real number every `vgi_worker` table looked equally
-  expensive to the planner, which could pick the wrong outer/inner loop
-  order on a join between differently-sized VGI tables.
-- **`vcpkg.json`'s `cpp-httplib` feature list needs `openssl` explicitly**,
-  even though `vgi-rpc-c++`'s own `vcpkg.json` already declares it - vcpkg
-  manifest resolution follows only the top-level project's `vcpkg.json`
-  when building as a sibling subdirectory, so a sibling's correct
-  declaration is never consulted. A real, pre-existing bug in `vgi-c++`
-  too, not specific to this repo.
-- **`catalog_attach`'s `attach_opaque_data` must be minted once per
-  (location, catalog) and reused, not re-minted per physical connection.**
-  A worker can derive real state identity from those bytes directly (found
-  against vgi-fixture-worker's `simple_writable` fixture: its backing
-  SQLite file's path is `{attach_opaque_data.hex()}.sqlite`) - two
-  independently-spawned connections that each called `catalog_attach`
-  looked at two unrelated, empty databases, with no error anywhere to say
-  so; an `INSERT` was silently invisible to a later `SELECT`. `ConnectionPool`
-  caches the first successful attach's value per key and has every later
-  connection for that key skip `catalog_attach` and reuse it directly - see
-  `connection_pool.h`'s file comment.
+  drive it; without a real number every `vgi_worker` table looks equally
+  expensive to the planner, which can pick the wrong outer/inner loop order
+  on a join between differently-sized VGI tables.
+- **`AdvanceBatch` (`vgi_vtab.cpp` and `vgi_table_function_vtab.cpp`) only
+  ever SETS a cursor's `eof` to `true` on genuine end-of-stream - it never
+  CLEARS it on a successful fetch.** Safe only when a cursor's `eof` starts
+  `false` and the cursor is used exactly once per scan. A table-function
+  cursor used for a correlated scan (`FROM t, fn(t.x)`, re-`xFilter`ed once
+  per outer row on the SAME cursor object) must explicitly reset
+  `cursor->eof = false` at the start of every `xFilter` call, or every
+  outer row after the first silently produces zero result rows. Also: every
+  RPC-calling step in `xFilter` (including the FIRST batch fetch, not just
+  `xNext`'s later ones) must be inside the try/catch - an uncaught
+  `vgi_rpc::RpcException` there reaches `std::terminate()`/`abort()` and
+  crashes the whole host process instead of surfacing as a normal SQLite
+  error.
+
+### Writes, row identity, transactions
+
 - **VGI identifies a row for UPDATE/DELETE by a worker-declared column
   (Arrow field metadata `is_row_id`), not a SQL PRIMARY KEY** - UPDATE
   sends `(changed_columns..., rowid)`, DELETE sends `(rowid,)`. Mapping
   this onto SQLite's own rowid contract needs `xRowid` to report that
-  column's *actual per-row value* (not a locally-assigned counter) - which
+  column's *actual per-row value* (not a locally-assigned counter), which
   in turn requires `xBestIndex` to force that column into the fetched
   projection whenever the table supports update/delete, even if the
   query's own `colUsed` never asked for it (`UPDATE t SET x=? WHERE y=?`
   never selects the rowid column at all). No `INTEGER PRIMARY KEY` DDL
-  aliasing was needed - `xRowid` alone is enough for both read-side
-  `rowid` display and `xUpdate`'s `argv[0]` contract, since this vtab does
-  a full scan for every query regardless.
+  aliasing is needed - `xRowid` alone is enough for both read-side `rowid`
+  display and `xUpdate`'s `argv[0]` contract, since this vtab does a full
+  scan for every query regardless.
 - **VGI's transaction RPC surface has no nested-savepoint concept at all**
   - only `catalog_transaction_begin`/`_commit`/`_rollback`, one flat
-  transaction. SQLite's vtab contract has `xSavepoint`/`xRelease`/
-  `xRollbackTo` for `SAVEPOINT` nesting *within* one transaction; this
-  driver leaves all three null rather than attempt partial rollback VGI's
-  protocol can't support - confirmed safe by every INSERT/UPDATE/DELETE
-  test having already passed with these null the whole time (SQLite simply
-  doesn't offer/use the savepoint mechanism for a vtab that doesn't
-  implement it; only an explicit SQL `SAVEPOINT` would need it).
+  transaction. This driver leaves `xSavepoint`/`xRelease`/`xRollbackTo`
+  null rather than attempt partial rollback VGI's protocol can't support -
+  safe because SQLite only calls these for an explicit SQL `SAVEPOINT`,
+  which this driver doesn't advertise support for.
 - **SQLite calls a vtab module's `xBegin` once per *vtab instance* per
   transaction, but VGI's `catalog_transaction_begin` is scoped to one
   *(location, catalog) attachment*** - three `vgi_worker` tables from the
@@ -227,613 +269,260 @@ the wire protocol in isolation, THEN wire into the SQLite extension, where a
   share exactly one `catalog_transaction_begin`/`transaction_opaque_data`
   call. `ConnectionPool::Begin/Commit/RollbackTransaction` solve this with
   the same ref-counted-per-key, shared-across-every-physical-connection
-  pattern already used for `attach_opaque_data` (see the entry above) -
-  only the first `Begin` for a key actually calls `catalog_transaction_
-  begin`, only the `Commit`/`Rollback` that brings the count back to zero
-  calls the real RPC, and every `bind` made during the transaction
-  (`TableScanner::Bind`, `TableWriter::Write`) threads
+  pattern already used for `attach_opaque_data` above - only the first
+  `Begin` for a key actually calls `catalog_transaction_begin`, only the
+  `Commit`/`Rollback` that brings the count back to zero calls the real
+  RPC, and every `bind` made during the transaction threads
   `CurrentTransactionOpaqueData(key)` through regardless of which specific
   connection happens to serve that call.
 - **`xBegin` fires for *every* `vgi_worker` table touched inside a
   transaction, not just written ones - including a plain `SELECT` inside
-  SQLite's own implicit per-statement transaction.** `example` (the
-  fixture catalog nearly every read test in this suite uses) declares
-  `supports_transactions = True`, so registering `xBegin`/`xCommit`
-  immediately put every existing read test through a real
-  `catalog_transaction_begin`/`_commit` round trip too, not just the new
-  write/transaction tests - worth remembering if a read-path test ever
-  needs to reason about extra RPC traffic per query.
-- **`Begin/Commit/RollbackTransaction` are gated on
-  `CatalogAttachResult.supports_transactions`, cached in `ConnectionPool`'s
-  `attach_info_` map alongside `attach_opaque_data`** - a catalog that
-  doesn't support transactions (`simple_writable`, the write-path test
-  target) never gets a `catalog_transaction_begin` call at all;
-  `CurrentTransactionOpaqueData` reports `nullopt` for it regardless of
-  how many `xBegin` calls ref-counted up, so every `bind` made "during"
-  that no-op transaction still passes `nullopt`, exactly as if no
-  transaction existed. `attach_info_` is guaranteed populated before any
-  `xBegin` could fire on a table, since `xConnect` (which every table runs
-  before it's usable at all) always resolves it first.
-- **`vgi_rpc::RpcClient` and `vgi_rpc::HttpClient` are not a common
-  interface with two implementations - their method signatures genuinely
-  differ**, not just in name: HTTP's `open_producer`/`open_stream_exchange`
-  require explicit `input_schema`/`output_schema` arguments raw's
-  `open_producer`/`open_exchange` don't take at all, and HTTP's `call()`
-  wants an `AnnotatedBatch` request where raw's `call_unary()` wants a bare
-  `RecordBatch`. `VgiConnection` unifies them at the shape *this driver's*
-  call sites need (every one already has both schemas on hand from its own
-  prior `bind()` call), not by wrapping `RpcClient`/`HttpClient` themselves
-  - `CallUnary`/`OpenProducer`/`OpenExchange` dispatch to whichever of an
-  `optional<RpcClient>`/`optional<HttpClient>` pair `Connect()` engaged,
-  and `OpenProducer`/`OpenExchange` return a `VgiStream` abstract handle
-  (`vgi_rpc::AnnotatedBatch` itself needed no such wrapping - identical
-  type, one definition, on both transports). A bearer token is embedded as
-  URL userinfo (`http://TOKEN@host:port/...`), not a separate
-  `vgi_attach()` channel - `location` already threads unchanged through
-  every `CREATE VIRTUAL TABLE` this driver generates and every
-  `ConnectionPool` key, so folding the token in there once (in
-  `VgiAttachFunc`, before anything else touches `location`) avoids
-  plumbing a second channel through all of those call sites too. Plain
-  `http://` + a token requires `HttpClientConfig.allow_insecure_credentials
-  = true` (refused by default in `vgi-rpc-c++`) - set only when the scheme
-  is literally `http` (not `https`), treating an explicit `http://` as
-  informed consent for a local/private channel.
-- **Any worker-supplied catalog metadata (schema/table/column names)
-  embedded in a SQL string this driver builds itself must go through
-  `sql_quote.h`'s `SqlQuoteIdentifier`/`SqlQuote`, never raw string
-  concatenation.** Found two real instances during the Milestone 5
-  security review where it wasn't: `vgi_attach()`'s generated
-  `CREATE VIRTUAL TABLE "<schema>.<table>" ...`/`DROP TABLE ...`
-  (`extension.cpp`) and `xConnect`/`xCreate`'s generated
-  `CREATE TABLE x("<column>" ...)` DDL passed to `sqlite3_declare_vtab`
-  (`vgi_vtab.cpp`) both embedded a worker-supplied name inside a bare
-  `"\"" + name + "\""` with no escaping of an embedded `"` - a worker
-  (buggy, or actively malicious - the location a caller points
-  `vgi_attach()` at is already a code-execution-level trust boundary, but
-  that's not license to let its *data* smuggle SQL into the attaching
-  connection too) whose metadata contained a `"` could break out of the
-  identifier. `location`/`catalog`/`schema`/`table` module arguments were
-  already correctly going through `SqlQuote` (string-literal escaping);
-  only the identifier side was missed.
-- **A bearer token passed to `vgi_attach()`'s `bearer_token` argument ends
-  up persisted in cleartext in the database file**, not just held in
-  memory for the connection's lifetime - it's folded into `location`
-  before `VgiAttachFunc` generates each table's `CREATE VIRTUAL TABLE`
-  statement, and SQLite itself stores that whole statement verbatim in
-  `sqlite_master`/`sqlite_schema` (`SELECT sql FROM sqlite_master` reads
-  it back). Not a new bug introduced by adding bearer-token support -
-  `location` was already persisted this way for the subprocess transport,
-  where it's rarely secret - but a token is exactly the kind of value
-  that shouldn't be silently written to disk. Surfaced via a
-  `sqlite3_log(SQLITE_WARNING, ...)` at attach time rather than fixed by
-  a bigger redesign (storing credentials outside the schema) - out of
-  scope for now, see the plan file's Milestone 5 status.
-- **`VgiConnection::Connect` also speaks `unix:///path/to.sock`** -
-  connects to an already-running worker (`vgi_rpc::RpcClient::connect_unix`)
-  instead of spawning a new subprocess per connection, landing in the same
-  `raw_client_` slot `spawn()` uses (both are "the raw/subprocess-family
-  transport"). Added for `test/sqllogictest/`'s persistent-worker mechanism
-  (see its README) after spawn-per-`ATTACH` overhead (a fresh `uv run` +
-  Python-interpreter-startup per connection) turned out to dominate that
-  tool's wall-clock time - not the full AF_UNIX launcher-protocol discovery
-  contract (`docs/launcher-protocol.md`, still a documented gap), just
-  connecting to a socket something else already bound.
-- **A single persistent worker process does NOT scale with client-side
-  concurrency**, even with `--unix`'s own `--threaded` default (one daemon
-  thread per connection) - it's still one CPython process, and real
-  request handling mostly holds the GIL, so concurrent connections
-  interleave rather than run in parallel. Measured directly building
-  `test/sqllogictest/`'s persistent-worker pool: 16x client-side
-  concurrency against one persistent worker instance bought ~1.4x
-  wall-clock improvement while CPU time roughly doubled (thread-scheduling/
-  GIL-contention overhead) - a pool of real OS processes (one worker
-  process per pool slot) is what actually parallelizes. Relevant to any
-  future use of a shared/pooled worker process from this driver, not just
-  the test tooling.
-- **Two real bugs found by running `~/Development/vgi`'s sqllogictest
-  corpus against this driver for the first time, both fixed** (see the
-  plan file's Milestone 6/7 status for the full detail):
-  1. **Process-crashing bug, fixed.** `xFilter` (`vgi_vtab.cpp`) wrapped
-     its `Bind()`/`Init()` calls in a try/catch but called
-     `AdvanceBatch(cursor)` - fetching the scan's FIRST batch, an RPC tick
-     that can throw - OUTSIDE that block, right before `return SQLITE_OK`.
-     `xNext`'s own call to the same function was already correctly
-     wrapped; only the first batch was unprotected, so a worker error on
-     that specific tick reached `std::terminate()`/`abort()` (confirmed
-     `vgi_rpc::RpcException` derives from `std::exception`, so the
-     existing catch clause is sufficient once the call is actually inside
-     it) instead of surfacing as a normal SQLite error. Fix: move
-     `AdvanceBatch(cursor)` inside the existing try block.
-  2. **Scalar-function silent-truncation bug, fixed.**
-     `ScalarFunctionCaller` used to lock `arg_types_` from the *first*
-     call's actual argument values and `CastTo` every later call's
-     arguments into that locked schema - and Arrow's `CastTo` between
-     compatible-but-different numeric types (double -> int64) *succeeds*
-     with silent truncation rather than failing, so calling the same
-     scalar function with genuinely different argument types later in a
-     session silently computed the wrong answer instead of erroring or
-     re-resolving (`add_values(1.5, 2.5)` after an earlier
-     `add_values(int, int)` call computed 3, not 4 - the floats got
-     truncated to ints before ever reaching the worker). Fix: removed the
-     locking entirely - `arg_types_` is now derived fresh from every
-     call's own actual values, at no extra cost (a full bind/init/exchange
-     round trip already happened fresh every call regardless). **Not yet
-     checked**: `src/catalog/aggregate_caller.{h,cpp}` has the identical
-     locking pattern for aggregate function arguments - plausibly the same
-     risk, not yet fixed.
-- **VGI splits (sequential redemption) is implemented** - `src/catalog/
-  catalog_table_plan.h`/`table_scanner.{h,cpp}`. Splits is an optional
-  planning phase (`FunctionInfo.supports_splits`) layered on the ordinary
-  bind->init->tick lifecycle: `table_function_plan` divides a scan into N
-  independently-redeemable opaque tokens; `InitRequest.split_tokens`
-  redeems one via an otherwise-ordinary init. A single sequential reader
-  claiming every split one at a time (what `TableScanner` does - entirely
-  transparent to `vgi_vtab.cpp`, which needed zero changes) is a legal,
-  degenerate consumer even though the mechanism exists for real
-  distributed engines to claim splits concurrently. Load-bearing gotchas,
-  confirmed the hard way or by a peer session that shipped this same
-  protocol feature across every other VGI client SDK (reached out before
-  implementing, rather than rediscovering these independently):
-  - **End-of-stream is a `nullopt` tick, never a present-but-0-row batch**
-    - already true for an ordinary scan (`TableScanner::Next()`'s existing
-      loop got this right from Milestone 2), and it matters even more
-      under splits: a 0-row batch mid-split is legitimate (a filter pruned
-      that split to nothing) and must not be read as "this split is done."
-  - **Every `next_cursors` entry a plan response returns must be followed,
-    not just the first** - enumeration is complete only once *every*
-    outstanding cursor has returned none. Taking just the first (what
-    vgi's own DuckDB client does, a deliberate no-fan-out simplification
-    appropriate to its scope) would silently drop everything reachable
-    from the rest if a worker ever returns more than one - missing rows,
-    no error. `PlanTableFunctionSplits` drains a plain queue of every
-    cursor any response returns instead - a few lines, stays entirely
-    single-threaded, closes the risk instead of accepting it.
-  - **A worker's argument resolver can key strictly by declared NAME, not
-    position** - confirmed against vgi-python's own split fixtures
-    (`KeyError: "Argument 'n': not found"` from a naive positional
-    encoding). `ScanFunction::arguments_already_wrapped` is a small escape
-    hatch letting a caller hand `TableScanner::Bind()` an already-wire-
-    shaped `{args: struct<named_n, ...>}` batch instead of going through
-    `WrapAsArgsStruct`'s unconditional positional rename - used today only
-    by `tools/vgi-split-probe`, since no vgi-python fixture exposes a
-    split-capable function as a plain `CREATE VIRTUAL TABLE`-attachable
-    table (every one is a directly-callable table function with SQL
-    arguments - the same table-function-call gap named elsewhere in this
-    file), so there's no real caller of this path through the SQL layer
-    yet.
-- **The full launcher discovery protocol (`launch:<argv...>` locations,
-  `docs/launcher-protocol.md`) is implemented** - `src/rpc/launcher.{h,cpp}`,
-  ported from vgi (the DuckDB extension)'s own C++ reference
-  (`src/vgi_launcher{,_internal}.cpp`), POSIX-only (this driver has no
-  Windows build target at all). Brings up, or reuses, a worker
-  system-wide - across this driver, vgi's own DuckDB extension,
-  `vgi-rpc launch` on the CLI, any other client - per (worker_argv, cwd,
-  `VGI_RPC_*`-env) tuple, coordinated via a per-hash flock in a per-user
-  state directory (`$XDG_RUNTIME_DIR/vgi-rpc` or `$TMPDIR/vgi-rpc-$EUID`
-  or `/tmp/vgi-rpc-$EUID`). The hash (16 hex chars, first 8 bytes of
-  `sha256(canonical_json({cmd,cwd,env}))`) MUST match byte-for-byte across
-  every client SDK - this isn't an internal implementation detail free to
-  diverge, it's how two different clients agree they mean the same
-  worker. `VgiConnection::Connect` wires `launch:` in right next to the
-  existing `unix://` path (same `RpcClient::connect_unix` underneath -
-  `Launch()` just resolves which socket path to connect to first), with a
-  small per-process cache (location -> resolved socket path) so repeated
-  `ConnectionPool::Acquire()` calls for the same location don't re-run the
-  whole flock+probe dance every time - invalidated and retried once on a
-  stale cached path (the typical cause: the worker's idle-timeout expired
-  between calls), mirroring vgi's own `ResolveAndConnect`.
-  Verified end-to-end against a real `vgi-fixture-worker`: a fresh
-  `launch:` location spawns and attaches correctly (confirmed real data:
-  `data.numbers` scan returns 100 rows); a SECOND attach to the identical
-  location reuses the already-running worker rather than spawning a
-  second one (confirmed directly via `ps` - same PID pair, same start
-  time, across both attaches); killing the worker and attaching again
-  correctly detects the stale socket (a failed connect probe), unlinks
-  it, and spawns a fresh one (confirmed by a genuine cold-start-length
-  attach time, not a fast reuse). Full pytest suite (46/46) unaffected.
-  Not ported: vgi-rpc-python's `.meta`-file writing and `gc_state_dir`
-  opportunistic cleanup of dead entries - matches vgi's own C++ port,
-  which also skips both (a debugging/introspection convenience, not part
-  of the core wire contract another client strictly needs to
-  interoperate) - so leftover `.lock`/`.sock` files from a worker whose
-  idle-timeout already fired accumulate in the state dir over a long
-  enough session; harmless (tiny, and any future `Launch()` for that same
-  tuple just reuses/replaces them), just not proactively swept.
-  Also not exposed yet: per-location overrides (`launcher_idle_timeout`/
-  `launcher_state_dir`, which vgi's own ATTACH-option syntax supports) -
-  `vgi_attach()` has no general options mechanism to carry them through,
-  so every `launch:` connection uses `LaunchConfig`'s plain defaults
-  (300s idle timeout, 30s connect timeout, 60s worker-startup timeout) -
-  a real, documented scope decision, not an oversight.
-- **`test/integration/`'s own worker fixtures now use `launch:` locations,
-  not bare spawn argv** - `conn` is function-scoped (a fresh
-  `ConnectionPool` per test), so a bare spawn argv paid a full `uv run` +
-  Python-interpreter-startup cost on literally every one of this suite's
-  ~50 tests; `launch:` makes every test's `Acquire()` discover and reuse
-  the one already-running worker process instead. Measured: the full
-  suite went from ~4 minutes to ~100s. `_verify_worker_available`'s own
-  fast-fail check strips the `launch:` prefix first - it runs the worker
-  argv directly as a one-shot subprocess (`--help`), not through
-  `rpc/launcher.h`'s discovery protocol, so it needs the bare argv either
-  way.
-- **VGI's table_in_out protocol has two structurally different call
-  shapes, and only one is representable in SQLite at all.** Researched
-  thoroughly first (reading `vgi_table_in_out_impl.cpp`/
-  `vgi_lateral_batch_operator.cpp`/`vgi_function_connection.cpp` from
-  vgi's own DuckDB extension, plus vgi-python's `table_in_out_function.py`
-  and vgi-c++'s `table_in_out.cpp`/`function_dispatch.cpp` for the
-  worker-side wire contract) rather than guessing from the protocol docs
-  alone: (1) the classic shape takes a genuine relation-valued (`TABLE`-
-  typed) argument, streaming an entire sub-relation in - SQLite's
-  table-valued-function calling convention has no equivalent of a
-  TABLE-typed argument at all, only scalar HIDDEN-column arguments, so
-  this shape can't be ported, full stop. (2) The "blended"/
-  `RowTransformFunction` shape - discovery signal
-  `FunctionInfo.input_from_args=true` - has REAL typed positional
-  arguments that ARE its per-row input columns (no synthetic TABLE
-  placeholder), is guaranteed `has_finalize=false` (the worker's own
-  `resolve_metadata` rejects a blended function that declares one), and
-  is map-shaped (1 input row -> 0, 1, or N output rows, no accumulation
-  across rows) - this maps almost exactly onto a SQLite table-valued
-  function with HIDDEN argument columns, called once per correlated
-  outer row exactly like `json_each(t.x)` (no LATERAL keyword needed -
-  see the entry above on `FROM t, json_each(t.x)`). Implemented as a new
-  `vgi_table_in_out` vtab module (`src/vtab/vgi_table_in_out_vtab.{h,cpp}`)
-  plus `TableInOutCaller` (`src/catalog/table_in_out_caller.{h,cpp}`),
-  which binds ONCE and holds one open exchange stream for a cursor's
-  ENTIRE lifetime (every `xFilter` call on that cursor - one per outer
-  row - is just another `Exchange()` on the same stream, not a fresh
-  bind), matching the DuckDB client's own "bind is expensive relative to
-  exchange, don't re-bind per row" design intent.
-  Confirmed via the wire protocol's OWN authoritative contract
-  (`vgi-c++/src/function_dispatch.cpp`'s `TableInOutExchange::exchange`),
-  not just the DuckDB client's usage of it: exactly one `WriteInputBatch`
-  per `Exchange()` call, ALWAYS answered by exactly one response batch -
-  a strict 1:1 lockstep, never more or fewer - and that one response
-  batch can hold 0, 1, or many rows with no row-count cap and no second
-  round trip needed for "more of the same input row's output." This
-  directly resolved a design question the user raised mid-session
-  (prompted by noticing `SumAllColumnsFunction` in vgi-python's fixtures
-  is a genuine table_in_out contract violation - a whole-relation
-  aggregation that should have been a real aggregate function instead):
-  confirmed, via a purpose-built fixture (`test/integration/fixtures/
-  row_transform_worker.py`'s `repeat_row(value, n)`) and both a literal
-  and a CORRELATED query against it, that one input row producing zero,
-  one, or many output rows already works with zero protocol-level design
-  change - the existing "one response batch, no row-count cap" wire
-  contract already covers it.
-  Never sends `pushdown_filters` or `projection_ids` on this function's
-  `init()` for v1 (confirmed via the DuckDB client: its planner never
-  sends `table_filters` to a table-in-out function's init at all -
-  filtering happens locally over the fetched result like any other
-  unclaimed WHERE constraint; `CatalogTableInOutFunction::projection_pushdown`
-  is decoded and carried through for a future pass but not yet wired to
-  `InitRequest.projection_ids`). No transactions (`xBegin`/`xSync`/
-  `xCommit`/`xRollback` all null) - this vtab never writes and needs no
-  cross-statement read-consistency coordination beyond what one
-  `bind()`/`init()` pair already gives a single query's whole cursor.
-  `xBestIndex` requires an EQ constraint on EVERY hidden (argument)
-  column, returning `SQLITE_CONSTRAINT` (SQLite's own documented "this
-  plan can't work" signal, matching `json_each`/`generate_series`'s own
-  reference behavior) when one is missing - confirmed a missing-argument
-  query fails cleanly at PREPARE time ("no query solution"), not at
-  runtime and not by silently calling the worker with a wrong-arity
-  request.
-  A real, narrow, and now-documented constraint found via a self-inflicted
-  bug while building the verification fixture, not a driver defect: an
-  output column and a HIDDEN input-argument column can't share a name
-  (both are plain columns in the one `CREATE TABLE` this module's
-  `xConnect`/`xCreate` declares; SQLite rejects a duplicate column name
-  outright) - not a crash, `sqlite3_declare_vtab` just fails cleanly and
-  `vgi_attach()` already treats any one function's `CREATE VIRTUAL TABLE`
-  failure as a per-function skip (logged, not fatal to the rest of the
-  attach), same handling an ordinary table's `xConnect` failure already
-  gets.
-  No fixture worker anywhere in the ecosystem exercised this shape
-  (confirmed by grepping vgi-python's whole `_test_fixtures/` tree - every
-  existing table_in_out fixture there is the classic, unrepresentable
-  relation-valued-argument shape) - built a small standalone fixture
-  worker (`test/integration/fixtures/row_transform_worker.py`, importing
-  vgi-python's SDK as a library rather than modifying vgi-python itself,
-  which is the shared, canonical protocol implementation other client
-  SDKs also depend on) rather than testing against a synthetic/mocked
-  wire response, matching this driver's established "probe tool first,
-  against something real" discipline (`tools/vgi-table-in-out-probe.cpp`
-  proved the catalog/RPC layer standalone before any vtab code was
-  written). Verified end-to-end, both via the probe and via real SQLite
-  queries through the built extension: a literal call
-  (`add_row(3, 4) = 7`), a correlated call over three outer rows via
-  `FROM pairs, row_transform_add_row(pairs.x, pairs.y)` (each row
-  independently computed, on the SAME bound connection/stream), the
-  1-input-row->N-output-rows and ->0-output-rows cases (both standalone
-  and correlated, with varying `n` per outer row), and the
-  missing-argument-rejected-at-prepare-time case. `test/integration/
-  test_table_in_out.py` (7 tests) covers all of the above as real,
-  regression-tracked pytest coverage. Full suite re-run clean on both
-  macOS (local) and Linux/GCC/aarch64 (EC2): 53/53 (46 pre-existing + 7
-  new).
-- **`arrow::util::base64_decode`'s return type isn't just version-
-  dependent, it's non-monotonically version-dependent across this repo's
-  own build environments** - confirmed the hard way while working on the
-  above: a from-scratch macOS/vcpkg build resolved Arrow 23.0.1 (plain
-  `std::string` return) the same day a from-scratch Linux/vcpkg build on
-  a different machine resolved Arrow 25.0.1 (`arrow::Result<std::string>`
-  return) - the opposite direction from the drift Milestone 4 already hit
-  and fixed once. Neither `vgi-sqlite/vcpkg.json` nor `vgi-c++/vcpkg.json`
-  pins a `builtin-baseline`, so a fresh `vcpkg install` isn't guaranteed
-  to resolve the same Arrow version twice, let alone across machines -
-  a real, still-unfixed root cause (out of scope to fix here; pinning a
-  baseline is a bigger, separate repo-hygiene decision that could affect
-  every other vcpkg-resolved dependency, not just Arrow). Two prior fixes
-  each hardcoded one specific signature and broke the other build
-  environment in turn. Fixed properly this time in `vgi-c++` (not
-  `vgi-sqlite` - the affected call sites are worker-dispatch-side, in
-  `vgi-c++/src/catalog.cpp` and `src/function_dispatch.cpp`, this repo
-  only depends on the result via the sibling-checkout build): a new
-  `vgi::wire::base64_decode(s)` helper (`vgi-c++/src/wire.{h,cpp}`) that
-  compiles against EITHER signature via a real template + `if constexpr`
-  (a non-template function's `if constexpr` still requires both branches
-  to type-check - only a genuinely dependent type parameter lets the
-  compiler discard the untaken branch), so it doesn't matter which one a
-  given `vcpkg install` hands the build. Verified: builds clean against
-  both Arrow 23.0.1 (macOS) and Arrow 25.0.1 (Linux/GCC/aarch64) from the
-  same source, no `#ifdef`/version-number branching needed.
-- **Real-world validation against a live, third-party-deployed VGI HTTP
-  worker (open-meteo, a Cloudflare Worker) found three more real bugs -
-  none reachable via any fixture worker this driver had tested against
-  before**, prompted directly by the user handing over a working DuckDB
-  demo query and asking for it to be run and adapted:
-  1. **`vgi_attach()`'s HTTP transport had no way to reach a worker
-     mounted at a non-default RPC prefix.** `vgi_rpc::HttpClientConfig`'s
-     own default (`/vgi`) doesn't match vgi-python's reference HTTP
-     client (`vgi_rpc.http.http_connect`'s own default is `""` - bare
-     method paths), and this open-meteo deployment mounts at the bare
-     root. Fixed with a new `?vgi_prefix=<value>` query parameter on an
-     `http(s)://` location (`rpc/vgi_connection.{h,cpp}`'s
-     `ParseLocation`/`Connect`) - an empty value explicitly asks for bare
-     paths, distinct from omitting the parameter (which leaves
-     `HttpClientConfig`'s own default untouched, so every existing test
-     against `vgi-fixture-http`'s `--prefix /vgi` convention is
-     unaffected). Can't just be a path segment in `location` itself -
-     `HttpClient::builder()` refuses a base_url containing a path at all.
-  2. **`vgi_table_in_out`'s output/HIDDEN-column name collision handling
-     turned out to block essentially every real-world function, not a
-     narrow edge case.** All 13 of open-meteo's blended functions have an
-     output column sharing a name with one of their own arguments (e.g.
-     `geocoding(name, count, country_code, language)` whose output rows
-     also carry `name`/`country_code`) - the "not worth disambiguating
-     automatically" scope decision this module shipped with (see the
-     entry above) turned out to be wrong the first time it met a real
-     worker. Fixed: a colliding HIDDEN column is now silently renamed
-     (`<name>_arg`, `<name>_arg2`, ...) before declaring the vtab's DDL -
-     safe because a hidden column's name only matters for `CREATE TABLE`
-     uniqueness and an explicit `SELECT hidden_col FROM fn(...)`
-     read-back, never for call-syntax argument binding (always
-     positional). See `vgi_table_in_out_vtab.cpp`'s `ConnectImpl`.
-  3. **The real, high-value bug: `TableInOutCaller` routed EVERY declared
-     argument through the per-row streaming channel, silently dropping
-     "named" (VGI's general `:=`-keyword-argument model,
-     `FunctionInfo.arguments`' `vgi_arg: named` field metadata,
-     vgi-python's `argument_spec.py`) argument values entirely.** VGI's
-     protocol requires a named argument's VALUE to travel in
-     `BindRequest.arguments` (read server-side as `params.args`), not as
-     an `input_schema` streaming column - this class sent every argument,
-     named or not, as a streaming column and always sent an EMPTY
-     `arguments` struct at bind() time. No error, no warning: the
-     worker's own `process()` simply never looks at the streaming
-     column for a named argument and falls back to its own default.
-     Confirmed both the bug and the fix with a real, externally-
-     verifiable comparison: `forecast_hourly(..., temperature_unit :=
-     'fahrenheit')` returned IDENTICAL values whether `'fahrenheit'` or
-     `'celsius'` was supplied before the fix (17.5, matching Celsius);
-     after the fix, `'fahrenheit'` correctly returns 63.5 (matching
-     `'celsius'`'s 17.5 exactly, 17.5°C = 63.5°F) - and the driver's full
-     adapted query output now matches `haybarn-cli` (a DuckDB+VGI
-     reference build) byte-for-byte across all 6 rows of a live LATERAL
-     join. Fixed by splitting a function's declared `input_schema` once,
-     in `TableInOutCaller`'s constructor, by each field's own `vgi_arg`
-     metadata: true positional fields flow through `Exchange()` per row,
-     unchanged; named fields' values are extracted from the FIRST real
-     `Exchange()` call's row and sent as that (real, not the throwaway
-     xConnect-time probe) bind()'s `arguments` (via a new
-     `BuildNamedArgsStruct`, mirroring `TableScanner::WrapAsArgsStruct`'s
-     "positional_N"/`named_<name>`-prefixed struct-field wire
-     convention). A real, documented consequence: a named argument's
-     value is fixed for a cursor's WHOLE lifetime (one bind, reused
-     across every later `Exchange()` call) - a caller supplying a
-     DIFFERENT named-arg value on a later correlated row can't make it
-     take effect, matching VGI's own bind-time-fixed semantics for named
-     arguments generally, not a limitation specific to this class.
-  Also found along the way, in `vgi-rpc-c++` (not vgi-sqlite) - see that
-  repo's own commit: `HttpClient`'s schema-equality check compared field
-  metadata and nullability, both of which this same worker's bind()/
-  init()/exchange() responses carry inconsistently for the identical
-  logical schema - fixed to compare structural shape only (names + types,
-  recursively).
-  SQLite has no keyword-argument call syntax at all (unlike DuckDB's
-  `:=`), which is a separate, unrelated fact from the bug above - every
-  declared argument, positional or named, is still exposed as an
-  ordinary positional HIDDEN column in declared order; a caller supplies
-  a value (or explicit `NULL`, "use the worker's default") for all of
-  them positionally, e.g. `forecast_hourly(lat, lon, 2, NULL, NULL, NULL,
-  'fahrenheit', NULL, NULL)`. New `tools/vgi-http-probe.cpp`: an ad hoc
-  diagnostic tool (connects via `VgiConnection::Connect()`, unlike every
-  other probe here which hardcodes `spawn()`) that made isolating each of
-  these three bugs from a real worker's actual RPC responses tractable,
-  independent of the SQLite layer.
-- **A fourth real bug found via the same live-worker-testing discipline,
-  against the DuckDB `earthquakes` demo this time**:
-  `EncodePushdownFilters` (`src/vtab/filter_pushdown.{h,cpp}`) sent
-  `pushdown_filters.column_index` as the constraint's index into the
-  table's full DECLARED schema. The wire protocol actually wants the
-  column's position within the PROJECTED (narrowed) output - confirmed
-  against `vgi`'s own DuckDB-extension source (`vgi_table_function_impl.cpp`'s
-  own comment: "col_idx is the filter's position in the projected
-  column_ids... the worker applies ConstantFilter/InFilter by INDEX
-  (batch.column(column_index))... this only resolves correctly because the
-  worker emits its output batch in the same projected order"). A narrow
-  `SELECT col` combined with `WHERE col ...` silently returned ZERO rows;
-  `SELECT *` with the identical `WHERE` worked, since declared-index and
-  projected-position coincide when nothing is dropped - masking this for
-  every prior milestone's testing, since a genuinely narrow projection
-  combined with a filter was never exercised until this demo. Fixed by
-  threading `xFilter`'s `projected_columns` through to
-  `EncodePushdownFilters` and translating each constraint's declared index
-  into its position within that list (empty list means "every column,
-  declared order," where the two already coincide). Verified against both
-  the raw repro and the full earthquakes demo query, byte-for-byte
-  matching `haybarn-cli`'s reference output.
-- **Plain, standalone table (generator) functions are supported** - a new
-  `vgi_table_function` SQLite virtual table module
-  (`src/vtab/vgi_table_function_vtab.{h,cpp}`), for the shape `table_in_out`
-  deliberately doesn't cover: no per-row streaming input at all, just
-  ordinary declared arguments, callable as `FROM catalog_fn(args)`
-  (literal or per-outer-row correlated via `FROM t, catalog_fn(t.x)` - the
-  same `json_each`-style implicit correlation `table_in_out` already
-  established needs no LATERAL keyword). Architecturally closer to
-  `vgi_worker` than `vgi_table_in_out`: a fresh `TableScanner` per
-  `xFilter` call (no persistent per-cursor caller), matching a plain
-  table's own scan semantics exactly, since this shape has nothing
-  analogous to `table_in_out`'s "bind once, exchange many times" per-row
-  contract. `catalog_client.{h,cpp}` gained `CatalogPlainTableFunction`
-  discovery (`SchemaContentsPlainTableFunctions`/`PlainTableFunctionGet`),
-  filtered to `input_from_args=false && has_finalize=false &&
-  !HasTableTypedArgument(argument_schema)` - excludes `table_in_out`'s own
-  territory (input_from_args=true) and the classic relation-valued-
-  argument `table_in_out` shape (any argument field carrying `vgi_type:
-  table` metadata), leaving only genuinely plain, positionally-argued
-  table functions. `xBestIndex` requires an EQ constraint on every HIDDEN
-  argument column (same `SQLITE_CONSTRAINT`-on-missing-arg contract
-  `vgi_table_in_out` already uses); output/hidden-column name-collision
-  disambiguation is copied from `vgi_table_in_out_vtab.cpp` verbatim (same
-  risk, same fix). A known, not-yet-handled gap: arity-overloading (e.g.
-  `geo_encode`/`geo_encode3` sharing one SQL name) collides when
+  SQLite's own implicit per-statement transaction**, for any catalog that
+  declares `supports_transactions = true`. `Begin/Commit/RollbackTransaction`
+  are gated on `CatalogAttachResult.supports_transactions`, cached in
+  `ConnectionPool`'s `attach_info_` map alongside `attach_opaque_data` - a
+  catalog that doesn't support transactions never gets a
+  `catalog_transaction_begin` call at all, regardless of how many `xBegin`
+  calls ref-counted up. `attach_info_` is guaranteed populated before any
+  `xBegin` could fire, since `xConnect` (which every table runs before it's
+  usable) always resolves it first.
+
+### `table_in_out` and `table_function` (correlated table-valued functions)
+
+- **VGI's `table_in_out` protocol has two structurally different call
+  shapes, and only one is representable in SQLite at all.** The classic
+  shape takes a genuine relation-valued (`TABLE`-typed) argument, streaming
+  an entire sub-relation in - SQLite's table-valued-function calling
+  convention has no equivalent, only scalar HIDDEN-column arguments, so
+  this shape can't be ported. The "blended"/row-transform shape (discovery
+  signal `FunctionInfo.input_from_args=true`) has real typed positional
+  arguments that ARE its per-row input columns, is guaranteed
+  `has_finalize=false`, and is map-shaped (1 input row -> 0, 1, or N output
+  rows, no cross-row accumulation) - this maps onto a SQLite table-valued
+  function with HIDDEN argument columns, called once per correlated outer
+  row exactly like `json_each(t.x)` (no LATERAL keyword needed - SQLite
+  automatically re-invokes `xFilter` once per outer row whenever a HIDDEN
+  column is constrained by an earlier table in the same `FROM` clause;
+  ordinary `xBestIndex`/`xFilter` pushdown machinery does the correlation
+  implicitly). Implemented as `vgi_table_in_out`
+  (`src/vtab/vgi_table_in_out_vtab.{h,cpp}`) plus `TableInOutCaller`
+  (`src/catalog/table_in_out_caller.{h,cpp}`), which binds ONCE and holds
+  one open exchange stream for a cursor's entire lifetime - every `xFilter`
+  call on that cursor is just another `Exchange()` on the same stream, not
+  a fresh bind.
+- **The wire protocol's exchange contract is a strict 1:1 lockstep**: one
+  `WriteInputBatch` per `Exchange()` call, always answered by exactly one
+  response batch, which can hold 0, 1, or many rows with no row-count cap
+  and no second round trip needed - confirmed against
+  `vgi-c++/src/function_dispatch.cpp`'s `TableInOutExchange::exchange`, the
+  wire protocol's own authoritative contract.
+- Never sends `pushdown_filters` or `projection_ids` on this function's
+  `init()` - filtering happens locally over the fetched result like any
+  other unclaimed WHERE constraint, matching the DuckDB client's own
+  behavior. No transactions (`xBegin`/etc. all null) - this vtab never
+  writes and needs no cross-statement consistency beyond one query's own
+  bind/init pair.
+- **`xBestIndex` requires an EQ constraint on every hidden (argument)
+  column**, returning `SQLITE_CONSTRAINT` when one's missing - SQLite's own
+  documented "this plan can't work" signal, matching `json_each`/
+  `generate_series`'s reference behavior; a missing-argument query fails
+  cleanly at PREPARE time, never by silently calling the worker with a
+  wrong-arity request.
+- **An output column and a HIDDEN input-argument column can't share a
+  name** (both are plain columns in the one `CREATE TABLE` this module
+  declares; SQLite rejects a duplicate column name outright). This turned
+  out to be common, not a narrow edge case - real-world worker functions
+  routinely have an output column sharing a name with one of their own
+  arguments (e.g. `geocoding(name, count, country_code, language)` whose
+  output rows also carry `name`/`country_code`). Fixed: a colliding HIDDEN
+  column is silently renamed (`<name>_arg`, `<name>_arg2`, ...) before
+  declaring the vtab's DDL - safe because a hidden column's name only
+  matters for `CREATE TABLE` uniqueness and an explicit
+  `SELECT hidden_col FROM fn(...)` read-back, never for call-syntax
+  argument binding (always positional). `vgi_table_function` copies the
+  same fix verbatim (same risk, same module shape).
+- **A "named" (VGI's `:=`-keyword-argument model, `vgi_arg: named` field
+  metadata) argument's VALUE must travel in `BindRequest.arguments`, not as
+  a streaming `input_schema` column.** A real, high-value bug: an earlier
+  version routed every argument through the per-row streaming channel
+  regardless of `vgi_arg`, so a named argument's value was silently
+  dropped and the worker fell back to its own default, with no error.
+  `TableInOutCaller`'s constructor now splits a function's declared
+  `input_schema` by each field's own `vgi_arg` metadata: true positional
+  fields flow through `Exchange()` per row; named fields' values are
+  extracted from the first real `Exchange()` call's row and sent as that
+  bind's `arguments` (`BuildNamedArgsStruct`, mirroring
+  `TableScanner::WrapAsArgsStruct`'s `positional_N`/`named_<name>`-prefixed
+  struct-field wire convention). Consequence: a named argument's value is
+  fixed for a cursor's whole lifetime (one bind, reused across every later
+  `Exchange()` call) - a caller supplying a different value on a later
+  correlated row can't make it take effect, matching VGI's own
+  bind-time-fixed semantics for named arguments generally. SQLite itself
+  has no keyword-argument call syntax (unlike DuckDB's `:=`) - every
+  declared argument, positional or named, is exposed as an ordinary
+  positional HIDDEN column in declared order regardless.
+- **`vgi_table_function`** (`src/vtab/vgi_table_function_vtab.{h,cpp}`)
+  covers the shape `table_in_out` doesn't: plain, standalone table
+  (generator) functions with no per-row streaming input, callable as
+  `FROM catalog_fn(args)` (literal or correlated). Architecturally closer
+  to `vgi_worker` than `vgi_table_in_out`: a fresh `TableScanner` per
+  `xFilter` call, matching a plain table's own scan semantics, since this
+  shape has nothing analogous to `table_in_out`'s "bind once, exchange many
+  times" contract. Discovery (`catalog_client.{h,cpp}`'s
+  `CatalogPlainTableFunction`) is filtered to `input_from_args=false &&
+  !has_finalize && !HasTableTypedArgument(...)` to exclude both
+  `table_in_out` shapes. **Known, not-yet-handled gap**: arity-overloading
+  (e.g. `geo_encode`/`geo_encode3` sharing one SQL name) collides when
   `vgi_attach()` tries to register the second one under the same generated
   name - the second attempt fails cleanly and is skipped (matching every
   other per-function `CREATE VIRTUAL TABLE` failure's handling), but only
-  one overload ends up callable; not fixed, `overload` stays a structural
-  skip category in the sqllogictest corpus for exactly this reason. Two
-  real bugs found and fixed via live testing against the `example`
-  catalog's real `split_sequence` fixture (no synthetic fixture needed -
-  this one was already registered in `vgi-fixture-worker` the whole time,
-  just never reachable via any SQLite construct before this module):
-  1. **`split_sequence(100, 4)` returned 0 rows.** `AdvanceBatch` (as
-     implemented in both `vgi_vtab.cpp` and copied into
-     `vgi_table_function_vtab.cpp`) only ever SETS `cursor->eof = true`
-     on a genuine end-of-stream - it never CLEARS it on a successful
-     fetch. Safe only when a cursor's `eof` field starts `false` and the
-     cursor is used exactly once per scan (true for a plain table's
-     cursor) - the new module's cursor's `eof` field simply defaulted to
-     the wrong value relative to this implicit contract. Fixed by an
-     explicit `bool eof = false;` with a comment explaining exactly why
-     this default matters here specifically.
-  2. **Correlated multi-row scans (`FROM nums, fn(nums.n, ...)`) returned
-     0 rows for every outer row after the first.** Same `AdvanceBatch`
-     contract, a sharper case of it: unlike a plain table's cursor
-     (`xFilter` called once per cursor lifetime), a table-function
-     cursor used for a correlated scan is re-filtered many times on the
-     SAME cursor object (one `xFilter` call per outer row) - a PRIOR
-     scan's own completion (`eof` correctly left `true` by ITS last
-     `AdvanceBatch`) stayed stuck `true` forever without an explicit
-     reset, silently reporting every subsequent correlated row as
-     producing zero results. Fixed by explicitly resetting
-     `cursor->eof = false` at the start of `xFilter`'s real-scan setup,
-     right before the (now try-block-wrapped, matching the earlier
-     Milestone-7 process-crash fix) call to `AdvanceBatch`. Verified via
-     a 3-outer-row test (`n=5,10,20` -> `5,10,20` rows respectively,
-     total 35, all correct) - this is exactly the scenario the module's
-     whole raison d'être (correlated table-function calls) depends on, so
-     this bug would have silently broken the module's primary use case.
-  `test/integration/test_table_function.py` (6 tests) covers both bugs as
-  real, regression-tracked pytest coverage, plus literal calls, splits
-  redemption through this new call path, missing-argument-rejected-at-
-  prepare-time, and a cross-module sanity check that `vgi_table_function`
-  and `vgi_table_in_out` registering side-by-side in one `vgi_attach()`
-  call don't interfere with each other.
-- **The sqllogictest corpus's persistent worker pool now backs the
-  dominant `example` catalog fixture with `vgi-go`, not just
-  `vgi-python`** (`test/sqllogictest/workers.py`) - found necessary the
-  hard way: a `--jobs 48` corpus run against the pre-existing
-  4-process-per-fixture `vgi-python` pool mass-timed-out (152/328 files
-  hit the 120s per-file timeout - GIL contention: a CPython `--unix`
-  worker serves each connection on its own thread, but real request
-  handling mostly holds the GIL, so N client connections against a small
-  fixed pool of GIL-bound processes don't get real N-way parallelism, just
-  queueing once client-side concurrency is high enough - the same class of
-  bottleneck this file's own docstring already measured once for a single
-  worker instance, just hit again at a coarser scale). `vgi-go`'s example
-  worker binaries (`~/Development/vgi-go`, `go build ./cmd/<pkg>/`)
-  register the SAME catalog name (`vgi.WithCatalogName("example")`,
-  confirmed by reading `cmd/vgi-example-worker/main.go`) as `vgi-python`'s
-  fixture, but handle concurrent requests via goroutines, not a GIL-bound
-  thread pool - one process gets real multi-core concurrency for free
-  (confirmed directly: the single Go worker process reached 900%+ CPU
-  during a full-corpus run). `workers.py` now spawns exactly ONE Go
-  process (never a `pool_size`-sized pool - no process-pool workaround
-  needed when the single process itself scales) for the five fixtures
-  with a vgi-go equivalent (`VGI_TEST_WORKER`, `VGI_SIMPLE_WRITABLE_WORKER`,
-  `VGI_ATTACH_OPTIONS_WORKER`/`_REQUIRED_WORKER`, `VGI_VERSIONED_WORKER`,
-  `VGI_VERSIONED_TABLES_WORKER`); `VGI_BAD_PROTOCOL_WORKER`/
-  `VGI_BAD_ENUM_WORKER` have no vgi-go equivalent and stay on
-  `vgi-python`'s `pool_size`-process mechanism. Result: zero timeouts, and
-  the corpus's own passing-record count rose from 616 to 787 (verified
-  twice for determinism). **A real, serious self-inflicted incident along
-  the way, fully resolved**: blindly passing `--update-baseline` on the
-  first (mass-timed-out, garbage 141-passing) run overwrote
-  `baseline.json` with that garbage result, clobbering the good
-  616-passing baseline - caught by reading the actual run output rather
-  than trusting the update silently, fixed by restoring `baseline.json`
-  from the local git-tracked copy (never touched locally, so fully
-  recoverable). Never blindly pass `--update-baseline` without reading the
-  run's own pass/fail/skip numbers and regression list first.
-  **The 5 "regressed" records are corpus drift, not a vgi-go fixture
-  difference - checked and corrected twice over, not just suspected.**
-  First guess was that `vgi-go`'s own "products" example fixture
-  (`examples/table/static_data.go`) builds its Arrow schema with no field
-  metadata at all, so it never populates `duckdb_columns().comment` the
-  way `vgi-python`'s equivalent fixture does. First correction: `gh run
-  view` against `vgi-go`'s own `integration.yml` CI (runs the IDENTICAL
-  pinned `Query-farm/vgi` corpus against a real DuckDB extension via
-  `haybarn-unittest`) showed all 5 flagged files, including
-  `table/comments.test`, are NOT among that run's failures (320/322 test
-  cases pass). Final confirmation, at the user's direct suggestion,
-  connecting `uvx haybarn-cli` straight to a locally-built
-  `vgi-example-worker-go` and querying `duckdb_columns()` for
-  `data.products` live: the comments ARE genuinely present and correct
-  (`id -> "Unique product identifier"`, `name -> "Product display name"`,
-  `price -> "Unit price in USD"`, `quantity -> NULL`, exactly matching
-  what the corpus expects). The original grep simply looked in the wrong
-  file - `RegisterCatalogTable`'s `ColumnComments` field for the
-  `products` table is actually set in
-  `cmd/vgi-example-worker/main.go:583-591`, a separate catalog-assembly
-  layer entirely independent of `examples/table/static_data.go`'s own
-  scan-function schema (which genuinely does carry no field metadata, but
-  that's irrelevant - `ColumnComments` at registration time is what
-  `duckdb_columns().comment` actually reports). There was no vgi-go bug at
-  any point; the real (and only) explanation for the 5 "regressed" records
-  is `baseline.json` predating ~5 days of upstream `~/Development/vgi`
-  corpus commits (confirmed via `git log` on that sibling checkout - a
-  `refactor!: remove vgi_table_function()...` commit alone could shift
-  which query a stored `file.test:LINE` id refers to).
-  **`vgi-go`'s own CI does have a real, currently-failing gap, found
-  answering a direct question about whether its test suite is
-  sufficient**: its `integration.yml` (4 transport lanes: stdio/launch/
-  shm/http, gated per a recent "gate the integration lane on executed
-  count and expected skips" commit) is RED on `main` right now, on 2
-  files unrelated to anything `vgi-sqlite` touches -
-  `cache/secret_ineligible.test:85` and `macro/macros.test:171`, both
-  `count_star()` row-count mismatches (`cache`/`macro` are both
-  structurally-skipped categories here regardless, no query-cache layer
-  or macro-expansion support in this driver). Not `vgi-sqlite`'s problem
-  to fix, but real and worth knowing before assuming "the CI is green" -
-  it currently isn't. `vgi-sqlite` does NOT implement
-  `duckdb_functions()`/`duckdb_columns()`/any other DuckDB-native
-  introspection view, and `translate.py` does not rewrite calls to them
-  into anything else - a corpus query using them genuinely fails ("no
-  such table"), which is correct and expected (DuckDB-dialect-specific
-  constructs baked into the corpus's own `.test` files; this driver has
-  no reason to reimplement DuckDB's own introspection views under
-  DuckDB's own names - `pragma_*`/`information_schema` conventions, or a
-  `vgi_*`-prefixed function, would be the right shape if this driver ever
-  wants to expose worker-catalog metadata to SQL, never a `duckdb_*`
-  name).
+  one overload ends up callable; `overload` stays a structural skip
+  category in the sqllogictest corpus for exactly this reason.
+
+### VGI splits (sequential redemption)
+
+Splits is an optional planning phase (`FunctionInfo.supports_splits`)
+layered on the ordinary bind->init->tick lifecycle
+(`src/catalog/catalog_table_plan.h`/`table_scanner.{h,cpp}`):
+`table_function_plan` divides a scan into N independently-redeemable opaque
+tokens; `InitRequest.split_tokens` redeems one via an otherwise-ordinary
+init. A single sequential reader claiming every split one at a time (what
+`TableScanner` does, entirely transparent to `vgi_vtab.cpp`) is a legal,
+degenerate consumer even though the mechanism exists for real distributed
+engines to claim splits concurrently.
+
+- **End-of-stream is a `nullopt` tick, never a present-but-0-row batch** -
+  a 0-row batch mid-split is legitimate (a filter pruned that split to
+  nothing) and must not be read as "this split is done."
+- **Every `next_cursors` entry a plan response returns must be followed,
+  not just the first** - enumeration is complete only once every
+  outstanding cursor has returned none. `PlanTableFunctionSplits` drains a
+  plain queue of every cursor any response returns, staying single-threaded
+  while still closing the "silently drop rows reachable from a second
+  cursor" risk.
+- **A worker's argument resolver can key strictly by declared NAME, not
+  position.** `ScanFunction::arguments_already_wrapped` is a small escape
+  hatch letting a caller hand `TableScanner::Bind()` an already-wire-shaped
+  `{args: struct<named_n, ...>}` batch instead of going through
+  `WrapAsArgsStruct`'s unconditional positional rename - used today only by
+  `tools/vgi-split-probe`, since no fixture exposes a split-capable
+  function as a plain `CREATE VIRTUAL TABLE`-attachable table (every one is
+  a directly-callable table function, the same "table-function call" gap
+  `vgi_table_function` now covers for the plain, non-split case).
+
+### Transports
+
+- **`vgi_rpc::RpcClient` and `vgi_rpc::HttpClient` are not a common
+  interface with two implementations - their method signatures genuinely
+  differ**: HTTP's `open_producer`/`open_stream_exchange` require explicit
+  `input_schema`/`output_schema` arguments raw's `open_producer`/
+  `open_exchange` don't take at all, and HTTP's `call()` wants an
+  `AnnotatedBatch` request where raw's `call_unary()` wants a bare
+  `RecordBatch`. `VgiConnection` unifies them at the shape this driver's
+  call sites need (every one already has both schemas on hand from its own
+  prior `bind()` call) - `CallUnary`/`OpenProducer`/`OpenExchange` dispatch
+  to whichever of an `optional<RpcClient>`/`optional<HttpClient>` pair
+  `Connect()` engaged, returning a `VgiStream` abstract handle.
+- A bearer token is embedded as URL userinfo (`http://TOKEN@host:port/...`),
+  not a separate `vgi_attach()` channel - `location` already threads
+  unchanged through every generated `CREATE VIRTUAL TABLE` and every
+  `ConnectionPool` key, so folding the token in once (in `VgiAttachFunc`,
+  before anything else touches `location`) avoids plumbing a second
+  channel through every downstream call site. Plain `http://` + a token
+  requires `HttpClientConfig.allow_insecure_credentials = true` (refused
+  by default) - set only when the scheme is literally `http`, treating an
+  explicit `http://` as informed consent for a local/private channel.
+  **A bearer token ends up persisted in cleartext in the database file**,
+  not just held in memory - SQLite stores the generated `CREATE VIRTUAL
+  TABLE` statement (with the token folded into `location`) verbatim in
+  `sqlite_master`/`sqlite_schema`. Surfaced via a `sqlite3_log(SQLITE_WARNING,
+  ...)` at attach time rather than fixed by a bigger redesign (storing
+  credentials outside the schema).
+- **HTTP transport needs a `?vgi_prefix=<value>` query parameter to reach a
+  worker mounted at a non-default RPC prefix.** `vgi_rpc::HttpClientConfig`'s
+  own default (`/vgi`) doesn't match every real deployment - a real
+  third-party worker mounted at the bare root needed `?vgi_prefix=` (empty
+  value, explicitly distinct from omitting the parameter, which leaves the
+  library default untouched).
+- **`VgiConnection::Connect` also speaks `unix:///path/to.sock`** -
+  connects to an already-running worker (`vgi_rpc::RpcClient::connect_unix`)
+  instead of spawning a new subprocess per connection, and `launch:<argv...>`
+  - the full AF_UNIX launcher discovery protocol (`docs/launcher-protocol.md`,
+  `src/rpc/launcher.{h,cpp}`, ported from vgi's own C++ reference,
+  POSIX-only). `launch:` brings up, or reuses, a worker system-wide across
+  this driver, vgi's own DuckDB extension, `vgi-rpc launch` on the CLI, and
+  any other client, keyed per `(worker_argv, cwd, VGI_RPC_*-env)` tuple via
+  a per-hash flock in a per-user state directory. **The hash (16 hex
+  chars, first 8 bytes of `sha256(canonical_json({cmd,cwd,env}))`) MUST
+  match byte-for-byte across every client SDK** - this isn't an internal
+  implementation detail free to diverge, it's how two different clients
+  agree they mean the same worker. A small per-process cache (location ->
+  resolved socket path) avoids re-running the whole flock+probe dance on
+  every `ConnectionPool::Acquire()` for an already-attached location,
+  invalidated and retried once on a stale cached path (typically because
+  the worker's idle-timeout expired between calls). Not exposed yet:
+  per-location `launcher_idle_timeout`/`launcher_state_dir` overrides
+  (`vgi_attach()` has no general options mechanism to carry them through) -
+  every `launch:` connection uses `LaunchConfig`'s plain defaults (300s
+  idle timeout, 30s connect timeout, 60s worker-startup timeout).
+- **A single persistent worker process does NOT scale with client-side
+  concurrency**, even with a thread-per-connection model - a CPython
+  worker's real request handling mostly holds the GIL, so concurrent
+  connections against one process interleave rather than run in parallel;
+  a real multi-process pool (or a non-GIL-bound worker implementation) is
+  what actually parallelizes. Relevant to any future use of a shared/pooled
+  worker process from this driver, not just test tooling.
+
+### Build & portability gotchas
+
+- **`vcpkg.json`'s `cpp-httplib` feature list needs `openssl` explicitly**,
+  even though `vgi-rpc-c++`'s own `vcpkg.json` already declares it - vcpkg
+  manifest resolution follows only the top-level project's `vcpkg.json`
+  when building as a sibling subdirectory, so a sibling's correct
+  declaration is never consulted. A real, pre-existing bug in `vgi-c++`
+  too, not specific to this repo.
+- **Any worker-supplied catalog metadata (schema/table/column names)
+  embedded in a SQL string this driver builds itself must go through
+  `sql_quote.h`'s `SqlQuoteIdentifier`/`SqlQuote`, never raw string
+  concatenation.** A real security-review finding: `vgi_attach()`'s
+  generated `CREATE VIRTUAL TABLE`/`DROP TABLE` (`extension.cpp`) and
+  `xConnect`/`xCreate`'s generated `CREATE TABLE` DDL (`vgi_vtab.cpp`) both
+  embedded a worker-supplied name inside a bare `"\"" + name + "\""` with
+  no escaping of an embedded `"` - a worker (buggy, or actively malicious -
+  the location a caller points `vgi_attach()` at is already a
+  code-execution-level trust boundary, but that's not license to let its
+  *data* smuggle SQL into the attaching connection too) whose metadata
+  contained a `"` could break out of the identifier.
+- **`arrow::util::base64_decode`'s return type is non-monotonically
+  version-dependent across build environments** (plain `std::string` on
+  one resolved Arrow version, `arrow::Result<std::string>` on another) -
+  neither `vgi-sqlite/vcpkg.json` nor `vgi-c++/vcpkg.json` pins a
+  `builtin-baseline`, so a fresh `vcpkg install` isn't guaranteed to
+  resolve the same Arrow version twice, let alone across machines (a real,
+  still-unfixed root cause; pinning a baseline is a bigger, separate
+  repo-hygiene decision affecting every vcpkg-resolved dependency, not just
+  Arrow). Fixed in `vgi-c++` (the affected call sites are worker-dispatch-
+  side, `vgi-c++/src/catalog.cpp` and `src/function_dispatch.cpp`): a
+  `vgi::wire::base64_decode(s)` helper (`vgi-c++/src/wire.{h,cpp}`)
+  compiles against either signature via a template + `if constexpr`, so it
+  doesn't matter which one a given `vcpkg install` resolves.
+
+### Explicit non-goals
+
+- **`vgi-sqlite` does NOT implement `duckdb_functions()`/`duckdb_columns()`/
+  any other DuckDB-native introspection view or function**, and
+  `test/sqllogictest/translate.py` does not rewrite calls to them into
+  anything else - a corpus query using them genuinely fails ("no such
+  table"), which is correct and expected: these are DuckDB-dialect-
+  specific catalog-introspection constructs, and this driver has no reason
+  to reimplement them under DuckDB's own names. If this driver ever wants
+  to expose worker-catalog metadata to SQL, the right shape is SQLite's own
+  `pragma_*`/`information_schema` conventions, or a `vgi_*`-prefixed
+  function - never a `duckdb_*` name.
+- **Classic `table_in_out` (relation-valued argument) and multi-branch
+  (union-of-sources) tables remain out of scope** - SQLite's virtual-table
+  model has no native concept matching either (no relation-valued function
+  parameter, no natural multi-source union at the vtab level), so
+  supporting them would mean inventing driver-specific conventions with no
+  SQL-standard shape to hang them on. Revisit only if a concrete consumer
+  need appears.
