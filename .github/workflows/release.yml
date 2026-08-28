@@ -1,12 +1,19 @@
 # © Copyright 2026 Query Farm LLC - https://query.farm
 #
-# Builds the loadable extension (vgi.{so,dylib}) for every supported
+# Builds the loadable extension (vgi.{so,dylib,dll}) for every supported
 # (OS, architecture) pair and publishes them to a GitHub Release.
 #
-# Windows is NOT in this matrix: the launcher/subprocess transport
-# (src/rpc/launcher.{h,cpp}) is POSIX-only by design (fork/exec, flock,
-# AF_UNIX) - see CLAUDE.md. A Windows build needs real portability work
-# first, not just another matrix row.
+# Windows IS now in this matrix (build-windows, a separate job below,
+# structurally the same reason ci.yml's build-and-test-windows is its own
+# job rather than a matrix row: PowerShell throughout, not per-step bash/
+# pwsh branching within one mixed-OS matrix). This was blocked for a
+# while on real portability work, not just a missing matrix row -
+# src/rpc/launcher.{h,cpp}'s `launch:` support needed a genuine Windows
+# implementation (named pipes, not AF_UNIX or fork/exec/flock) - see
+# CLAUDE.md's Windows/launcher entry for the full history. That work is
+# done and verified (ci.yml's own build-and-test-windows job has run it
+# against a real worker), so shipping a Windows binary is no longer
+# blocked on it.
 #
 # Every dependency vcpkg builds (Arrow, OpenSSL, etc.) is statically linked
 # by vcpkg's own default triplet on Linux/macOS (x64-linux/arm64-linux/
@@ -18,6 +25,18 @@
 # note in CLAUDE.md for the full reasoning, including the real, accepted
 # limits this doesn't solve (a glibc version floor from the build
 # environment's own libc; no musl/Alpine build).
+#
+# Windows is structurally different here, not a bug: vcpkg's default
+# x64-windows triplet is DYNAMICALLY linked (DLLs), confirmed by
+# ci.yml's own build-and-test-windows job log ("Copying vcpkg runtime
+# DLLs next to vgi.dll" - CMakeLists.txt's own POST_BUILD step, config-
+# aware via $<CONFIG:...>, so it copies the Release DLLs correctly here
+# too). So the Windows release artifact isn't a single self-contained
+# file the way the POSIX ones are - it's vgi.dll plus every DLL that
+# POST_BUILD step copies alongside it, staged and archived together.
+# This is normal for a Windows-distributed native extension (the same
+# shape any redistributable Windows DLL-based app ships in) and doesn't
+# need a static-triplet workaround the way this would on Linux/macOS.
 
 name: Release
 
@@ -241,11 +260,135 @@ jobs:
             vgi-sqlite-*.tar.gz.sha256
           if-no-files-found: error
 
+  build-windows:
+    runs-on: windows-2022
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out vgi-cpp
+        uses: actions/checkout@v4
+        with:
+          repository: Query-farm/vgi-cpp
+          path: vgi-cpp
+
+      - name: Check out vgi-rpc-cpp
+        uses: actions/checkout@v4
+        with:
+          repository: Query-farm/vgi-rpc-cpp
+          path: vgi-rpc-c++
+
+      - name: Clone and bootstrap vcpkg
+        run: |
+          git clone https://github.com/microsoft/vcpkg.git
+          git -C vcpkg checkout $env:VCPKG_COMMIT
+          .\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+          echo "VCPKG_ROOT=$(Resolve-Path vcpkg)" >> $env:GITHUB_ENV
+
+      # See ci.yml's build-and-test-windows job's matching step for the
+      # full reasoning - same shared Haybarn cache, same graceful
+      # read-only fallback.
+      - name: Configure vcpkg binary cache
+        env:
+          QUERY_FARM_VCPKG_TOKEN: ${{ secrets.QUERY_FARM_VCPKG_TOKEN }}
+        run: |
+          if ($env:QUERY_FARM_VCPKG_TOKEN) {
+            $remote = "http,https://haybarn-vcpkg-cache.rusty-bb6.workers.dev,readwrite,Authorization: Bearer $env:QUERY_FARM_VCPKG_TOKEN"
+          } else {
+            $remote = "http,https://haybarn-vcpkg-cache.rusty-bb6.workers.dev,read"
+          }
+          $archives = Join-Path $env:GITHUB_WORKSPACE "vcpkg-archives"
+          echo "VCPKG_BINARY_SOURCES=clear;files,$archives,readwrite;$remote" >> $env:GITHUB_ENV
+
+      - name: Cache vcpkg binary archives (local)
+        uses: actions/cache@v4
+        with:
+          path: vcpkg-archives
+          key: vcpkg-release-windows-x86_64-${{ env.VCPKG_COMMIT }}-${{ hashFiles('vcpkg.json') }}
+          restore-keys: |
+            vcpkg-release-windows-x86_64-${{ env.VCPKG_COMMIT }}-
+
+      # See ci.yml's build-and-test-windows job's matching step - pinned
+      # rather than whatever chocolatey/winget currently ship, for
+      # confirmed HTTP remote-storage support.
+      - name: Install ccache (pinned, for HTTP remote-storage support)
+        run: |
+          $CCACHE_VERSION = "4.14"
+          $asset = "ccache-$CCACHE_VERSION-windows-x86_64.zip"
+          Invoke-WebRequest -Uri "https://github.com/ccache/ccache/releases/download/v$CCACHE_VERSION/$asset" -OutFile ccache.zip
+          Expand-Archive -Path ccache.zip -DestinationPath ccache-extract -Force
+          $dir = (Get-ChildItem -Recurse -Path ccache-extract -Filter ccache.exe | Select-Object -First 1).DirectoryName
+          echo $dir >> $env:GITHUB_PATH
+          & "$dir\ccache.exe" --version
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@main
+        with:
+          key: release-windows-x86_64
+          max-size: 500M
+          install: 'no'
+
+      - name: Configure ccache remote storage
+        env:
+          QUERY_FARM_VCPKG_TOKEN: ${{ secrets.QUERY_FARM_VCPKG_TOKEN }}
+        run: |
+          @(
+            "CCACHE_BASEDIR=$env:GITHUB_WORKSPACE"
+            "CCACHE_NOHASHDIR=1"
+            "CCACHE_SLOPPINESS=time_macros,include_file_mtime,pch_defines"
+            "CCACHE_COMPILERCHECK=content"
+          ) | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          if ($env:QUERY_FARM_VCPKG_TOKEN) {
+            "CCACHE_REMOTE_STORAGE=http://haybarn-vcpkg-cache.rusty-bb6.workers.dev/ccache|bearer-token=$env:QUERY_FARM_VCPKG_TOKEN|connect-timeout=10000|operation-timeout=30000" |
+              Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          }
+
+      - name: Fetch pinned SQLite
+        run: .\scripts\fetch_sqlite.ps1
+
+      # No -G, same reasoning as ci.yml's build-and-test-windows job: let
+      # CMake auto-detect the installed VS generator rather than
+      # hardcoding one. -A x64 stays explicit.
+      - name: Configure (Release)
+        run: >
+          cmake --preset release -A x64
+          -DVGI_CPP_SOURCE_DIR="$env:GITHUB_WORKSPACE\vgi-cpp"
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+      - name: Build
+        run: cmake --build build-release --config Release --parallel
+
+      # Windows has no single self-contained artifact the way .so/.dylib
+      # are (see this file's top comment) - stage vgi.dll plus every DLL
+      # CMakeLists.txt's own POST_BUILD step already copied next to it
+      # (the vcpkg-built Arrow/OpenSSL/etc. runtime, config-aware so this
+      # picks up the Release build's DLLs, not Debug's).
+      - name: Package
+        run: |
+          $version = if ($env:GITHUB_REF_NAME) { $env:GITHUB_REF_NAME } else { "dev" }
+          $stage = "vgi-sqlite-$version-windows-x86_64"
+          New-Item -ItemType Directory -Path $stage | Out-Null
+          Copy-Item build-release\Release\vgi.dll $stage\
+          Copy-Item build-release\Release\*.dll $stage\ -Exclude vgi.dll -ErrorAction SilentlyContinue
+          Copy-Item LICENSE, README.md $stage\
+          tar czf "$stage.tar.gz" $stage
+          $hash = (Get-FileHash "$stage.tar.gz" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $stage.tar.gz" | Out-File -FilePath "$stage.tar.gz.sha256" -Encoding ascii -NoNewline
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vgi-sqlite-windows-x86_64
+          path: |
+            vgi-sqlite-*.tar.gz
+            vgi-sqlite-*.tar.gz.sha256
+          if-no-files-found: error
+
   publish:
     # Only on an actual tag push - workflow_dispatch is for validating the
     # build matrix itself without cutting a release.
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    needs: [build, build-windows]
     runs-on: ubuntu-24.04
     permissions:
       contents: write

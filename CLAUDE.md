@@ -104,6 +104,14 @@ environment. Real, accepted limits: no musl/Alpine build, and a glibc
 version floor from whatever the build image itself ships (not solved via
 an older build container, to match `vgi-c++`'s own CI posture) - see
 `.github/workflows/release.yml`'s own comments for the full reasoning.
+**Windows is a genuine exception to "statically linked," not an oversight**:
+vcpkg's default `x64-windows` triplet is dynamically linked (DLLs), so the
+Windows release artifact is `vgi.dll` plus every vcpkg-built runtime DLL
+CMakeLists.txt's own `POST_BUILD` step already copies alongside it,
+staged and archived together - not a single self-contained file the way
+the POSIX artifacts are. `release.yml`'s `build-windows` job (a separate
+job, not a matrix row - same PowerShell-throughout reasoning as `ci.yml`'s
+`build-and-test-windows`) builds and packages this.
 
 **CI/release builds also use two shared, already-warm caches** hosted on
 the same Cloudflare-Worker-fronted R2 bucket
@@ -134,6 +142,16 @@ uv run pytest -v
 Override the worker with `VGI_TEST_WORKER` (matches `vgi/Makefile`'s
 convention) or the extension path with `VGI_SQLITE_EXTENSION`. See
 `test/integration/README.md` for the coverage table.
+
+`test_http_transport.py`'s 7 tests need `VGI_PYTHON`'s checkout synced
+with `uv sync --extra http` - without it, `vgi-fixture-http` fails to
+start and `conftest.py`'s `http_worker_base_url` fixture SKIPS (not
+fails) the whole file, since a missing optional extra isn't a real
+failure. This was a genuine, previously-unnoticed CI coverage gap
+(neither `ci.yml` job ran that `--extra http` sync, so these tests
+always showed as skipped in CI despite the feature being implemented and
+tested locally) - fixed in both `ci.yml` jobs; local runs need the same
+flag manually if you want this file to actually run rather than skip.
 
 `test/integration/` remains the test source of record (see "Definition of
 done" above) - `test/sqllogictest/` is a separate, complementary tool that
@@ -389,25 +407,42 @@ shared/pooled connection use.
   times" contract. Discovery (`catalog_client.{h,cpp}`'s
   `CatalogPlainTableFunction`) is filtered to `input_from_args=false &&
   !has_finalize && !HasTableTypedArgument(...)` to exclude both
-  `table_in_out` shapes. **Known, not-yet-handled gap, and the actual
-  mechanism is worse than earlier notes here claimed** (corrected after
-  actually reading the registration loop, not from memory): arity-
-  overloading (e.g. `geo_encode`/`geo_encode3` sharing one SQL name)
-  does NOT fail cleanly on the second registration. Every table/function
+  `table_in_out` shapes. **Arity-overloading (e.g. `geo_encode`/
+  `geo_encode3` sharing one SQL name) is fixed, not silently
+  order-dependent** - it previously wasn't: every table/function
   `vgi_attach()` registers goes through an unconditional `DROP TABLE IF
   EXISTS <name>` immediately followed by `CREATE VIRTUAL TABLE <name>
-  ...`, with no existence check or dedup anywhere in the loop - so when
-  two overloads produce the same generated name, the SECOND one's `DROP`
-  silently removes the FIRST one's already-successfully-registered vtab,
-  then its own `CREATE` succeeds cleanly in its place. Whichever overload
-  the worker's own catalog listing (`catalog_schema_contents_functions`)
-  happens to return LAST for that schema is the one that ends up
-  callable - silently, no error - and that discovery order is entirely
-  worker-defined (passed straight through with no client-side sorting or
-  dedup in `SchemaContentsPlainTableFunctions`/
-  `SchemaContentsTableInOutFunctions`). Not deterministic or documented
-  from this driver's own perspective; `overload` stays a structural skip
-  category in the sqllogictest corpus for exactly this reason.
+  ...`, with no existence check or dedup, so when two overloads produced
+  the same generated name the SECOND one's `DROP` silently removed the
+  FIRST one's already-registered vtab, whichever overload the worker's
+  own catalog listing happened to return LAST for that schema winning -
+  silently, no error, and worker-order-dependent (`SELECT vgi_attach(...)`
+  gave no signal about which overload you'd actually get). Fixed in
+  `extension.cpp`'s `VgiAttachFunc`: a `std::set<std::string>` of
+  already-registered `<catalog>_<function>` names, tracked across the
+  WHOLE attach call (every schema, not just one - this flat namespace has
+  no schema component either, so a cross-schema collision is just as real
+  as a within-schema one), shared between the `vgi_table_in_out` and
+  `vgi_table_function` registration loops (the two that actually generate
+  this name shape) - a name already in the set is skipped with a
+  `sqlite3_log(SQLITE_WARNING, ...)` naming both the skipped function and
+  the collision, rather than silently DROP-replacing the earlier
+  registration. Net behavior change: FIRST-discovered overload of a given
+  name now wins (deterministic given a fixed worker catalog-listing
+  order) and the collision is now visible in the log, instead of
+  LAST-discovered winning silently - this doesn't make both overloads
+  queryable (no SQL mechanism exists to hang that on, since a `CREATE
+  VIRTUAL TABLE` name has no arity dimension - the actual, narrower gap
+  this section used to frame more broadly), but "which one wins, and did
+  it happen" is now answerable instead of undefined. Ordinary tables
+  (already schema-qualified, no arity ambiguity) and scalar/aggregate
+  functions (SQLite's own `(name, arg-count)`-keyed
+  `sqlite3_create_function_v2`, which naturally disambiguates by arity
+  and isn't vulnerable to this class of bug) are deliberately not part of
+  this tracking. `overload` stays a structural skip category in the
+  sqllogictest corpus - this fix makes the collision deterministic and
+  logged, not something a DuckDB-dialect corpus query could newly pass by
+  virtue of it.
 
 ### VGI splits (sequential redemption)
 

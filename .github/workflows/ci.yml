@@ -227,6 +227,16 @@ jobs:
       - name: Build
         run: cmake --build build --parallel
 
+      # Without --extra http, vgi-fixture-http (the HTTP-transport test
+      # fixture) fails to start - conftest.py's http_worker_base_url
+      # fixture then skips the whole test_http_transport.py file rather
+      # than failing (missing an optional extra isn't a real failure),
+      # which is why those 7 tests always showed as skipped in CI even
+      # though the feature itself is implemented and tested - a real,
+      # previously-unnoticed coverage gap, not a deliberate exclusion.
+      - name: Sync vgi-python dependencies (including the http extra)
+        run: uv sync --extra http --project "${{ github.workspace }}/vgi-python"
+
       # test/integration/ is the test source of record (see CLAUDE.md's
       # "Definition of done") - drives the built extension via Python's
       # stdlib sqlite3 module against a real vgi-fixture-worker, not mocks.
@@ -382,8 +392,12 @@ jobs:
       # job's first real GitHub-hosted run - a systemic first-run cost,
       # not anything specific to one fixture. Pre-syncing here, before any
       # launch: call happens, removes that race entirely.
-      - name: Pre-sync vgi-python dependencies
-        run: uv sync --project "${{ github.workspace }}\vgi-python"
+      #
+      # --extra http: see the Linux/macOS job's matching step - without
+      # it, vgi-fixture-http fails to start and test_http_transport.py's
+      # 7 tests are silently skipped rather than actually run.
+      - name: Pre-sync vgi-python dependencies (including the http extra)
+        run: uv sync --extra http --project "${{ github.workspace }}\vgi-python"
 
       - name: Run integration tests
         working-directory: test/integration
