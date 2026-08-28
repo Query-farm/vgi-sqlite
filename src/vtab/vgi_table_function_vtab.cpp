@@ -219,6 +219,14 @@ int ConnectImpl(sqlite3* db, void* pAux, int argc, const char* const* argv, sqli
             "vgi_table_function requires location=, catalog=, schema=, and function= arguments");
         return SQLITE_ERROR;
     }
+    // Optional: disambiguates which overload of `function_name` this
+    // particular vtab instance means - see vgi_table_in_out_vtab.cpp's
+    // matching comment and catalog_client.h's PlainTableFunctionGet
+    // comment for the full story (the identical bug class, same fix).
+    std::optional<int> arity;
+    if (auto arity_str = require("arity")) {
+        arity = std::stoi(*arity_str);
+    }
 
     auto vtab = std::make_unique<VgiTableFunctionVtab>();
     std::memset(&vtab->base, 0, sizeof(vtab->base));
@@ -230,7 +238,7 @@ int ConnectImpl(sqlite3* db, void* pAux, int argc, const char* const* argv, sqli
     try {
         auto checkout = pool->Acquire(*location, *catalog_name);
         VgiCatalogClient catalog(checkout->connection);
-        auto fn = catalog.PlainTableFunctionGet(checkout->attach_opaque_data, *schema_name, *function_name);
+        auto fn = catalog.PlainTableFunctionGet(checkout->attach_opaque_data, *schema_name, *function_name, arity);
         vtab->argument_schema = fn.argument_schema;
         vtab->supports_splits = fn.supports_splits;
 

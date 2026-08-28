@@ -408,41 +408,66 @@ shared/pooled connection use.
   `CatalogPlainTableFunction`) is filtered to `input_from_args=false &&
   !has_finalize && !HasTableTypedArgument(...)` to exclude both
   `table_in_out` shapes. **Arity-overloading (e.g. `geo_encode`/
-  `geo_encode3` sharing one SQL name) is fixed, not silently
-  order-dependent** - it previously wasn't: every table/function
-  `vgi_attach()` registers goes through an unconditional `DROP TABLE IF
-  EXISTS <name>` immediately followed by `CREATE VIRTUAL TABLE <name>
-  ...`, with no existence check or dedup, so when two overloads produced
-  the same generated name the SECOND one's `DROP` silently removed the
-  FIRST one's already-registered vtab, whichever overload the worker's
-  own catalog listing happened to return LAST for that schema winning -
-  silently, no error, and worker-order-dependent (`SELECT vgi_attach(...)`
-  gave no signal about which overload you'd actually get). Fixed in
-  `extension.cpp`'s `VgiAttachFunc`: a `std::set<std::string>` of
-  already-registered `<catalog>_<function>` names, tracked across the
-  WHOLE attach call (every schema, not just one - this flat namespace has
-  no schema component either, so a cross-schema collision is just as real
-  as a within-schema one), shared between the `vgi_table_in_out` and
-  `vgi_table_function` registration loops (the two that actually generate
-  this name shape) - a name already in the set is skipped with a
-  `sqlite3_log(SQLITE_WARNING, ...)` naming both the skipped function and
-  the collision, rather than silently DROP-replacing the earlier
-  registration. Net behavior change: FIRST-discovered overload of a given
-  name now wins (deterministic given a fixed worker catalog-listing
-  order) and the collision is now visible in the log, instead of
-  LAST-discovered winning silently - this doesn't make both overloads
-  queryable (no SQL mechanism exists to hang that on, since a `CREATE
-  VIRTUAL TABLE` name has no arity dimension - the actual, narrower gap
-  this section used to frame more broadly), but "which one wins, and did
-  it happen" is now answerable instead of undefined. Ordinary tables
-  (already schema-qualified, no arity ambiguity) and scalar/aggregate
-  functions (SQLite's own `(name, arg-count)`-keyed
-  `sqlite3_create_function_v2`, which naturally disambiguates by arity
-  and isn't vulnerable to this class of bug) are deliberately not part of
-  this tracking. `overload` stays a structural skip category in the
-  sqllogictest corpus - this fix makes the collision deterministic and
-  logged, not something a DuckDB-dialect corpus query could newly pass by
-  virtue of it.
+  `geo_encode3` sharing one worker-declared name) is real, both overloads
+  are independently queryable, and it's not hypothetical** - confirmed
+  against `example`'s own real `geo_encode` fixture
+  (`vgi-python/vgi/_test_fixtures/table_in_out.py`'s `GeoEncodeFunction`/
+  `GeoEncode3Function`, both `Meta.name = "geo_encode"`, different
+  arities), which this repo's own tests exercise directly
+  (`test_table_function.py::test_geo_encode_blended_function_still_works`).
+  Two structurally separate problems had to be solved, not one:
+  1. **Which SQL name does each overload get?** A `CREATE VIRTUAL TABLE`
+     name has no arity dimension the way a function call does - two
+     overloads generating the same `<catalog>_<function>` name used to
+     silently DROP-replace one another (whichever the worker's own
+     catalog listing returned LAST for that schema winning, with no
+     error). Fixed in `extension.cpp`'s `VgiAttachFunc`: `vgi_table_in_out`
+     and `vgi_table_function` candidates are only COLLECTED while
+     iterating schemas, then named/registered together in one pass after
+     every schema's candidates are known. A base name (`<catalog>_
+     <function>`) used by exactly one candidate keeps that name unchanged
+     (the common case, zero behavior change). A base name shared by 2+
+     candidates - a genuine arity overload - gets each suffixed by its own
+     SQL-callable positional argument count: `<catalog>_<function>_<N>args`
+     (`N` = `input_schema`/`argument_schema`'s total field count,
+     positional AND named together - see point 2 below for why that's the
+     right count). The one residual case arity alone can't resolve (same
+     name AND same argument count, differing only by type) still falls
+     back to first-discovered-wins with a `sqlite3_log(SQLITE_WARNING,
+     ...)` - a SQL identifier has no practical room to encode a full type
+     signature, and this is now genuinely rare rather than the common
+     case.
+  2. **How does `xConnect`/`xCreate` re-resolve the RIGHT overload later?**
+     A real, initially-missed bug this driver's own regression test
+     caught (not theoretical): `vgi_table_in_out_vtab.cpp`/
+     `vgi_table_function_vtab.cpp`'s `ConnectImpl` only has this module's
+     own `CREATE VIRTUAL TABLE ... USING vgi_table_in_out(location=...,
+     schema=..., function=...)` arguments to go on - it re-resolves the
+     function via `VgiCatalogClient::TableInOutFunctionGet`/
+     `PlainTableFunctionGet`, which searched by `function_name` ALONE.
+     With two overloads sharing that name, EVERY suffixed vtab (both
+     `_3args` and `_4args`) resolved to whichever overload that search
+     found first - the SQL name suffix disambiguated the table name, but
+     nothing threaded that same disambiguator back into the vtab's own
+     independent re-resolution. Fixed by adding an `arity=<N>` module
+     argument (`extension.cpp` now always emits it, not just when a name
+     was suffixed) and an `std::optional<int> arity` parameter on both
+     `*Get` functions (`catalog_client.{h,cpp}`) that additionally
+     requires `input_schema->num_fields() == *arity` when given - `Parse
+     ModuleArgs` in each vtab file reads it back and threads it through.
+     A vtab's actual query-time path (`xFilter`) was never affected by
+     this bug - it already uses the vtab's own cached `input_schema`/
+     `function_name` directly rather than re-resolving by name, so only
+     the one-time `ConnectImpl` schema-discovery call needed the fix.
+  Ordinary tables (already schema-qualified, no arity ambiguity) and
+  scalar/aggregate functions (SQLite's own `(name, arg-count)`-keyed
+  `sqlite3_create_function_v2`, which naturally disambiguates by arity)
+  don't need any of this. `overload` stays a structural skip category in
+  the sqllogictest corpus - this fix makes both overloads independently
+  correct and queryable under this driver's own generated names, not
+  something a DuckDB-dialect corpus query (which calls `geo_encode(...)`
+  unprefixed, unaware of this driver's naming scheme at all) could newly
+  pass by virtue of it.
 
 ### VGI splits (sequential redemption)
 

@@ -82,6 +82,21 @@ def test_geo_encode_blended_function_still_works(conn: sqlite3.Connection, worke
     """Not a plain table function (geo_encode is table_in_out/blended,
     vgi_table_in_out's own module) - included here as a quick cross-check
     that registering both modules' functions side by side in one
-    vgi_attach() call doesn't interfere with either."""
+    vgi_attach() call doesn't interfere with either.
+
+    example's real geo_encode is itself a genuine arity overload
+    (GeoEncodeFunction: lat, lon, +named precision -> 3 SQL-callable
+    positional args; GeoEncode3Function: lat, lon, alt, +named precision
+    -> 4) - confirmed against vgi-python's own _test_fixtures/table_in_out.py,
+    not a synthetic case. Before extension.cpp's arity-suffix fix, this
+    test happened to only ever exercise whichever overload won the
+    worker's own DROP+CREATE race for the bare "example_geo_encode" name
+    (undefined which one, silently) - now both are independently
+    registered and both are asserted on directly."""
     _attach(conn, worker_location)
-    assert conn.execute("SELECT geohash FROM example_geo_encode(52.0, 13.0, 4)").fetchall() == [("52.0:13.0",)]
+    assert conn.execute("SELECT geohash FROM example_geo_encode_3args(52.0, 13.0, 4)").fetchall() == [
+        ("52.0:13.0",)
+    ]
+    assert conn.execute("SELECT geohash FROM example_geo_encode_4args(52.0, 13.0, 100.0, 4)").fetchall() == [
+        ("52.0:13.0:100.0",)
+    ]

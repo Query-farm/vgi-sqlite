@@ -229,17 +229,30 @@ public:
         const std::string& attach_opaque_data, const std::string& schema_name);
 
     // Fallback for a vgi_table_in_out vtab's xConnect/xCreate, which only
-    // has (schema, function) from its own module arguments, not the full
-    // listing already enumerated at vgi_attach() time - re-lists and
-    // finds by name (there is no dedicated single-function catalog RPC;
-    // vgi's own DuckDB client resolves the same way, see the plan file's
-    // Milestone 9 research notes). Throws if no such eligible function is
-    // found (a real "no such table_in_out function" error, not a null/
-    // optional - matches VgiCatalogClient::TableGet's own contract for
-    // an unknown table).
+    // has (schema, function[, arity]) from its own module arguments, not
+    // the full listing already enumerated at vgi_attach() time - re-lists
+    // and finds by name (there is no dedicated single-function catalog
+    // RPC; vgi's own DuckDB client resolves the same way, see the plan
+    // file's Milestone 9 research notes). `arity`, when given, additionally
+    // requires `input_schema->num_fields() == *arity` - needed because two
+    // functions can share a worker-declared `function_name` with different
+    // arities (a real arity overload; vgi_attach() disambiguates this at
+    // the SQL-table-name level by suffixing, but that suffix isn't itself
+    // one of this module's own arguments, so xConnect/xCreate needs
+    // `arity` threaded through separately to resolve back to the SAME
+    // overload the suffixed name was generated from - a real bug found via
+    // this driver's own regression test, not theoretical: without it,
+    // EVERY overload of a shared name resolves to whichever one this list
+    // happens to return first, regardless of which suffixed vtab is
+    // asking). Throws if no such eligible function is found (a real "no
+    // such table_in_out function" error, not a null/optional - matches
+    // VgiCatalogClient::TableGet's own contract for an unknown table) -
+    // including when `arity` is given but doesn't match any candidate
+    // with that name.
     CatalogTableInOutFunction TableInOutFunctionGet(const std::string& attach_opaque_data,
                                                      const std::string& schema_name,
-                                                     const std::string& function_name);
+                                                     const std::string& function_name,
+                                                     std::optional<int> arity = std::nullopt);
 
     // Every plain, standalone table (generator) function registered in
     // `schema_name` that this driver can represent (see
@@ -253,12 +266,14 @@ public:
         const std::string& attach_opaque_data, const std::string& schema_name);
 
     // Fallback for a vgi_table_function vtab's xConnect/xCreate - same
-    // re-list-and-find-by-name contract as TableInOutFunctionGet (no
-    // dedicated single-function catalog RPC exists). Throws if no such
-    // eligible function is found.
+    // re-list-and-find-by-(name[, arity]) contract as
+    // TableInOutFunctionGet (no dedicated single-function catalog RPC
+    // exists) - see that function's own comment for why `arity` exists
+    // and what it disambiguates.
     CatalogPlainTableFunction PlainTableFunctionGet(const std::string& attach_opaque_data,
                                                      const std::string& schema_name,
-                                                     const std::string& function_name);
+                                                     const std::string& function_name,
+                                                     std::optional<int> arity = std::nullopt);
 
     // Write-path function resolution - only called for a table whose
     // CatalogTable::supports_insert/update/delete says the operation is

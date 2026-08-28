@@ -278,11 +278,19 @@ std::vector<CatalogTableInOutFunction> VgiCatalogClient::SchemaContentsTableInOu
 
 CatalogTableInOutFunction VgiCatalogClient::TableInOutFunctionGet(const std::string& attach_opaque_data,
                                                                    const std::string& schema_name,
-                                                                   const std::string& function_name) {
+                                                                   const std::string& function_name,
+                                                                   std::optional<int> arity) {
     for (auto& fn : SchemaContentsTableInOutFunctions(attach_opaque_data, schema_name)) {
-        if (fn.function_name == function_name) return fn;
+        if (fn.function_name != function_name) continue;
+        if (arity) {
+            int fn_arity = fn.input_schema ? fn.input_schema->num_fields() : 0;
+            if (fn_arity != *arity) continue;
+        }
+        return fn;
     }
-    throw std::runtime_error("no such table_in_out function '" + schema_name + "." + function_name + "'");
+    std::string what = "no such table_in_out function '" + schema_name + "." + function_name + "'";
+    if (arity) what += " with " + std::to_string(*arity) + " argument(s)";
+    throw std::runtime_error(what);
 }
 
 namespace {
@@ -336,11 +344,19 @@ std::vector<CatalogPlainTableFunction> VgiCatalogClient::SchemaContentsPlainTabl
 
 CatalogPlainTableFunction VgiCatalogClient::PlainTableFunctionGet(const std::string& attach_opaque_data,
                                                                    const std::string& schema_name,
-                                                                   const std::string& function_name) {
+                                                                   const std::string& function_name,
+                                                                   std::optional<int> arity) {
     for (auto& fn : SchemaContentsPlainTableFunctions(attach_opaque_data, schema_name)) {
-        if (fn.function_name == function_name) return fn;
+        if (fn.function_name != function_name) continue;
+        if (arity) {
+            int fn_arity = fn.argument_schema ? fn.argument_schema->num_fields() : 0;
+            if (fn_arity != *arity) continue;
+        }
+        return fn;
     }
-    throw std::runtime_error("no such table function '" + schema_name + "." + function_name + "'");
+    std::string what = "no such table function '" + schema_name + "." + function_name + "'";
+    if (arity) what += " with " + std::to_string(*arity) + " argument(s)";
+    throw std::runtime_error(what);
 }
 
 }  // namespace vgi_sqlite

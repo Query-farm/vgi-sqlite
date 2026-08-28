@@ -157,6 +157,18 @@ int ConnectImpl(sqlite3* db, void* pAux, int argc, const char* const* argv, sqli
             "vgi_table_in_out requires location=, catalog=, schema=, and function= arguments");
         return SQLITE_ERROR;
     }
+    // Optional: disambiguates which overload of `function_name` this
+    // particular vtab instance means, when vgi_attach() found more than
+    // one function sharing that worker-declared name with different
+    // arities (see catalog_client.h's TableInOutFunctionGet comment).
+    // Absent for a non-overloaded function - vgi_attach() always passes it
+    // now, but a hand-written CREATE VIRTUAL TABLE (or an older DDL string
+    // still in a database file's sqlite_master from before this argument
+    // existed) legitimately won't have it.
+    std::optional<int> arity;
+    if (auto arity_str = require("arity")) {
+        arity = std::stoi(*arity_str);
+    }
 
     auto vtab = std::make_unique<VgiTableInOutVtab>();
     std::memset(&vtab->base, 0, sizeof(vtab->base));
@@ -175,7 +187,7 @@ int ConnectImpl(sqlite3* db, void* pAux, int argc, const char* const* argv, sqli
         // comment on why binds aren't shared/cached across connections.
         auto checkout = pool->Acquire(*location, *catalog_name);
         VgiCatalogClient catalog(checkout->connection);
-        auto fn = catalog.TableInOutFunctionGet(checkout->attach_opaque_data, *schema_name, *function_name);
+        auto fn = catalog.TableInOutFunctionGet(checkout->attach_opaque_data, *schema_name, *function_name, arity);
         vtab->input_schema = fn.input_schema;
 
         TableInOutCaller caller(*pool, *location, *catalog_name, fn.schema_name, fn.function_name,

@@ -28,7 +28,12 @@ def test_attach_registers_both_functions_as_tables(
         row[0]
         for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
     }
-    assert {"row_transform_add_row", "row_transform_repeat_row"} <= names
+    # row_transform_add_row itself is deliberately NOT here - add_row is an
+    # arity overload (2-arg and 3-arg, see AddRow3Function's own comment
+    # in the fixture), so vgi_attach() suffixes both instead of registering
+    # a bare, ambiguous name - see test_arity_overload_gets_distinct_names.
+    assert {"row_transform_add_row_2args", "row_transform_add_row_3args", "row_transform_repeat_row"} <= names
+    assert "row_transform_add_row" not in names
 
 
 def test_literal_call(conn: sqlite3.Connection, row_transform_worker_location: str) -> None:
@@ -36,7 +41,7 @@ def test_literal_call(conn: sqlite3.Connection, row_transform_worker_location: s
     - same table-valued-function machinery, just with constant arguments
     instead of a correlated column."""
     _attach(conn, row_transform_worker_location)
-    assert conn.execute("SELECT * FROM row_transform_add_row(3, 4)").fetchall() == [(7,)]
+    assert conn.execute("SELECT * FROM row_transform_add_row_2args(3, 4)").fetchall() == [(7,)]
 
 
 def test_missing_argument_rejected_at_prepare_time(
@@ -49,7 +54,7 @@ def test_missing_argument_rejected_at_prepare_time(
     wrong-arity call to the worker."""
     _attach(conn, row_transform_worker_location)
     try:
-        conn.execute("SELECT * FROM row_transform_add_row(3)").fetchall()
+        conn.execute("SELECT * FROM row_transform_add_row_2args(3)").fetchall()
     except sqlite3.OperationalError as e:
         assert "no query solution" in str(e)
     else:
@@ -69,10 +74,26 @@ def test_correlated_call_one_row_per_input_row(
     conn.execute("CREATE TABLE pairs(x INTEGER, y INTEGER)")
     conn.executemany("INSERT INTO pairs VALUES (?, ?)", [(1, 2), (10, 20), (100, 200)])
     rows = conn.execute(
-        "SELECT pairs.x, pairs.y, t.sum FROM pairs, row_transform_add_row(pairs.x, pairs.y) AS t "
+        "SELECT pairs.x, pairs.y, t.sum FROM pairs, row_transform_add_row_2args(pairs.x, pairs.y) AS t "
         "ORDER BY pairs.x"
     ).fetchall()
     assert rows == [(1, 2, 3), (10, 20, 30), (100, 200, 300)]
+
+
+def test_arity_overload_gets_distinct_names(
+    conn: sqlite3.Connection, row_transform_worker_location: str
+) -> None:
+    """Regression test for extension.cpp's VgiAttachFunc arity-suffix
+    dispatch: AddRowFunction and AddRow3Function both declare the
+    worker-side name "add_row" but different arities (2 and 3) - a real
+    arity overload, not a synthetic one. Before this fix, an unconditional
+    DROP+CREATE per function meant whichever the worker's own catalog
+    listing returned LAST silently replaced the other; now both get their
+    own name (`_<N>args` suffix) and both are independently queryable and
+    correct."""
+    _attach(conn, row_transform_worker_location)
+    assert conn.execute("SELECT * FROM row_transform_add_row_2args(3, 4)").fetchall() == [(7,)]
+    assert conn.execute("SELECT * FROM row_transform_add_row_3args(3, 4, 5)").fetchall() == [(12,)]
 
 
 def test_one_input_row_can_produce_many_output_rows(

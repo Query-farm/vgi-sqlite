@@ -14,8 +14,10 @@
 // VFS registry, mutex objects), and two independently-initialized copies
 // in one process collide despite being the identical amalgamation
 // version. Not a portability nicety - it's required for correctness.
+#include <map>
 #include <set>
 #include <string>
+#include <vector>
 
 #include <sqlite3ext.h>
 SQLITE_EXTENSION_INIT1
@@ -216,26 +218,26 @@ void VgiAttachFunc(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
 
         // vgi_table_in_out and vgi_table_function both register into the
         // SAME flat "<catalog>_<function>" SQL table-name namespace (see
-        // each loop's own comment) with no per-arity dispatch available -
+        // each loop's own comment) with no NATURAL per-arity dispatch -
         // a CREATE VIRTUAL TABLE name is just a name, SQL has no overload
-        // resolution for it. Without this, an arity-overloaded function
-        // (e.g. geo_encode/geo_encode3 sharing one generated name) or two
-        // unrelated functions in different schemas that happen to
-        // generate the same name would silently replace one another
-        // (DROP + CREATE, no error) with whichever one the worker's own
-        // catalog listing returns LAST for that schema winning - entirely
-        // worker-order-dependent and undetectable from here. Tracked
-        // across the WHOLE attach call (every schema), matching this flat
-        // namespace's own actual scope - a collision two schemas apart is
-        // just as real as one within a single schema. Ordinary tables
-        // (schema-qualified "schema.table" names) and scalar/aggregate
-        // functions (SQLite's own (name, arg-count)-keyed
-        // sqlite3_create_function_v2, which naturally disambiguates by
-        // arity and isn't vulnerable to this) are deliberately not
-        // included here - see CLAUDE.md's "table_in_out and
-        // table_function" section for why this bug is specific to these
-        // two loops.
-        std::set<std::string> registered_function_table_names;
+        // resolution for it the way a function call has. Rather than
+        // silently let a later overload's DROP+CREATE replace an earlier
+        // one (worker-order-dependent, undetectable from here), both
+        // loops below only COLLECT their candidates while iterating
+        // schemas; the actual naming/registration happens in one unified
+        // pass afterward (see "Register table_in_out + plain table
+        // function candidates" below) that gives every genuine
+        // arity-overload its own name instead of picking a winner.
+        // Collected across the WHOLE attach call (every schema), matching
+        // this flat namespace's own actual scope - a collision two
+        // schemas apart is just as real as one within a single schema.
+        // Ordinary tables (schema-qualified "schema.table" names) and
+        // scalar/aggregate functions (SQLite's own (name, arg-count)-
+        // keyed sqlite3_create_function_v2, which already disambiguates
+        // by arity natively) don't need this - see CLAUDE.md's
+        // "table_in_out and table_function" section.
+        std::vector<CatalogTableInOutFunction> table_in_out_candidates;
+        std::vector<CatalogPlainTableFunction> plain_table_fn_candidates;
 
         for (const auto& schema : catalog.Schemas(checkout->attach_opaque_data)) {
             for (const auto& table : catalog.SchemaContentsTables(checkout->attach_opaque_data, schema.name)) {
@@ -350,49 +352,13 @@ void VgiAttachFunc(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
             // table, callable as a per-row-correlated table-valued
             // function (`SELECT * FROM t, "<catalog>_<function>"(t.x,
             // t.y)`, json_each(t.x)-style - see vtab/vgi_table_in_out_vtab.h).
-            // Same flat "<catalog>_<function>" naming as scalar/aggregate
-            // functions above - no collision risk, SQLite's table
-            // namespace and function namespace are separate. A CREATE
-            // VIRTUAL TABLE failure here (e.g. the throwaway schema-probe
-            // bind failing for a function this driver's type mapping
-            // can't fully represent) is skipped exactly like a table's
-            // own xConnect failure above, not fatal to the rest of the
-            // attach.
+            // Just collected here - see "Register table_in_out + plain
+            // table function candidates" below for the actual naming/
+            // registration, which needs every schema's candidates
+            // together first.
             for (const auto& fn :
                  catalog.SchemaContentsTableInOutFunctions(checkout->attach_opaque_data, schema.name)) {
-                std::string vtab_name = catalog_name + "_" + fn.function_name;
-                if (!registered_function_table_names.insert(vtab_name).second) {
-                    sqlite3_log(SQLITE_WARNING,
-                                "vgi_attach: skipping table_in_out function \"%s.%s\" - \"%s\" is "
-                                "already registered by another overload (arity-overloaded functions "
-                                "sharing one SQL name have no per-arity CREATE VIRTUAL TABLE dispatch; "
-                                "only the first-discovered overload of a given name is queryable)",
-                                schema.name.c_str(), fn.function_name.c_str(), vtab_name.c_str());
-                    ++skip_count;
-                    continue;
-                }
-                std::string quoted_vtab_name = SqlQuoteIdentifier(vtab_name);
-                std::string drop_sql = "DROP TABLE IF EXISTS " + quoted_vtab_name + ";";
-                std::string create_sql = "CREATE VIRTUAL TABLE " + quoted_vtab_name + " USING vgi_table_in_out(" +
-                                          "location=" + SqlQuote(location) +
-                                          ", catalog=" + SqlQuote(catalog_name) +
-                                          ", schema=" + SqlQuote(fn.schema_name) +
-                                          ", function=" + SqlQuote(fn.function_name) + ");";
-                char* err = nullptr;
-                if (sqlite3_exec(db, drop_sql.c_str(), nullptr, nullptr, &err) != SQLITE_OK) {
-                    std::string msg = "vgi_attach: " + (err ? std::string(err) : "drop failed");
-                    if (err) sqlite3_free(err);
-                    sqlite3_result_error(ctx, msg.c_str(), -1);
-                    return;
-                }
-                if (sqlite3_exec(db, create_sql.c_str(), nullptr, nullptr, &err) != SQLITE_OK) {
-                    sqlite3_log(SQLITE_WARNING, "vgi_attach: skipping table_in_out function \"%s\": %s",
-                                vtab_name.c_str(), err ? err : "create failed");
-                    if (err) sqlite3_free(err);
-                    ++skip_count;
-                    continue;
-                }
-                ++table_count;
+                table_in_out_candidates.push_back(fn);
             }
 
             // Plain, standalone table (generator) functions - e.g.
@@ -400,44 +366,121 @@ void VgiAttachFunc(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
             // virtual table, callable both as a literal call
             // (`SELECT * FROM "<catalog>_<function>"(1, 2)`) and, per-outer-
             // row correlated, the same way vgi_table_in_out's functions are
-            // (see vtab/vgi_table_function_vtab.h). Same flat naming/
-            // failure-handling as table_in_out functions above.
+            // (see vtab/vgi_table_function_vtab.h). Just collected here -
+            // same reason as table_in_out functions above.
             for (const auto& fn :
                  catalog.SchemaContentsPlainTableFunctions(checkout->attach_opaque_data, schema.name)) {
-                std::string vtab_name = catalog_name + "_" + fn.function_name;
-                if (!registered_function_table_names.insert(vtab_name).second) {
-                    sqlite3_log(SQLITE_WARNING,
-                                "vgi_attach: skipping table function \"%s.%s\" - \"%s\" is already "
-                                "registered by another overload (arity-overloaded functions sharing "
-                                "one SQL name have no per-arity CREATE VIRTUAL TABLE dispatch; only "
-                                "the first-discovered overload of a given name is queryable)",
-                                schema.name.c_str(), fn.function_name.c_str(), vtab_name.c_str());
-                    ++skip_count;
-                    continue;
-                }
-                std::string quoted_vtab_name = SqlQuoteIdentifier(vtab_name);
-                std::string drop_sql = "DROP TABLE IF EXISTS " + quoted_vtab_name + ";";
-                std::string create_sql = "CREATE VIRTUAL TABLE " + quoted_vtab_name + " USING vgi_table_function(" +
-                                          "location=" + SqlQuote(location) +
-                                          ", catalog=" + SqlQuote(catalog_name) +
-                                          ", schema=" + SqlQuote(fn.schema_name) +
-                                          ", function=" + SqlQuote(fn.function_name) + ");";
-                char* err = nullptr;
-                if (sqlite3_exec(db, drop_sql.c_str(), nullptr, nullptr, &err) != SQLITE_OK) {
-                    std::string msg = "vgi_attach: " + (err ? std::string(err) : "drop failed");
-                    if (err) sqlite3_free(err);
-                    sqlite3_result_error(ctx, msg.c_str(), -1);
-                    return;
-                }
-                if (sqlite3_exec(db, create_sql.c_str(), nullptr, nullptr, &err) != SQLITE_OK) {
-                    sqlite3_log(SQLITE_WARNING, "vgi_attach: skipping table function \"%s\": %s",
-                                vtab_name.c_str(), err ? err : "create failed");
-                    if (err) sqlite3_free(err);
-                    ++skip_count;
-                    continue;
-                }
-                ++table_count;
+                plain_table_fn_candidates.push_back(fn);
             }
+        }
+
+        // Register table_in_out + plain table function candidates: both
+        // share one flat "<catalog>_<function>" SQL table-name namespace
+        // (see the candidate-collection comment above), so naming has to
+        // consider them together, across every schema, before issuing any
+        // DDL. A base name used by exactly one candidate keeps that plain
+        // name unchanged (the overwhelmingly common case - no behavior
+        // change from before this arity-suffix scheme existed). A base
+        // name shared by 2+ candidates is a genuine arity overload (e.g.
+        // geo_encode/geo_encode3 both discovered as worker function name
+        // "geo_encode" with different declared arities): each gets its
+        // own name instead of one silently winning, by appending its own
+        // argument count - "<catalog>_<function>_<N>args". This can't
+        // collide with a worker's own separately-named overload (e.g. a
+        // literal "geo_encode3") since that already has a different
+        // function_name and was never grouped with "geo_encode" here in
+        // the first place.
+        struct FunctionVtabCandidate {
+            std::string schema_name;
+            std::string function_name;
+            const char* module_name;  // "vgi_table_in_out" or "vgi_table_function"
+            int arity;
+        };
+        std::vector<FunctionVtabCandidate> function_vtab_candidates;
+        function_vtab_candidates.reserve(table_in_out_candidates.size() + plain_table_fn_candidates.size());
+        for (const auto& fn : table_in_out_candidates) {
+            // A null schema (distinct from a present-but-zero-field one -
+            // see catalog_client.cpp's HasTableTypedArgument, which guards
+            // the same way) means the worker's response had no usable
+            // "arguments" field at all - treated as arity 0 rather than
+            // dereferenced blindly.
+            int arity = fn.input_schema ? fn.input_schema->num_fields() : 0;
+            function_vtab_candidates.push_back({fn.schema_name, fn.function_name, "vgi_table_in_out", arity});
+        }
+        for (const auto& fn : plain_table_fn_candidates) {
+            int arity = fn.argument_schema ? fn.argument_schema->num_fields() : 0;
+            function_vtab_candidates.push_back({fn.schema_name, fn.function_name, "vgi_table_function", arity});
+        }
+
+        std::map<std::string, int> base_name_counts;
+        for (const auto& c : function_vtab_candidates) {
+            ++base_name_counts[catalog_name + "_" + c.function_name];
+        }
+
+        // Guards the rare residual case: two candidates sharing both a
+        // base name AND an argument count (differing only by argument
+        // TYPE, which a SQL identifier has no practical room to encode) -
+        // arity alone can't disambiguate those, so the second one found
+        // is skipped with a clear warning naming the collision, the same
+        // deterministic-first-wins fallback this driver used for every
+        // overload before this arity-suffix scheme existed.
+        std::set<std::string> final_vtab_names;
+
+        for (const auto& c : function_vtab_candidates) {
+            std::string base_name = catalog_name + "_" + c.function_name;
+            std::string vtab_name = base_name_counts[base_name] == 1
+                                        ? base_name
+                                        : base_name + "_" + std::to_string(c.arity) + "args";
+            if (!final_vtab_names.insert(vtab_name).second) {
+                sqlite3_log(SQLITE_WARNING,
+                            "vgi_attach: skipping %s function \"%s.%s\" - \"%s\" is already registered "
+                            "by another overload with the same argument count (arity alone can't "
+                            "disambiguate overloads that also share their argument count; only the "
+                            "first-discovered one of these is queryable)",
+                            c.module_name, c.schema_name.c_str(), c.function_name.c_str(), vtab_name.c_str());
+                ++skip_count;
+                continue;
+            }
+            if (vtab_name != base_name) {
+                sqlite3_log(SQLITE_NOTICE,
+                            "vgi_attach: \"%s.%s\" (%s) registered as \"%s\", not \"%s\" - %d functions "
+                            "named \"%s\" were discovered with different argument counts (an arity "
+                            "overload), so each was given its own name instead of one silently winning",
+                            c.schema_name.c_str(), c.function_name.c_str(), c.module_name, vtab_name.c_str(),
+                            base_name.c_str(), base_name_counts[base_name], c.function_name.c_str());
+            }
+            std::string quoted_vtab_name = SqlQuoteIdentifier(vtab_name);
+            std::string drop_sql = "DROP TABLE IF EXISTS " + quoted_vtab_name + ";";
+            // `arity=` is always passed, not just when `vtab_name` got
+            // suffixed - the suffix disambiguates the SQL TABLE name, but
+            // xConnect/xCreate re-resolves the underlying function
+            // independently (it only has this module's own arguments to
+            // go on, not vgi_attach()'s own discovery-time context), so it
+            // needs the SAME disambiguator threaded through explicitly or
+            // it can't tell which overload THIS particular vtab instance
+            // should bind to - see catalog_client.h's TableInOutFunctionGet/
+            // PlainTableFunctionGet comment for the full story (a real bug
+            // this driver's own regression test caught, not theoretical).
+            std::string create_sql = "CREATE VIRTUAL TABLE " + quoted_vtab_name + " USING " +
+                                      std::string(c.module_name) + "(" + "location=" + SqlQuote(location) +
+                                      ", catalog=" + SqlQuote(catalog_name) + ", schema=" + SqlQuote(c.schema_name) +
+                                      ", function=" + SqlQuote(c.function_name) +
+                                      ", arity=" + SqlQuote(std::to_string(c.arity)) + ");";
+            char* err = nullptr;
+            if (sqlite3_exec(db, drop_sql.c_str(), nullptr, nullptr, &err) != SQLITE_OK) {
+                std::string msg = "vgi_attach: " + (err ? std::string(err) : "drop failed");
+                if (err) sqlite3_free(err);
+                sqlite3_result_error(ctx, msg.c_str(), -1);
+                return;
+            }
+            if (sqlite3_exec(db, create_sql.c_str(), nullptr, nullptr, &err) != SQLITE_OK) {
+                sqlite3_log(SQLITE_WARNING, "vgi_attach: skipping %s function \"%s\": %s", c.module_name,
+                            vtab_name.c_str(), err ? err : "create failed");
+                if (err) sqlite3_free(err);
+                ++skip_count;
+                continue;
+            }
+            ++table_count;
         }
     } catch (const std::exception& e) {
         sqlite3_result_error(ctx, e.what(), -1);

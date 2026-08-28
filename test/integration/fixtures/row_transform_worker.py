@@ -26,13 +26,18 @@ test/integration/fixtures/row_transform_worker.py [--unix PATH]
 vgi-fixture-worker's own convention) - `Worker.main()` handles all of
 that CLI surface generically.
 
-Two functions, both registered under the `row_transform` catalog's
+Three functions, all registered under the `row_transform` catalog's
 default `main` schema:
 
   - `add_row(x, y)` -> one row, `{sum: x+y}` - the ordinary 1-input-row
     -> 1-output-row case (a per-row-correlated table function computing
     something from its correlated arguments, the "table-valued function"
     version of an ordinary scalar function call).
+  - `add_row(x, y, z)` (`AddRow3Function`) -> one row, `{sum: x+y+z}` -
+    deliberately shares its worker-declared name with the function above
+    but a different arity, a real arity overload used to test
+    vgi_attach()'s arity-suffix disambiguation (extension.cpp's
+    VgiAttachFunc) against a real worker.
   - `repeat_row(value, n)` -> `n` rows, each `{value: value}` - the
     1-input-row -> N-output-rows case this driver's design specifically
     needed to confirm was already supported with no protocol-level
@@ -95,6 +100,45 @@ class AddRowFunction(RowTransformFunction[_AddRowArgs]):
 
 
 @dataclass(frozen=True)
+class _AddRow3Args:
+    x: Annotated[int, Arg(0, doc="first addend, per row")]
+    y: Annotated[int, Arg(1, doc="second addend, per row")]
+    z: Annotated[int, Arg(2, doc="third addend, per row")]
+
+
+class AddRow3Function(RowTransformFunction[_AddRow3Args]):
+    """`add_row(x, y, z)` -> one row of `{sum: x + y + z}` per correlated call.
+
+    Deliberately shares its worker-declared Meta.name ("add_row") with
+    AddRowFunction above but a different arity (3 args, not 2) - a real
+    arity overload. Exists specifically to test vgi_attach()'s
+    arity-suffix disambiguation (extension.cpp's VgiAttachFunc) against a
+    real worker, not just reason about it from code review -
+    test_table_in_out.py::test_arity_overload_gets_distinct_names asserts
+    on it directly.
+    """
+
+    class Meta:
+        name = "add_row"
+        description = "per-row x+y+z, same worker name as add_row's 2-arg overload"
+
+    @classmethod
+    def on_bind(cls, params: BindParams[_AddRow3Args]) -> BindResponse:
+        return BindResponse(output_schema=pa.schema([pa.field("sum", pa.int64())]))
+
+    @classmethod
+    def process(
+        cls,
+        params: ProcessParams[_AddRow3Args],
+        state: None,
+        batch: pa.RecordBatch,
+        out: OutputCollector,
+    ) -> None:
+        total = pc.add(pc.add(batch.column("x"), batch.column("y")), batch.column("z"))
+        out.emit(pa.RecordBatch.from_arrays([total], schema=params.output_schema))
+
+
+@dataclass(frozen=True)
 class _RepeatRowArgs:
     # Named distinctly from the output column ("repeated") on purpose -
     # an output column and a HIDDEN input-argument column can't share a
@@ -147,7 +191,7 @@ class RowTransformWorker(Worker):
     # worker, which needs table-specific catalog behavior this probe
     # doesn't (this catalog registers no tables at all, only functions).
     catalog_name = CATALOG_NAME
-    functions = [AddRowFunction, RepeatRowFunction]
+    functions = [AddRowFunction, AddRow3Function, RepeatRowFunction]
 
 
 if __name__ == "__main__":
