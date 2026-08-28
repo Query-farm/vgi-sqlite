@@ -385,11 +385,10 @@ void VgiAttachFunc(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
         // geo_encode/geo_encode3 both discovered as worker function name
         // "geo_encode" with different declared arities): each gets its
         // own name instead of one silently winning, by appending its own
-        // argument count - "<catalog>_<function>_<N>args". This can't
-        // collide with a worker's own separately-named overload (e.g. a
-        // literal "geo_encode3") since that already has a different
-        // function_name and was never grouped with "geo_encode" here in
-        // the first place.
+        // argument count - "<catalog>_<function>_<N>". This can't collide
+        // with a worker's own separately-named overload (e.g. a literal
+        // "geo_encode3") since that already has a different function_name
+        // and was never grouped with "geo_encode" here in the first place.
         struct FunctionVtabCandidate {
             std::string schema_name;
             std::string function_name;
@@ -428,9 +427,8 @@ void VgiAttachFunc(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
 
         for (const auto& c : function_vtab_candidates) {
             std::string base_name = catalog_name + "_" + c.function_name;
-            std::string vtab_name = base_name_counts[base_name] == 1
-                                        ? base_name
-                                        : base_name + "_" + std::to_string(c.arity) + "args";
+            std::string vtab_name =
+                base_name_counts[base_name] == 1 ? base_name : base_name + "_" + std::to_string(c.arity);
             if (!final_vtab_names.insert(vtab_name).second) {
                 sqlite3_log(SQLITE_WARNING,
                             "vgi_attach: skipping %s function \"%s.%s\" - \"%s\" is already registered "

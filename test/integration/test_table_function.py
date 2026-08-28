@@ -94,9 +94,9 @@ def test_geo_encode_blended_function_still_works(conn: sqlite3.Connection, worke
     (undefined which one, silently) - now both are independently
     registered and both are asserted on directly."""
     _attach(conn, worker_location)
-    assert conn.execute("SELECT geohash FROM example_geo_encode_3args(52.0, 13.0, 4)").fetchall() == [
+    assert conn.execute("SELECT geohash FROM example_geo_encode_3(52.0, 13.0, 4)").fetchall() == [
         ("52.0:13.0",)
     ]
-    assert conn.execute("SELECT geohash FROM example_geo_encode_4args(52.0, 13.0, 100.0, 4)").fetchall() == [
+    assert conn.execute("SELECT geohash FROM example_geo_encode_4(52.0, 13.0, 100.0, 4)").fetchall() == [
         ("52.0:13.0:100.0",)
     ]

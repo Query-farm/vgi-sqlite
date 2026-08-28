@@ -428,7 +428,7 @@ shared/pooled connection use.
      <function>`) used by exactly one candidate keeps that name unchanged
      (the common case, zero behavior change). A base name shared by 2+
      candidates - a genuine arity overload - gets each suffixed by its own
-     SQL-callable positional argument count: `<catalog>_<function>_<N>args`
+     SQL-callable positional argument count: `<catalog>_<function>_<N>`
      (`N` = `input_schema`/`argument_schema`'s total field count,
      positional AND named together - see point 2 below for why that's the
      right count). The one residual case arity alone can't resolve (same
@@ -446,8 +446,8 @@ shared/pooled connection use.
      function via `VgiCatalogClient::TableInOutFunctionGet`/
      `PlainTableFunctionGet`, which searched by `function_name` ALONE.
      With two overloads sharing that name, EVERY suffixed vtab (both
-     `_3args` and `_4args`) resolved to whichever overload that search
-     found first - the SQL name suffix disambiguated the table name, but
+     `_3` and `_4`) resolved to whichever overload that search found
+     first - the SQL name suffix disambiguated the table name, but
      nothing threaded that same disambiguator back into the vtab's own
      independent re-resolution. Fixed by adding an `arity=<N>` module
      argument (`extension.cpp` now always emits it, not just when a name
