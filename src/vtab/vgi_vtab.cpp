@@ -460,13 +460,16 @@ int xFilter(sqlite3_vtab_cursor* base_cursor, int, const char* idxStr, int argc,
         // itself (observed against vgi-fixture-worker's
         // filter_echo_table - the table lives in "data", its
         // filter_echo_table_scan function is registered under "main").
-        // BindRequest.schema_name exists to disambiguate a function name
-        // registered in more than one schema; leaving it null (as here)
-        // is exactly what asks the worker to fall back to a cross-schema
-        // lookup by name instead, which every fixture table this driver
-        // has scanned so far resolves correctly through. Revisit only if
-        // a real name collision across schemas turns up.
-        cursor->scanner->Bind(*vtab->table.scan_function, /*schema_name=*/std::nullopt,
+        // Prefer the function's OWN schema (scan_function->schema_name,
+        // protocol 1.5.0's ScanFunctionResult.schema_name - see
+        // catalog_client.h's field comment) when the worker reported it;
+        // only fall back to nullopt (asking the worker to cross-schema-
+        // resolve by bare name) for a pre-1.5.0 worker that never sent it.
+        // That fallback isn't a protocol guarantee every worker honors - a
+        // real one (vgi-rust) refuses an unqualified bind outright - so
+        // sending the real schema whenever it's known is the correct
+        // behavior now, not just a defensive nicety.
+        cursor->scanner->Bind(*vtab->table.scan_function, vtab->table.scan_function->schema_name,
                              vtab->pool->CurrentTransactionOpaqueData(vtab->location, vtab->catalog_name));
         std::vector<int64_t> projection_ids(cursor->projected_columns.begin(),
                                              cursor->projected_columns.end());

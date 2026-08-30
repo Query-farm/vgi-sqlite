@@ -232,9 +232,32 @@ shared/pooled connection use.
   `WrapAsArgsStruct` always builds exactly one struct row regardless of the
   source's row count.
 - **A table's backing scan function isn't necessarily registered in the
-  same schema as the table itself.** `Bind()` passes `schema_name` as
-  `nullopt` deliberately, to trigger VGI's own cross-schema fallback lookup
-  - not the table's schema.
+  same schema as the table itself.** Confirmed against a real, non-
+  hypothetical case: `example`'s own `data.numbers` table scans via
+  `sequence`, an unscoped table function that lives in `main`, not `data`.
+  Before protocol 1.5.0, `catalog_table_scan_function_get`'s response gave
+  the client no way to learn a function's real schema at all, so `Bind()`
+  passed `schema_name` as `nullopt` deliberately, relying on a worker's
+  own cross-schema-by-bare-name fallback lookup - not a protocol
+  guarantee every worker honors (a real one, `vgi-rust`, refuses an
+  unqualified bind outright once it started enforcing this). Fixed now
+  that the gap is closed: `ScanFunctionResult`/`ScanBranch` gained an
+  additive, nullable `schema_name` field in protocol 1.5.0
+  (`ce77ce2` in vgi-python), and `Bind()` prefers it
+  (`ScanFunction::schema_name`, read via `wire::get_optional_string` in
+  `ParseScanFunction`) over `nullopt` whenever the worker reports it -
+  falling back to the old nullopt-triggers-fallback-lookup behavior only
+  for a pre-1.5.0 worker that never sends the field. **Found and fixed
+  end-to-end by testing against a genuinely different worker
+  implementation, not just vgi-python's own** - the first vgi-rust-side
+  attempt at populating this field (during the same investigation)
+  naively reused the requesting table's own schema instead of resolving
+  where the function is actually registered, which is exactly the
+  cross-schema case this fix exists for and would have silently gotten
+  it wrong for exactly `data.numbers`/`sequence` - caught immediately by
+  a real end-to-end query, not a unit test. The correct fix (already
+  released upstream in vgi-rust independently, v0.32.0) resolves a
+  function's real home schema from the worker's own scope registry.
 - **A function that hasn't declared `projection_pushdown` support silently
   ignores `InitRequest.projection_ids` and returns every column anyway.**
   `xColumn` checks the *actual returned batch's width* against the

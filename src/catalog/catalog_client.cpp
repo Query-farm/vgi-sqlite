@@ -63,6 +63,7 @@ ScanFunction ParseScanFunction(const std::shared_ptr<arrow::RecordBatch>& scan_f
     // exactly "no splits", not an error. See catalog_client.h's
     // ScanFunction::supports_splits comment.
     fn.supports_splits = wire::get_optional_bool(scan_function_info, "supports_splits").value_or(false);
+    fn.schema_name = wire::get_optional_string(scan_function_info, "schema_name");
     return fn;
 }
 

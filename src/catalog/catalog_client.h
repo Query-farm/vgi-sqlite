@@ -40,6 +40,23 @@ struct ScanFunction {
     // of the ordinary single whole-scan init - see that file's comment for
     // the full design and the protocol source this was built against.
     bool supports_splits = false;
+    // Catalog schema this function is registered in (protocol 1.5.0's
+    // ScanFunctionResult.schema_name, added specifically to close the gap
+    // this field exists for: BindRequest.schema_name previously had to be
+    // sent as nullopt for a fallback-bound table function - since neither
+    // TableGet nor TableScanFunctionGet's response told the client which
+    // schema the resolved function actually lives in - relying on every
+    // worker supporting a cross-schema-by-bare-name fallback lookup for a
+    // null schema_name. Most workers tolerate that (vgi-python's own
+    // reference worker does), but it's not a protocol guarantee - a worker
+    // is entitled to reject an ambiguous/unqualified bind outright (a real
+    // one does: vgi-rust's dispatcher refuses any bind with no schema_name
+    // unless it's a COPY handler or an explicitly-unlisted function).
+    // std::nullopt for a pre-1.5.0 worker (the field is simply absent from
+    // its response) or a native/format branch with no VGI-side schema of
+    // its own - Bind() falls back to the old nullopt-triggers-fallback-
+    // lookup behavior in exactly those cases, unchanged.
+    std::optional<std::string> schema_name;
     // When true, arguments_ipc_bytes is ALREADY a wrapped one-row
     // {args: struct<...>} batch (VGI's BindRequest.arguments wire shape
     // directly - "positional_N"/"named_<name>" struct fields) and
