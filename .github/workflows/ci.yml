@@ -45,12 +45,14 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: Query-farm/vgi-cpp
+          ref: v0.13.1
           path: vgi-cpp
 
       - name: Check out vgi-rpc-cpp
         uses: actions/checkout@v4
         with:
           repository: Query-farm/vgi-rpc-cpp
+          ref: v0.11.0
           path: vgi-rpc-c++
 
       # vgi-python (public) - source of the fixture worker test/integration
@@ -59,6 +61,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: Query-farm/vgi-python
+          ref: v0.48.2
           path: vgi-python
 
       - name: Install uv
@@ -274,18 +277,21 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: Query-farm/vgi-cpp
+          ref: v0.13.1
           path: vgi-cpp
 
       - name: Check out vgi-rpc-cpp
         uses: actions/checkout@v4
         with:
           repository: Query-farm/vgi-rpc-cpp
+          ref: v0.11.0
           path: vgi-rpc-c++
 
       - name: Check out vgi-python
         uses: actions/checkout@v4
         with:
           repository: Query-farm/vgi-python
+          ref: v0.48.2
           path: vgi-python
 
       - name: Install uv
