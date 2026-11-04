@@ -40,6 +40,11 @@ std::shared_ptr<arrow::Array> optional_binary_or_null(const std::optional<std::v
     return finish(b, "optional binary");
 }
 
+std::shared_ptr<arrow::Array> schema_path_or_null(const std::optional<std::string>& schema_name) {
+    return schema_name ? vgi::BuildStringListScalar({*schema_name})
+                       : vgi::BuildOptionalStringListScalar(std::nullopt);
+}
+
 }  // namespace
 
 std::shared_ptr<arrow::RecordBatch> BuildAggregateBindRequest(
@@ -54,7 +59,8 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateBindRequest(
         arrow::field("settings", arrow::binary(), true),
         arrow::field("secrets", arrow::binary(), true),
         arrow::field("attach_opaque_data", arrow::binary(), true),
-        arrow::field("schema_name", arrow::utf8(), true),
+        arrow::field("schema_path", arrow::list(arrow::utf8()), true),
+        arrow::field("argument_names", arrow::list(arrow::utf8()), true),
     });
     std::vector<std::shared_ptr<arrow::Array>> arrays = {
         vgi::BuildStringScalar(function_name),
@@ -63,7 +69,8 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateBindRequest(
         optional_binary_or_null(std::nullopt),  // settings
         optional_binary_or_null(std::nullopt),  // secrets
         optional_binary_or_null(attach_opaque_data),
-        vgi::BuildOptionalStringScalar(schema_name),
+        schema_path_or_null(schema_name),
+        vgi::BuildOptionalStringListScalar(std::nullopt),  // argument_names: positional only
     };
     return arrow::RecordBatch::Make(schema, 1, arrays);
 }
@@ -98,14 +105,14 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateUpdateRequest(
         arrow::field("execution_id", arrow::binary(), false),
         arrow::field("input_batch", arrow::binary(), false),
         arrow::field("attach_opaque_data", arrow::binary(), true),
-        arrow::field("schema_name", arrow::utf8(), true),
+        arrow::field("schema_path", arrow::list(arrow::utf8()), true),
     });
     std::vector<std::shared_ptr<arrow::Array>> arrays = {
         vgi::BuildStringScalar(function_name),
         binary_required(execution_id),
         binary_required(input_batch_ipc_bytes),
         optional_binary_or_null(attach_opaque_data),
-        vgi::BuildOptionalStringScalar(schema_name),
+        schema_path_or_null(schema_name),
     };
     return arrow::RecordBatch::Make(schema, 1, arrays);
 }
@@ -120,7 +127,7 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateFinalizeRequest(
         arrow::field("group_ids_batch", arrow::binary(), false),
         arrow::field("output_schema", arrow::binary(), false),
         arrow::field("attach_opaque_data", arrow::binary(), true),
-        arrow::field("schema_name", arrow::utf8(), true),
+        arrow::field("schema_path", arrow::list(arrow::utf8()), true),
     });
     std::vector<std::shared_ptr<arrow::Array>> arrays = {
         vgi::BuildStringScalar(function_name),
@@ -128,7 +135,7 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateFinalizeRequest(
         binary_required(group_ids_batch_ipc_bytes),
         binary_required(output_schema_bytes),
         optional_binary_or_null(attach_opaque_data),
-        vgi::BuildOptionalStringScalar(schema_name),
+        schema_path_or_null(schema_name),
     };
     return arrow::RecordBatch::Make(schema, 1, arrays);
 }
@@ -153,14 +160,14 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateDestructorRequest(
         arrow::field("execution_id", arrow::binary(), false),
         arrow::field("group_ids_batch", arrow::binary(), false),
         arrow::field("attach_opaque_data", arrow::binary(), true),
-        arrow::field("schema_name", arrow::utf8(), true),
+        arrow::field("schema_path", arrow::list(arrow::utf8()), true),
     });
     std::vector<std::shared_ptr<arrow::Array>> arrays = {
         vgi::BuildStringScalar(function_name),
         binary_required(execution_id),
         binary_required(group_ids_batch_ipc_bytes),
         optional_binary_or_null(attach_opaque_data),
-        vgi::BuildOptionalStringScalar(schema_name),
+        schema_path_or_null(schema_name),
     };
     return arrow::RecordBatch::Make(schema, 1, arrays);
 }

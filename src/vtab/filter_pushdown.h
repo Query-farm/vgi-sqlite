@@ -1,19 +1,21 @@
 // © Copyright 2026 Query Farm LLC - https://query.farm
 //
 // WHERE-constraint pushdown: translates SQLite's xBestIndex constraints
-// into VGI's "hybrid JSON + Arrow" InitRequest.pushdown_filters wire
-// format (vgi-python's docs/filter-pushdown.md) - a JSON array describing
-// filter structure/operators plus an Arrow RecordBatch carrying the typed
-// constant values.
+// into VGI Filter Encoding v2 (vgi-python's
+// docs/protocol/vgi-filter-encoding-v2-spec.md) for
+// InitRequest.pushdown_filters - a JSON snapshot document describing filter
+// structure plus an Arrow RecordBatch carrying the typed literal values.
 //
-// Conservative by design: every pushed-down constraint is still left for
-// SQLite to re-check itself (aConstraintUsage[i].omit is never set) - a
-// worker that doesn't apply a filter it declared support for, or a bug in
-// this encoder, degrades to "did the pushdown work for nothing" rather
-// than "wrong query results". Only comparison operators (=, !=, <, <=, >,
-// >=) and IS [NOT] NULL are pushed; LIKE/GLOB/REGEXP/MATCH/IS/ISNOT and
-// anything on a column whose Arrow type isn't a simple scalar (temporal,
-// decimal, nested) are left for SQLite to filter unassisted.
+// Every predicate is "advisory": SQLite re-checks each pushed constraint
+// itself (aConstraintUsage[i].omit is never set), which is exactly the
+// spec's condition for that mode, so a worker that ignores a predicate, or a
+// bug in this encoder, degrades to "did the pushdown work for nothing"
+// rather than "wrong query results". Each constraint is its own predicate,
+// which section 8.3 allows because none of these comparisons can throw. Only
+// comparison operators (=, !=, <, <=, >, >=) and IS [NOT] NULL are pushed;
+// LIKE/GLOB/REGEXP/MATCH/IS/ISNOT and anything on a column whose Arrow type
+// isn't a simple scalar (temporal, decimal, nested) are left for SQLite to
+// filter unassisted.
 #pragma once
 
 #include <memory>
@@ -46,35 +48,11 @@ std::vector<PushableConstraint> SelectPushableConstraints(sqlite3_index_info* in
 // constraints SelectPushableConstraints chose plus their now-known values
 // (argv, same order/length as `constraints`) - nullopt if none of them
 // could actually be encoded (e.g. every candidate turned out to need a
-// column type this encoder doesn't handle). `columns` is the table's
-// declared Arrow schema, used to type each value column exactly like its
-// target column (docs/filter-pushdown.md: "Arrow columns store filter
-// values (preserves exact types)"). Call from xFilter.
-//
-// `projected_columns` is xFilter's own decoded projection list (empty
-// means "every column, in declared order" - the same convention
-// cursor->projected_columns/xColumn's FetchedPosition already use).
-// Required to get `column_index` right: the wire format's
-// pushdown_filters.column_index isn't the table's declared column index
-// at all - it's that column's POSITION WITHIN THE PROJECTED OUTPUT the
-// worker is about to emit (confirmed against vgi's own DuckDB extension,
-// vgi_table_function_impl.cpp: "`col_idx` is the filter's position in the
-// projected column_ids and is sent as the wire `column_index`. The
-// worker applies ConstantFilter/InFilter by INDEX (`batch.column
-// (column_index)`)... this only resolves correctly because the worker
-// emits its output batch in the same projected order"). Found the hard
-// way against a real deployed worker (earthquakes, a Cloudflare Worker):
-// `SELECT mag, time FROM t WHERE mag >= 0` silently returned zero rows -
-// column_index was sent as 2 (mag's DECLARED index in a ~30-column
-// table) when the worker's own 2-column projected response only has
-// positions 0/1, so the filter compared the wrong column (or an
-// out-of-range one) against every row and never matched. `SELECT *`
-// (no narrowing - projected order coincides with declared order)
-// accidentally "worked" the whole time, which is why this went
-// unnoticed until a genuinely narrow projection exercised it.
+// column type this encoder doesn't handle). `columns` is the unprojected
+// schema the scan binds to: a v2 column_ref's column_index indexes that
+// schema, not the projected output batch. Call from xFilter.
 std::optional<std::string> EncodePushdownFilters(const std::shared_ptr<arrow::Schema>& columns,
                                                   const std::vector<PushableConstraint>& constraints,
-                                                  sqlite3_value** argv,
-                                                  const std::vector<int>& projected_columns);
+                                                  sqlite3_value** argv);
 
 }  // namespace vgi_sqlite

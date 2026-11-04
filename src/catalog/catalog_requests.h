@@ -26,7 +26,7 @@ namespace vgi_sqlite {
 // (vgi/protocol.py): name (required), options (an IPC-serialized RecordBatch
 // of ATTACH-option key/values, itself passed pre-encoded), data_version_spec
 // and implementation_version (semver constraints, unconstrained when
-// nullopt). client_capabilities is left null - a later phase's concern.
+// nullopt). See the definition for the capabilities it offers.
 std::shared_ptr<arrow::RecordBatch> BuildCatalogAttachRequest(
     const std::string& name, const std::optional<std::vector<uint8_t>>& options_ipc_bytes,
     const std::optional<std::string>& data_version_spec,

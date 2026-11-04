@@ -15,12 +15,12 @@
 // the same shared-connection stream conflicts that motivated
 // ScalarFunctionCaller's own per-call checkout (see connection_pool.h).
 //
-// return_chunks is always false: no RETURNING support. SQLite's xUpdate
+// result_mode is always "count": no RETURNING support. SQLite's xUpdate
 // contract has no channel to hand modified row *data* back into the
 // query the way an SQL RETURNING clause would - it only wants a
 // success/failure and, for an INSERT, the new rowid via pRowid. VGI's
 // write functions default their bind() response to a plain
-// {count: int64} output schema when return_chunks=false (confirmed by
+// {count: int64} output schema for result_mode="count" (confirmed by
 // reading vgi-fixture-worker's simple_writable fixture, e.g. SimpleInsert.
 // on_bind), so that's what this class always requests and parses.
 //

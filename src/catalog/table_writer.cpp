@@ -33,12 +33,12 @@ int64_t TableWriter::Write(const ScanFunction& write_function,
                            const std::optional<std::vector<uint8_t>>& transaction_opaque_data) {
     auto checkout = pool_.Acquire(location_, catalog_name_);
 
-    // return_chunks=false, on_conflict="throw": see the header's file
+    // result_mode="count", on_conflict="throw": see the header's file
     // comment on why no RETURNING support, and table_writer.h/vgi_vtab.cpp
     // on why ON CONFLICT translation isn't implemented (SQLite's own
     // UNIQUE-constraint enforcement on the underlying table already
     // surfaces a conflict as an error either way).
-    auto write_options_bytes = BuildWriteOptionsBytes(/*return_chunks=*/false, /*on_conflict=*/"throw");
+    auto write_options_bytes = BuildWriteOptionsBytes(/*result_mode=*/"count", /*on_conflict=*/"throw");
     auto args_bytes = BuildWriteArgsStruct(write_function.arguments_ipc_bytes, write_options_bytes);
     auto input_schema_bytes = to_bytes(wire::encode_schema(input_row->schema()));
 

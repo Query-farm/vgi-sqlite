@@ -240,6 +240,12 @@ void VgiAttachFunc(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
         std::vector<CatalogPlainTableFunction> plain_table_fn_candidates;
 
         for (const auto& schema : catalog.Schemas(checkout->attach_opaque_data)) {
+            if (schema.path.size() != 1) {
+                sqlite3_log(SQLITE_WARNING, "vgi_attach: skipping schema \"%s\": nested schema paths are not supported",
+                            schema.name.c_str());
+                ++skip_count;
+                continue;
+            }
             for (const auto& table : catalog.SchemaContentsTables(checkout->attach_opaque_data, schema.name)) {
                 std::string vtab_name = schema.name + "." + table.name;  // display/log use only - never embedded raw in SQL below
                 std::string quoted_vtab_name = SqlQuoteIdentifier(vtab_name);
