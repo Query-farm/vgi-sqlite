@@ -1,8 +1,6 @@
 // © Copyright 2026 Query Farm LLC - https://query.farm
 #include "vtab/filter_pushdown.h"
 
-#include <algorithm>
-
 #include <arrow/api.h>
 #include <nlohmann/json.hpp>
 
@@ -16,7 +14,7 @@ SQLITE_EXTENSION_INIT3
 namespace vgi_sqlite {
 namespace {
 
-// eq/ne/gt/ge/lt/le per docs/filter-pushdown.md; nullopt for anything not
+// Comparison ops per the v2 spec's section 5.4; nullopt for anything not
 // pushed (LIKE/GLOB/REGEXP/MATCH/IS/ISNOT/FUNCTION/LIMIT/OFFSET - left for
 // SQLite to evaluate itself, same as it always does for a constraint this
 // vtab doesn't claim at all).
@@ -44,7 +42,17 @@ bool IsNullCheck(unsigned char op) {
 std::shared_ptr<arrow::Array> BuildValueArray(sqlite3_value* value,
                                                const std::shared_ptr<arrow::DataType>& column_type) {
     switch (column_type->id()) {
-        case arrow::Type::BOOL:
+        case arrow::Type::BOOL: {
+            // Bind-compatibility: a BOOLEAN column needs a BOOLEAN literal.
+            // SQLite has no boolean class, so only 0 and 1 have a faithful one.
+            if (sqlite3_value_type(value) != SQLITE_INTEGER) return nullptr;
+            const auto integer = sqlite3_value_int64(value);
+            if (integer != 0 && integer != 1) return nullptr;
+            arrow::BooleanBuilder builder;
+            if (!builder.Append(integer == 1).ok()) return nullptr;
+            auto result = builder.Finish();
+            return result.ok() ? result.ValueUnsafe() : nullptr;
+        }
         case arrow::Type::INT8:
         case arrow::Type::INT16:
         case arrow::Type::INT32:
@@ -112,11 +120,10 @@ std::vector<PushableConstraint> SelectPushableConstraints(sqlite3_index_info* in
 
 std::optional<std::string> EncodePushdownFilters(const std::shared_ptr<arrow::Schema>& columns,
                                                   const std::vector<PushableConstraint>& constraints,
-                                                  sqlite3_value** argv,
-                                                  const std::vector<int>& projected_columns) {
+                                                  sqlite3_value** argv) {
     if (!columns || constraints.empty()) return std::nullopt;
 
-    auto filter_spec = nlohmann::json::array();
+    auto predicates = nlohmann::json::array();
     arrow::FieldVector value_fields;
     std::vector<std::shared_ptr<arrow::Array>> value_arrays;
 
@@ -125,54 +132,58 @@ std::optional<std::string> EncodePushdownFilters(const std::shared_ptr<arrow::Sc
         if (constraint.column_index >= columns->num_fields()) continue;
         const auto& field = columns->field(constraint.column_index);
 
-        // See the header's file comment: the wire format wants this
-        // column's position within the PROJECTED output, not its
-        // declared table index - identical when nothing was narrowed
-        // (empty projected_columns means "every column, declared order").
-        int wire_column_index = constraint.column_index;
-        if (!projected_columns.empty()) {
-            auto it = std::find(projected_columns.begin(), projected_columns.end(), constraint.column_index);
-            if (it == projected_columns.end()) continue;  // shouldn't happen - colUsed already covers WHERE columns
-            wire_column_index = static_cast<int>(it - projected_columns.begin());
-        }
-
-        nlohmann::json entry;
-        entry["column_name"] = field->name();
-        entry["column_index"] = wire_column_index;
-
+        const nlohmann::json column_ref = {{"node", "column_ref"},
+                                           {"column_index", constraint.column_index},
+                                           {"column_name", field->name()}};
+        nlohmann::json expression;
         if (IsNullCheck(constraint.op)) {
-            entry["type"] = constraint.op == SQLITE_INDEX_CONSTRAINT_ISNULL ? "is_null" : "is_not_null";
+            expression = {{"node", "is_null"},
+                          {"expression", column_ref},
+                          {"negated", constraint.op == SQLITE_INDEX_CONSTRAINT_ISNOTNULL}};
         } else {
             auto value_array = BuildValueArray(argv[i], field->type());
             if (!value_array) continue;  // type mismatch/unsupported - skip this one, not the batch
-            entry["type"] = "constant";
-            entry["op"] = *OpName(constraint.op);
-            entry["value_ref"] = value_arrays.size();
-            value_fields.push_back(arrow::field("_val_" + std::to_string(value_arrays.size()), value_array->type()));
+            const auto value_ref = value_arrays.size();
+            expression = {{"node", "comparison"},
+                          {"op", *OpName(constraint.op)},
+                          {"left", column_ref},
+                          {"right", {{"node", "literal"}, {"value_ref", value_ref}}}};
+            value_fields.push_back(arrow::field("value_" + std::to_string(value_ref), value_array->type()));
             value_arrays.push_back(value_array);
         }
-        filter_spec.push_back(std::move(entry));
+        predicates.push_back({{"id", "query:" + std::to_string(predicates.size())},
+                              {"revision", 0},
+                              {"mode", "advisory"},
+                              {"source", "query"},
+                              {"expression", std::move(expression)}});
     }
 
-    if (filter_spec.empty()) return std::nullopt;
+    if (predicates.empty()) return std::nullopt;
 
-    // filter_spec's field metadata carries the format version
-    // (docs/filter-pushdown.md); the value it names as a plain JSON
-    // string, one column, followed by the referenced _val_N columns.
+    const nlohmann::json document = {{"encoding", "vgi.filters.v2"},
+                                     {"semantics", "vgi.duckdb.standard.v1"},
+                                     {"kind", "snapshot"},
+                                     {"predicates", std::move(predicates)}};
+
+    // Schema-level, not field-level, metadata. vgi.none.v1 is the right
+    // context: every predicate is a binary comparison or NULL test, and a
+    // vtab column has SQLite's default BINARY collation.
     auto metadata = std::make_shared<arrow::KeyValueMetadata>();
-    metadata->Append("vgi_filter_version", "1");
-    arrow::FieldVector fields = {arrow::field("filter_spec", arrow::utf8(), false, metadata)};
+    metadata->Append("vgi_filter_encoding", "vgi.filters.v2");
+    metadata->Append("vgi_filter_version", "2");
+    metadata->Append("vgi_evaluation_context", "vgi.none.v1");
+    arrow::FieldVector fields = {arrow::field("filter_spec", arrow::utf8(), false)};
     fields.insert(fields.end(), value_fields.begin(), value_fields.end());
 
     arrow::StringBuilder spec_builder;
-    if (!spec_builder.Append(filter_spec.dump()).ok()) return std::nullopt;
+    if (!spec_builder.Append(document.dump()).ok()) return std::nullopt;
     auto spec_result = spec_builder.Finish();
     if (!spec_result.ok()) return std::nullopt;
 
     std::vector<std::shared_ptr<arrow::Array>> arrays = {spec_result.ValueUnsafe()};
     arrays.insert(arrays.end(), value_arrays.begin(), value_arrays.end());
 
-    auto batch = arrow::RecordBatch::Make(arrow::schema(fields), 1, arrays);
+    auto batch = arrow::RecordBatch::Make(arrow::schema(fields, metadata), 1, arrays);
     return wire::encode_ipc(batch);
 }
 

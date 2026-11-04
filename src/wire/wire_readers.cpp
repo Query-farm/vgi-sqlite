@@ -94,6 +94,17 @@ std::optional<std::string> get_optional_binary(const std::shared_ptr<arrow::Reco
     if (auto wide = std::dynamic_pointer_cast<arrow::LargeBinaryArray>(arr)) {
         return wide->IsNull(0) ? std::nullopt : std::optional<std::string>(wide->GetString(0));
     }
+    // FunctionInfo interns its schema-valued fields as dictionary<int32, binary>.
+    if (auto encoded = std::dynamic_pointer_cast<arrow::DictionaryArray>(arr)) {
+        if (encoded->IsNull(0)) return std::nullopt;
+        auto values = std::dynamic_pointer_cast<arrow::BinaryArray>(encoded->dictionary());
+        if (!values) fail("field '" + field + "' is a dictionary of non-binary values");
+        const int64_t index = encoded->GetValueIndex(0);
+        if (index < 0 || index >= values->length()) {
+            fail("field '" + field + "' dictionary index " + std::to_string(index) + " is out of range");
+        }
+        return values->GetString(index);
+    }
     auto narrow = typed_column<arrow::BinaryArray>(batch, field, "binary or large_binary");
     if (narrow->IsNull(0)) return std::nullopt;
     return narrow->GetString(0);
@@ -205,6 +216,36 @@ std::vector<int64_t> get_int64_list(const std::shared_ptr<arrow::RecordBatch>& b
         if (!values->IsNull(i)) items.push_back(values->Value(i));
     }
     return items;
+}
+
+std::vector<std::string> get_string_list(const std::shared_ptr<arrow::RecordBatch>& batch,
+                                          const std::string& field) {
+    std::vector<std::string> items;
+    if (!has_column(batch, field)) return items;
+    auto list = std::dynamic_pointer_cast<arrow::ListArray>(column(batch, field));
+    if (!list) fail("field '" + field + "' is not a list");
+    if (list->length() == 0 || list->IsNull(0)) return items;
+    auto values = std::dynamic_pointer_cast<arrow::StringArray>(list->values());
+    if (!values) fail("field '" + field + "' is not a list of utf8");
+    for (int64_t i = list->value_offset(0); i < list->value_offset(1); ++i) {
+        if (!values->IsNull(i)) items.push_back(values->GetString(i));
+    }
+    return items;
+}
+
+std::optional<std::string> get_string_map_value(const std::shared_ptr<arrow::RecordBatch>& batch,
+                                                 const std::string& field, const std::string& key) {
+    if (!has_column(batch, field)) return std::nullopt;
+    auto map = std::dynamic_pointer_cast<arrow::MapArray>(column(batch, field));
+    if (!map) fail("field '" + field + "' is not a map");
+    if (map->length() == 0 || map->IsNull(0)) return std::nullopt;
+    auto keys = std::dynamic_pointer_cast<arrow::StringArray>(map->keys());
+    auto items = std::dynamic_pointer_cast<arrow::StringArray>(map->items());
+    if (!keys || !items) fail("field '" + field + "' is not a map of utf8 to utf8");
+    for (int64_t i = map->value_offset(0); i < map->value_offset(1); ++i) {
+        if (keys->GetString(i) == key && !items->IsNull(i)) return items->GetString(i);
+    }
+    return std::nullopt;
 }
 
 std::shared_ptr<arrow::RecordBatch> get_ipc(const std::shared_ptr<arrow::RecordBatch>& batch,

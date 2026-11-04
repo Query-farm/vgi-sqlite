@@ -8,6 +8,7 @@
 #include <utility>
 
 #include "rpc/launcher.h"
+#include "vgi/generated/vgi_protocol_names.hpp"
 #include "vgi/generated/vgi_protocol_version.hpp"
 
 namespace vgi_sqlite {
@@ -15,6 +16,7 @@ namespace {
 
 vgi_rpc::RpcClient ConnectUnixPath(const std::string& path) {
     vgi_rpc::RpcClientOptions options;
+    options.protocol = std::string(vgi::generated::VGI_PROTOCOL_NAME);
     options.protocol_version = std::string(vgi::generated::VGI_PROTOCOL_VERSION);
     return vgi_rpc::RpcClient::connect_unix(path, options);
 }
@@ -32,6 +34,7 @@ vgi_rpc::RpcClient ConnectUnixPath(const std::string& path) {
 vgi_rpc::RpcClient ConnectLauncherPath(const std::string& path) {
 #if defined(_WIN32)
     vgi_rpc::RpcClientOptions options;
+    options.protocol = std::string(vgi::generated::VGI_PROTOCOL_NAME);
     options.protocol_version = std::string(vgi::generated::VGI_PROTOCOL_VERSION);
     return vgi_rpc::RpcClient::connect_pipe(path, options);
 #else
@@ -187,6 +190,7 @@ VgiConnection VgiConnection::spawn(const std::vector<std::string>& argv) {
     // Stamped on every request; vgi_rpc's server enforces an exact
     // major.minor match at dispatch and fails the very first RPC on
     // mismatch, same as vgi's DuckDB extension does today.
+    options.protocol = std::string(vgi::generated::VGI_PROTOCOL_NAME);
     options.protocol_version = std::string(vgi::generated::VGI_PROTOCOL_VERSION);
     return VgiConnection(vgi_rpc::RpcClient::spawn(argv, options));
 }
@@ -234,6 +238,7 @@ VgiConnection VgiConnection::Connect(const std::string& location) {
     auto builder = vgi_rpc::HttpClient::builder(parsed.base_url);
     builder.config(config);
     // Same version-stamping rationale as spawn() above.
+    builder.protocol(std::string(vgi::generated::VGI_PROTOCOL_NAME));
     builder.protocol_version(std::string(vgi::generated::VGI_PROTOCOL_VERSION));
     if (parsed.bearer_token) {
         builder.header("Authorization", "Bearer " + *parsed.bearer_token);

@@ -104,7 +104,8 @@ std::shared_ptr<arrow::RecordBatch> BuildBindRequest(
         arrow::field("at_value", arrow::utf8(), true),
         arrow::field("copy_from", copy_from_type, true),
         arrow::field("copy_to", copy_to_type, true),
-        arrow::field("schema_name", arrow::utf8(), true),
+        arrow::field("schema_path", arrow::list(arrow::utf8()), true),
+        arrow::field("argument_names", arrow::list(arrow::utf8()), true),
     });
 
     std::vector<std::shared_ptr<arrow::Array>> arrays;
@@ -126,7 +127,9 @@ std::shared_ptr<arrow::RecordBatch> BuildBindRequest(
     arrays.push_back(vgi::BuildOptionalStringScalar(std::nullopt));  // at_value
     arrays.push_back(null_struct(copy_from_type));
     arrays.push_back(null_struct(copy_to_type));
-    arrays.push_back(vgi::BuildOptionalStringScalar(schema_name));
+    arrays.push_back(schema_name ? vgi::BuildStringListScalar({*schema_name})
+                                 : vgi::BuildOptionalStringListScalar(std::nullopt));
+    arrays.push_back(vgi::BuildOptionalStringListScalar(std::nullopt));  // argument_names: positional only
 
     return arrow::RecordBatch::Make(schema, 1, arrays);
 }

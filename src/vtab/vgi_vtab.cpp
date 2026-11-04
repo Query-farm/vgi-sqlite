@@ -425,14 +425,6 @@ int xFilter(sqlite3_vtab_cursor* base_cursor, int, const char* idxStr, int argc,
     auto* vtab = reinterpret_cast<VgiVtab*>(base_cursor->pVtab);
     auto decoded = DecodeIdxStr(idxStr);
     cursor->projected_columns = decoded.projected_columns;
-    // argv[i] holds the value for the constraint at argvIndex i+1 - the
-    // same order SelectPushableConstraints assigned them in, so
-    // decoded.constraints and argv line up positionally.
-    std::optional<std::string> pushdown_filters;
-    if (!decoded.constraints.empty() && static_cast<int>(decoded.constraints.size()) <= argc) {
-        pushdown_filters =
-            EncodePushdownFilters(vtab->table.columns, decoded.constraints, argv, decoded.projected_columns);
-    }
     // Mutually exclusive with the constraints branch above (xBestIndex
     // only claims LIMIT when `constraints` was empty), so argv[0] is never
     // ambiguous between "the limit value" and "the first constraint's
@@ -460,19 +452,24 @@ int xFilter(sqlite3_vtab_cursor* base_cursor, int, const char* idxStr, int argc,
         // itself (observed against vgi-fixture-worker's
         // filter_echo_table - the table lives in "data", its
         // filter_echo_table_scan function is registered under "main").
-        // Prefer the function's OWN schema (scan_function->schema_name,
-        // protocol 1.5.0's ScanFunctionResult.schema_name - see
-        // catalog_client.h's field comment) when the worker reported it;
-        // only fall back to nullopt (asking the worker to cross-schema-
-        // resolve by bare name) for a pre-1.5.0 worker that never sent it.
-        // That fallback isn't a protocol guarantee every worker honors - a
-        // real one (vgi-rust) refuses an unqualified bind outright - so
-        // sending the real schema whenever it's known is the correct
-        // behavior now, not just a defensive nicety.
+        // Use the function's OWN schema (ScanFunctionResult.schema_path - see
+        // catalog_client.h's field comment) when the worker reported it: a
+        // real worker (vgi-rust) refuses an unqualified bind outright.
         cursor->scanner->Bind(*vtab->table.scan_function, vtab->table.scan_function->schema_name,
                              vtab->pool->CurrentTransactionOpaqueData(vtab->location, vtab->catalog_name));
         std::vector<int64_t> projection_ids(cursor->projected_columns.begin(),
                                              cursor->projected_columns.end());
+        // argv[i] holds the value for the constraint at argvIndex i+1 - the
+        // same order SelectPushableConstraints assigned them in, so
+        // decoded.constraints and argv line up positionally. Encoded against
+        // the bound schema, not vtab->table.columns: a v2 column_ref must
+        // name the function's own column, and a table's column names can
+        // differ from its scan function's (they correspond by position, as
+        // projection_ids and xColumn already assume).
+        std::optional<std::string> pushdown_filters;
+        if (!decoded.constraints.empty() && static_cast<int>(decoded.constraints.size()) <= argc) {
+            pushdown_filters = EncodePushdownFilters(cursor->scanner->output_schema(), decoded.constraints, argv);
+        }
         cursor->scanner->Init(projection_ids, pushdown_filters, row_limit);
         cursor->rowid = 0;
         // Fetching the very first batch is just as capable of throwing (an
@@ -623,7 +620,7 @@ int DoInsert(VgiVtab* vtab, int argc, sqlite3_value** argv, sqlite3_int64* pRowi
         writer.Write(insert_fn, /*schema_name=*/std::nullopt, row_result.ValueUnsafe(),
                      vtab->pool->CurrentTransactionOpaqueData(vtab->location, vtab->catalog_name));
 
-        // No real new-rowid to report: return_chunks=false means the
+        // No real new-rowid to report: result_mode="count" means the
         // worker only echoes back a count, and even with a real
         // is_row_id column mapped for UPDATE/DELETE (see FindRowIdColumn),
         // a freshly-inserted row's assigned identity still isn't known

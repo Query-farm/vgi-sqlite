@@ -178,6 +178,15 @@ std::shared_ptr<arrow::Array> BuildStringListScalar(const std::vector<std::strin
     return FinishArray(list_builder, "string_list");
 }
 
+std::shared_ptr<arrow::Array> BuildOptionalStringListScalar(
+    const std::optional<std::vector<std::string>>& values) {
+    if (values) return BuildStringListScalar(*values);
+    auto value_builder = std::make_shared<arrow::StringBuilder>();
+    arrow::ListBuilder list_builder(arrow::default_memory_pool(), value_builder);
+    CheckStatus(list_builder.AppendNull(), "append null string list");
+    return FinishArray(list_builder, "optional_string_list");
+}
+
 std::shared_ptr<arrow::Array> BuildBinaryListScalar(
     const std::vector<std::vector<uint8_t>>& values) {
     auto value_builder = std::make_shared<arrow::BinaryBuilder>();

@@ -24,6 +24,13 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # unless it explicitly overrides POSITION_INDEPENDENT_CODE itself.
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+# <windows.h> defines min, max and (through wingdi.h) ERROR as macros, which
+# breaks vgi-rpc-c++'s std::numeric_limits<...>::max() calls and its
+# LogLevel::ERROR. Set here so it reaches the sibling checkouts added below.
+if(WIN32)
+    add_compile_definitions(NOMINMAX NOGDI)
+endif()
+
 # ── vgi-c++ (worker SDK, also home of the public generated protocol
 #    schemas this client links against) and, transitively through it,
 #    vgi-rpc-c++ (the Arrow-IPC RPC transport: RpcClient et al.) ──────────

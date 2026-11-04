@@ -23,20 +23,20 @@ std::shared_ptr<arrow::Array> finish(BuilderType& builder, const char* what) {
 
 }  // namespace
 
-std::vector<uint8_t> BuildWriteOptionsBytes(bool return_chunks, const std::string& on_conflict,
+std::vector<uint8_t> BuildWriteOptionsBytes(const std::string& result_mode, const std::string& on_conflict,
                                              const std::vector<std::string>& on_conflict_columns) {
     // Schema/field order/types mirror vgi's own vgi_physical_write.cpp
     // BuildWriteOptions exactly - plain utf8 for on_conflict, not
     // dictionary-encoded (unlike the protocol's own enum fields).
     auto schema = arrow::schema({
-        arrow::field("return_chunks", arrow::boolean()),
+        arrow::field("result_mode", arrow::utf8()),
         arrow::field("on_conflict", arrow::utf8()),
         arrow::field("on_conflict_columns", arrow::list(arrow::utf8())),
     });
 
-    arrow::BooleanBuilder return_chunks_builder;
-    check_ok(return_chunks_builder.Append(return_chunks), "append return_chunks");
-    auto return_chunks_arr = finish(return_chunks_builder, "return_chunks");
+    arrow::StringBuilder result_mode_builder;
+    check_ok(result_mode_builder.Append(result_mode), "append result_mode");
+    auto result_mode_arr = finish(result_mode_builder, "result_mode");
 
     arrow::StringBuilder on_conflict_builder;
     check_ok(on_conflict_builder.Append(on_conflict), "append on_conflict");
@@ -48,7 +48,7 @@ std::vector<uint8_t> BuildWriteOptionsBytes(bool return_chunks, const std::strin
     for (const auto& col : on_conflict_columns) check_ok(values->Append(col), "append on_conflict_column");
     auto columns_arr = finish(list_builder, "on_conflict_columns");
 
-    auto batch = arrow::RecordBatch::Make(schema, 1, {return_chunks_arr, on_conflict_arr, columns_arr});
+    auto batch = arrow::RecordBatch::Make(schema, 1, {result_mode_arr, on_conflict_arr, columns_arr});
     auto encoded = wire::encode_ipc(batch);
     return {encoded.begin(), encoded.end()};
 }

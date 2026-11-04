@@ -66,6 +66,8 @@ std::shared_ptr<arrow::Array> BuildOptionalEnumArray(
 // list<T> single-row builders, always non-null (no field in the protocol
 // declares a nullable list<simple-scalar>).
 std::shared_ptr<arrow::Array> BuildStringListScalar(const std::vector<std::string>& values);
+std::shared_ptr<arrow::Array> BuildOptionalStringListScalar(
+    const std::optional<std::vector<std::string>>& values);
 std::shared_ptr<arrow::Array> BuildBinaryListScalar(
     const std::vector<std::vector<uint8_t>>& values);
 std::shared_ptr<arrow::Array> BuildInt32ListScalar(const std::vector<int32_t>& values);

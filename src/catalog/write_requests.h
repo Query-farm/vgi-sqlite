@@ -20,13 +20,13 @@
 namespace vgi_sqlite {
 
 // IPC-encodes VGI's write_options convention: a 1-row
-// {return_chunks: bool, on_conflict: utf8, on_conflict_columns: list<utf8>}
-// batch. This driver only ever requests return_chunks=false (plain
+// {result_mode: utf8, on_conflict: utf8, on_conflict_columns: list<utf8>}
+// batch. This driver only ever requests result_mode="count" (plain
 // row-count responses - see TableWriter's file comment on why RETURNING
 // support is out of scope for now) and on_conflict="throw" (SQLite's own
 // UNIQUE-constraint semantics are enforced by the underlying table anyway;
 // ON CONFLICT clause translation isn't implemented).
-std::vector<uint8_t> BuildWriteOptionsBytes(bool return_chunks, const std::string& on_conflict,
+std::vector<uint8_t> BuildWriteOptionsBytes(const std::string& result_mode, const std::string& on_conflict,
                                              const std::vector<std::string>& on_conflict_columns = {});
 
 // Repackages a write function's flat positional-argument batch

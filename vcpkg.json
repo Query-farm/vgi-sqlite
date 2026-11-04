@@ -9,6 +9,7 @@
         "compute"
       ]
     },
+    "curl",
     "libsodium",
     "nlohmann-json",
     {

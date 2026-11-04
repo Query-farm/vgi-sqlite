@@ -55,7 +55,7 @@ public:
     // init: opens the producer stream. projection_ids, if non-empty, asks
     // the worker to emit only those column indices (into output_schema());
     // pushdown_filters, if set, is an IPC-encoded WHERE-constraint batch
-    // in VGI's hybrid JSON+Arrow format (see vtab/filter_pushdown.h);
+    // in VGI Filter Encoding v2 (see vtab/filter_pushdown.h);
     // row_limit, if set, is a plain "stop after this many rows" hint
     // (InitRequest.row_limit). None of the three is a correctness
     // guarantee, only a hint a function may ignore (see xColumn's

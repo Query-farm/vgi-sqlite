@@ -75,6 +75,14 @@ std::vector<std::string> get_binary_list(const std::shared_ptr<arrow::RecordBatc
 std::vector<int64_t> get_int64_list(const std::shared_ptr<arrow::RecordBatch>& batch,
                                      const std::string& field);
 
+// A `list<utf8>` field. Empty for a missing column or a NULL list.
+std::vector<std::string> get_string_list(const std::shared_ptr<arrow::RecordBatch>& batch,
+                                          const std::string& field);
+
+// A `map<utf8, utf8>` field's entry for `key`, or nullopt when absent.
+std::optional<std::string> get_string_map_value(const std::shared_ptr<arrow::RecordBatch>& batch,
+                                                 const std::string& field, const std::string& key);
+
 // Read a dataclass field: the named binary column, decoded.
 std::shared_ptr<arrow::RecordBatch> get_ipc(const std::shared_ptr<arrow::RecordBatch>& batch,
                                              const std::string& field);

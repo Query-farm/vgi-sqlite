@@ -13,6 +13,25 @@ namespace gen = ::vgi::generated;
 
 std::vector<uint8_t> to_bytes(const std::string& s) { return {s.begin(), s.end()}; }
 
+// SQLite has a flat namespace, so this driver addresses a schema by a single
+// name. The wire carries a path; nested paths are skipped at discovery (see
+// CatalogSchema::path), which leaves every name used here one component long.
+std::vector<std::string> SchemaPathOf(const std::string& schema_name) { return {schema_name}; }
+
+std::string JoinPath(const std::vector<std::string>& path) {
+    std::string joined;
+    for (const auto& part : path) {
+        if (!joined.empty()) joined += ".";
+        joined += part;
+    }
+    return joined;
+}
+
+std::string SchemaNameOf(const std::shared_ptr<arrow::RecordBatch>& item, const std::string& fallback) {
+    auto path = wire::get_string_list(item, "schema_path");
+    return path.empty() ? fallback : JoinPath(path);
+}
+
 // Every non-void RPC answers the same one-column outer envelope,
 // {result: binary}; for a Result-kind method (every method this client
 // calls, so far) those bytes are a self-describing IPC stream of the
@@ -39,12 +58,14 @@ CatalogTable ParseTableInfo(const std::string& schema_name_fallback,
                             const std::shared_ptr<arrow::RecordBatch>& info) {
     CatalogTable table;
     table.name = wire::get_string(info, "name");
-    table.schema_name = wire::get_optional_string(info, "schema_name").value_or(schema_name_fallback);
+    table.schema_name = SchemaNameOf(info, schema_name_fallback);
     table.comment = wire::get_optional_string(info, "comment");
     table.columns = wire::get_schema(info, "columns");
-    table.supports_insert = wire::get_bool(info, "supports_insert");
-    table.supports_update = wire::get_bool(info, "supports_update");
-    table.supports_delete = wire::get_bool(info, "supports_delete");
+    // write_result_modes: an absent operation is an unsupported one. Any mode
+    // implies "count", the only one this driver requests.
+    table.supports_insert = wire::get_string_map_value(info, "write_result_modes", "insert").has_value();
+    table.supports_update = wire::get_string_map_value(info, "write_result_modes", "update").has_value();
+    table.supports_delete = wire::get_string_map_value(info, "write_result_modes", "delete").has_value();
     if (auto v = wire::get_optional_int64(info, "cardinality_estimate")) table.cardinality_estimate = *v;
     if (auto v = wire::get_optional_int64(info, "cardinality_max")) table.cardinality_max = *v;
     if (auto scan_fn = wire::get_ipc(info, "scan_function")) table.scan_function = ParseScanFunction(scan_fn);
@@ -63,7 +84,9 @@ ScanFunction ParseScanFunction(const std::shared_ptr<arrow::RecordBatch>& scan_f
     // exactly "no splits", not an error. See catalog_client.h's
     // ScanFunction::supports_splits comment.
     fn.supports_splits = wire::get_optional_bool(scan_function_info, "supports_splits").value_or(false);
-    fn.schema_name = wire::get_optional_string(scan_function_info, "schema_name");
+    if (auto path = wire::get_string_list(scan_function_info, "schema_path"); !path.empty()) {
+        fn.schema_name = JoinPath(path);
+    }
     return fn;
 }
 
@@ -79,7 +102,7 @@ CatalogAttachResult VgiCatalogClient::Attach(const std::string& catalog_name,
     attach.attach_opaque_data = wire::get_binary(result, "attach_opaque_data");
     attach.supports_transactions = wire::get_bool(result, "supports_transactions");
     attach.supports_time_travel = wire::get_bool(result, "supports_time_travel");
-    attach.default_schema = wire::get_string(result, "default_schema");
+    attach.default_schema = wire::get_optional_string(result, "default_schema").value_or("");
     attach.resolved_data_version = wire::get_optional_string(result, "resolved_data_version");
     attach.resolved_implementation_version =
         wire::get_optional_string(result, "resolved_implementation_version");
@@ -121,7 +144,8 @@ std::vector<CatalogSchema> VgiCatalogClient::Schemas(const std::string& attach_o
     std::vector<CatalogSchema> schemas;
     for (const auto& item : Items(result)) {
         CatalogSchema schema;
-        schema.name = wire::get_string(item, "name");
+        schema.path = wire::get_string_list(item, "path");
+        schema.name = JoinPath(schema.path);
         schema.comment = wire::get_optional_string(item, "comment");
         schemas.push_back(std::move(schema));
     }
@@ -131,7 +155,7 @@ std::vector<CatalogSchema> VgiCatalogClient::Schemas(const std::string& attach_o
 std::vector<CatalogTable> VgiCatalogClient::SchemaContentsTables(const std::string& attach_opaque_data,
                                                                   const std::string& schema_name) {
     auto params = gen::BuildCatalogSchemaContentsTablesParams(
-        to_bytes(attach_opaque_data), schema_name, /*transaction_opaque_data=*/std::nullopt);
+        to_bytes(attach_opaque_data), SchemaPathOf(schema_name), /*transaction_opaque_data=*/std::nullopt);
     auto result = Call(connection_, "catalog_schema_contents_tables", params);
     std::vector<CatalogTable> tables;
     for (const auto& item : Items(result)) tables.push_back(ParseTableInfo(schema_name, item));
@@ -141,7 +165,7 @@ std::vector<CatalogTable> VgiCatalogClient::SchemaContentsTables(const std::stri
 CatalogTable VgiCatalogClient::TableGet(const std::string& attach_opaque_data,
                                         const std::string& schema_name,
                                         const std::string& table_name) {
-    auto params = gen::BuildCatalogTableGetParams(to_bytes(attach_opaque_data), schema_name, table_name,
+    auto params = gen::BuildCatalogTableGetParams(to_bytes(attach_opaque_data), SchemaPathOf(schema_name), table_name,
                                                    /*at_unit=*/std::nullopt, /*at_value=*/std::nullopt,
                                                    /*transaction_opaque_data=*/std::nullopt);
     auto result = Call(connection_, "catalog_table_get", params);
@@ -161,7 +185,7 @@ ScanFunction VgiCatalogClient::TableScanFunctionGet(const std::string& attach_op
                                                      const std::string& schema_name,
                                                      const std::string& table_name) {
     auto params = gen::BuildCatalogTableScanFunctionGetParams(
-        to_bytes(attach_opaque_data), schema_name, table_name, /*at_unit=*/std::nullopt,
+        to_bytes(attach_opaque_data), SchemaPathOf(schema_name), table_name, /*at_unit=*/std::nullopt,
         /*at_value=*/std::nullopt, /*transaction_opaque_data=*/std::nullopt);
     // catalog_table_scan_function_get is a Binary-kind method: the outer
     // envelope's "result" bytes are the ScanFunctionResult payload
@@ -175,7 +199,7 @@ ScanFunction VgiCatalogClient::TableInsertFunctionGet(const std::string& attach_
                                                        const std::string& schema_name,
                                                        const std::string& table_name) {
     auto params = gen::BuildCatalogTableInsertFunctionGetParams(
-        to_bytes(attach_opaque_data), schema_name, table_name,
+        to_bytes(attach_opaque_data), SchemaPathOf(schema_name), table_name,
         /*transaction_opaque_data=*/std::nullopt, /*writable_branch_function_name=*/std::nullopt);
     auto result = Call(connection_, "catalog_table_insert_function_get", params);
     return ParseScanFunction(result);
@@ -185,7 +209,7 @@ ScanFunction VgiCatalogClient::TableUpdateFunctionGet(const std::string& attach_
                                                        const std::string& schema_name,
                                                        const std::string& table_name) {
     auto params = gen::BuildCatalogTableUpdateFunctionGetParams(
-        to_bytes(attach_opaque_data), schema_name, table_name,
+        to_bytes(attach_opaque_data), SchemaPathOf(schema_name), table_name,
         /*transaction_opaque_data=*/std::nullopt);
     auto result = Call(connection_, "catalog_table_update_function_get", params);
     return ParseScanFunction(result);
@@ -195,7 +219,7 @@ ScanFunction VgiCatalogClient::TableDeleteFunctionGet(const std::string& attach_
                                                        const std::string& schema_name,
                                                        const std::string& table_name) {
     auto params = gen::BuildCatalogTableDeleteFunctionGetParams(
-        to_bytes(attach_opaque_data), schema_name, table_name,
+        to_bytes(attach_opaque_data), SchemaPathOf(schema_name), table_name,
         /*transaction_opaque_data=*/std::nullopt);
     auto result = Call(connection_, "catalog_table_delete_function_get", params);
     return ParseScanFunction(result);
@@ -206,14 +230,14 @@ std::vector<CatalogFunction> SchemaContentsFunctionsByType(VgiConnection& connec
                                                             const std::string& attach_opaque_data,
                                                             const std::string& schema_name,
                                                             const std::string& type) {
-    auto params = gen::BuildCatalogSchemaContentsFunctionsParams(to_bytes(attach_opaque_data), schema_name, type,
+    auto params = gen::BuildCatalogSchemaContentsFunctionsParams(to_bytes(attach_opaque_data), SchemaPathOf(schema_name), type,
                                                                   /*transaction_opaque_data=*/std::nullopt);
     auto result = Call(connection, "catalog_schema_contents_functions", params);
     std::vector<CatalogFunction> functions;
     for (const auto& item : Items(result)) {
         CatalogFunction fn;
         fn.name = wire::get_string(item, "name");
-        fn.schema_name = wire::get_optional_string(item, "schema_name").value_or(schema_name);
+        fn.schema_name = SchemaNameOf(item, schema_name);
         fn.argument_types = wire::get_schema(item, "arguments");
         functions.push_back(std::move(fn));
     }
@@ -259,7 +283,7 @@ std::vector<CatalogTableInOutFunction> ParseTableInOutFunctions(
         if (!input_from_args || has_finalize) continue;
         CatalogTableInOutFunction fn;
         fn.function_name = wire::get_string(item, "name");
-        fn.schema_name = wire::get_optional_string(item, "schema_name").value_or(schema_name_fallback);
+        fn.schema_name = SchemaNameOf(item, schema_name_fallback);
         fn.input_schema = wire::get_schema(item, "arguments");
         fn.projection_pushdown = wire::get_optional_bool(item, "projection_pushdown").value_or(false);
         functions.push_back(std::move(fn));
@@ -270,7 +294,7 @@ std::vector<CatalogTableInOutFunction> ParseTableInOutFunctions(
 
 std::vector<CatalogTableInOutFunction> VgiCatalogClient::SchemaContentsTableInOutFunctions(
     const std::string& attach_opaque_data, const std::string& schema_name) {
-    auto params = gen::BuildCatalogSchemaContentsFunctionsParams(to_bytes(attach_opaque_data), schema_name,
+    auto params = gen::BuildCatalogSchemaContentsFunctionsParams(to_bytes(attach_opaque_data), SchemaPathOf(schema_name),
                                                                   "TABLE_FUNCTION",
                                                                   /*transaction_opaque_data=*/std::nullopt);
     auto result = Call(connection_, "catalog_schema_contents_functions", params);
@@ -325,7 +349,7 @@ std::vector<CatalogPlainTableFunction> ParsePlainTableFunctions(
         if (HasTableTypedArgument(argument_schema)) continue;  // classic table_in_out - not representable
         CatalogPlainTableFunction fn;
         fn.function_name = wire::get_string(item, "name");
-        fn.schema_name = wire::get_optional_string(item, "schema_name").value_or(schema_name_fallback);
+        fn.schema_name = SchemaNameOf(item, schema_name_fallback);
         fn.argument_schema = argument_schema;
         fn.supports_splits = wire::get_optional_bool(item, "supports_splits").value_or(false);
         functions.push_back(std::move(fn));
@@ -336,7 +360,7 @@ std::vector<CatalogPlainTableFunction> ParsePlainTableFunctions(
 
 std::vector<CatalogPlainTableFunction> VgiCatalogClient::SchemaContentsPlainTableFunctions(
     const std::string& attach_opaque_data, const std::string& schema_name) {
-    auto params = gen::BuildCatalogSchemaContentsFunctionsParams(to_bytes(attach_opaque_data), schema_name,
+    auto params = gen::BuildCatalogSchemaContentsFunctionsParams(to_bytes(attach_opaque_data), SchemaPathOf(schema_name),
                                                                   "TABLE_FUNCTION",
                                                                   /*transaction_opaque_data=*/std::nullopt);
     auto result = Call(connection_, "catalog_schema_contents_functions", params);
