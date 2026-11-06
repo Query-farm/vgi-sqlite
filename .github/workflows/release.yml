@@ -73,7 +73,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: Query-farm/vgi-cpp
-          ref: v0.13.1
+          ref: v0.14.0
           path: vgi-cpp
 
       - name: Check out vgi-rpc-cpp
@@ -272,7 +272,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: Query-farm/vgi-cpp
-          ref: v0.13.1
+          ref: v0.14.0
           path: vgi-cpp
 
       - name: Check out vgi-rpc-cpp

@@ -166,17 +166,25 @@ namespace {
 
 // One page's worth of a plan response - mirrors vgi's own
 // ParseVgiScanPlanPage (vgi_catalog_api.cpp) closely, trimmed to what a
-// sequential single-reader client needs (drops locations/partitioning/
-// sort_order/cache_max_age_seconds/estimated_* - real fields this driver
-// simply has no consumer for yet, matching the "no live consumer" test
-// the protocol design itself was built against).
+// sequential single-reader client needs. Protocol 3.1's exact/range split
+// contract is retained long enough to validate it; optimizer-only locations,
+// sort_order, cache_max_age_seconds, and estimates remain intentionally
+// unconsumed because SQLite has no scheduler or physical-property planner.
 struct PlanPage {
-    std::vector<std::vector<uint8_t>> tokens;
+    struct Split {
+        std::vector<uint8_t> token;
+        std::optional<std::string> key_value;
+        std::optional<int64_t> range_index;
+        std::optional<std::string> column_bounds;
+    };
+    std::vector<Split> splits;
     // Every cursor this page returned, not just the first - see
     // PlanTableFunctionSplits's comment on why all of them must be
     // followed. Empty = this cursor's enumeration is exhausted.
     std::vector<std::vector<uint8_t>> next_cursors;
     std::vector<uint8_t> init_opaque_data;
+    std::optional<std::string> key_grouping;
+    std::optional<std::string> range_partitioning;
 };
 
 PlanPage ParsePlanPage(const std::shared_ptr<arrow::RecordBatch>& batch) {
@@ -200,7 +208,12 @@ PlanPage ParsePlanPage(const std::shared_ptr<arrow::RecordBatch>& batch) {
                 "worker returned a ScanSplit with no token; the framework stamps this, so an absent "
                 "token means the worker bypassed it");
         }
-        page.tokens.emplace_back(token->begin(), token->end());
+        PlanPage::Split split;
+        split.token.assign(token->begin(), token->end());
+        split.key_value = wire::get_optional_binary(split_batch, "key_value");
+        split.range_index = wire::get_optional_int64(split_batch, "range_index");
+        split.column_bounds = wire::get_optional_binary(split_batch, "column_bounds");
+        page.splits.push_back(std::move(split));
     }
 
     // next_cursors: every entry must be followed, not just the first. The
@@ -224,13 +237,175 @@ PlanPage ParsePlanPage(const std::shared_ptr<arrow::RecordBatch>& batch) {
     if (auto opaque = wire::get_optional_binary(batch, "init_opaque_data")) {
         page.init_opaque_data.assign(opaque->begin(), opaque->end());
     }
+    page.key_grouping = wire::get_optional_binary(batch, "key_grouping");
+    page.range_partitioning = wire::get_optional_binary(batch, "range_partitioning");
     return page;
+}
+
+struct TransformKey {
+    std::shared_ptr<arrow::Field> identity_field;
+};
+
+TransformKey ParseTransform(const std::string& bytes, const std::shared_ptr<arrow::Schema>& output_schema,
+                            const std::string& context) {
+    auto transform = wire::decode_ipc(bytes);
+    if (!transform || transform->num_rows() != 1) {
+        throw std::runtime_error(context + " transform must contain exactly one row");
+    }
+    const auto id = wire::get_string(transform, "id");
+    const auto inputs = wire::get_binary_list(transform, "inputs");
+    const auto parameters = wire::get_optional_binary(transform, "parameters");
+    for (const auto& input : inputs) {
+        auto path = wire::decode_ipc(input);
+        if (!path || path->num_rows() != 1 || wire::get_string_list(path, "components").empty()) {
+            throw std::runtime_error(context + " transform input must be a non-empty FieldPath");
+        }
+    }
+
+    TransformKey result;
+    if (id != "vgi.identity/1" || parameters || inputs.size() != 1) return result;
+    auto path = wire::decode_ipc(inputs.front());
+    const auto components = wire::get_string_list(path, "components");
+    if (components.size() != 1) return result;
+    result.identity_field = output_schema ? output_schema->GetFieldByName(components.front()) : nullptr;
+    if (!result.identity_field) {
+        throw std::runtime_error(context + " identity field '" + components.front() + "' is not in the output schema");
+    }
+    return result;
+}
+
+std::vector<TransformKey> ParseKeyGrouping(const std::string& bytes,
+                                           const std::shared_ptr<arrow::Schema>& output_schema) {
+    auto grouping = wire::decode_ipc(bytes);
+    if (!grouping || grouping->num_rows() != 1) {
+        throw std::runtime_error("key_grouping must contain exactly one row");
+    }
+    const auto keys = wire::get_binary_list(grouping, "keys");
+    if (keys.empty()) throw std::runtime_error("key_grouping must contain at least one key");
+    std::vector<TransformKey> parsed;
+    parsed.reserve(keys.size());
+    for (const auto& key : keys) parsed.push_back(ParseTransform(key, output_schema, "key_grouping"));
+    return parsed;
+}
+
+struct ParsedRangePartitioning {
+    std::vector<TransformKey> keys;
+    int64_t split_point_count = 0;
+};
+
+ParsedRangePartitioning ParseRangePartitioning(const std::string& bytes,
+                                               const std::shared_ptr<arrow::Schema>& output_schema) {
+    auto range = wire::decode_ipc(bytes);
+    if (!range || range->num_rows() != 1) {
+        throw std::runtime_error("range_partitioning must contain exactly one row");
+    }
+    const auto encoded_keys = wire::get_binary_list(range, "keys");
+    if (encoded_keys.empty()) throw std::runtime_error("range_partitioning must contain at least one key");
+
+    ParsedRangePartitioning parsed;
+    parsed.keys.reserve(encoded_keys.size());
+    for (const auto& encoded_key : encoded_keys) {
+        auto key = wire::decode_ipc(encoded_key);
+        if (!key || key->num_rows() != 1) {
+            throw std::runtime_error("range_partitioning key must contain exactly one row");
+        }
+        // Reading these fields validates the comparator, including their enum wire
+        // types.
+        (void)wire::get_enum(key, "direction");
+        (void)wire::get_enum(key, "null_order");
+        parsed.keys.push_back(ParseTransform(wire::get_binary(key, "transform"), output_schema, "range_partitioning"));
+    }
+
+    auto split_points = wire::get_ipc(range, "split_points");
+    if (!split_points) throw std::runtime_error("range_partitioning split_points is not an Arrow batch");
+    if (split_points->num_columns() != static_cast<int>(parsed.keys.size())) {
+        throw std::runtime_error("range_partitioning split_points has " + std::to_string(split_points->num_columns()) +
+                                 " columns; expected " + std::to_string(parsed.keys.size()));
+    }
+    for (int i = 0; i < split_points->num_columns(); ++i) {
+        const auto& expected = parsed.keys[static_cast<size_t>(i)].identity_field;
+        const auto& actual = split_points->schema()->field(i);
+        if (expected && !actual->type()->Equals(expected->type())) {
+            throw std::runtime_error("range_partitioning split point column '" + expected->name() + "' has type " +
+                                     actual->type()->ToString() + "; expected " + expected->type()->ToString());
+        }
+    }
+    parsed.split_point_count = split_points->num_rows();
+    return parsed;
+}
+
+void ValidateSplitMetadata(const std::vector<PlanPage::Split>& splits, const std::optional<std::string>& key_grouping,
+                           const std::optional<std::string>& range_partitioning,
+                           const std::shared_ptr<arrow::Schema>& output_schema) {
+    std::optional<std::vector<TransformKey>> grouping;
+    if (key_grouping) grouping = ParseKeyGrouping(*key_grouping, output_schema);
+    std::optional<ParsedRangePartitioning> ranges;
+    if (range_partitioning) ranges = ParseRangePartitioning(*range_partitioning, output_schema);
+
+    for (size_t split_index = 0; split_index < splits.size(); ++split_index) {
+        const auto& split = splits[split_index];
+        if (grouping) {
+            if (!split.key_value) {
+                throw std::runtime_error("declared an exact key grouping but split " + std::to_string(split_index) +
+                                         " has no key_value");
+            }
+            auto key = wire::decode_ipc(*split.key_value);
+            if (!key || key->num_rows() != 1) {
+                const auto rows = key ? key->num_rows() : 0;
+                throw std::runtime_error("split " + std::to_string(split_index) +
+                                         " key_value must contain exactly one row (got " + std::to_string(rows) + ")");
+            }
+            if (key->num_columns() != static_cast<int>(grouping->size())) {
+                throw std::runtime_error("split " + std::to_string(split_index) + " key_value has " +
+                                         std::to_string(key->num_columns()) + " columns; expected " +
+                                         std::to_string(grouping->size()));
+            }
+            for (int i = 0; i < key->num_columns(); ++i) {
+                const auto& expected = (*grouping)[static_cast<size_t>(i)].identity_field;
+                const auto& actual = key->schema()->field(i);
+                if (expected && !actual->type()->Equals(expected->type())) {
+                    throw std::runtime_error("split " + std::to_string(split_index) + " key_value column '" +
+                                             expected->name() + "' has type " + actual->type()->ToString() +
+                                             "; expected " + expected->type()->ToString());
+                }
+            }
+        } else if (split.key_value) {
+            throw std::runtime_error("split " + std::to_string(split_index) +
+                                     " has key_value but the plan has no key_grouping");
+        }
+
+        if (ranges) {
+            if (!split.range_index) {
+                throw std::runtime_error("declared range partitioning but split " + std::to_string(split_index) +
+                                         " has no range_index");
+            }
+            if (*split.range_index < 0 || *split.range_index > ranges->split_point_count) {
+                throw std::runtime_error("split " + std::to_string(split_index) + " range_index " +
+                                         std::to_string(*split.range_index) + " is outside [0, " +
+                                         std::to_string(ranges->split_point_count) + "]");
+            }
+        } else if (split.range_index) {
+            throw std::runtime_error("split " + std::to_string(split_index) +
+                                     " has range_index but the plan has no range_partitioning");
+        }
+
+        if (split.column_bounds) {
+            auto bounds = wire::decode_ipc(*split.column_bounds);
+            if (!bounds || bounds->num_rows() != 2) {
+                const auto rows = bounds ? bounds->num_rows() : 0;
+                throw std::runtime_error("split " + std::to_string(split_index) +
+                                         " column_bounds must contain exactly two rows (got " + std::to_string(rows) +
+                                         ")");
+            }
+        }
+    }
 }
 
 }  // namespace
 
 TableFunctionPlan PlanTableFunctionSplits(VgiConnection& connection, const std::vector<uint8_t>& bind_call_bytes,
                                           const std::vector<uint8_t>& bind_opaque_data,
+                                          const std::shared_ptr<arrow::Schema>& output_schema,
                                           const std::vector<int64_t>& projection_ids,
                                           const std::optional<std::string>& pushdown_filters) {
     // Bounds mirror vgi's own InvokeTableFunctionPlan: generous, and exist
@@ -246,6 +421,9 @@ TableFunctionPlan PlanTableFunctionSplits(VgiConnection& connection, const std::
     constexpr size_t kMaxSplits = 1u << 20;
 
     TableFunctionPlan plan;
+    std::vector<PlanPage::Split> splits;
+    std::optional<std::string> key_grouping;
+    std::optional<std::string> range_partitioning;
     // Every outstanding cursor must be followed to completion - see
     // ParsePlanPage's comment on next_cursors. A plain queue, drained
     // depth-first (order doesn't matter: this driver only needs the flat,
@@ -281,16 +459,21 @@ TableFunctionPlan PlanTableFunctionSplits(VgiConnection& connection, const std::
         // still enumerating) - matching vgi's own ParseVgiScanPlanPage.
         if (first_response) {
             plan.init_opaque_data = page.init_opaque_data;
+            key_grouping = page.key_grouping;
+            range_partitioning = page.range_partitioning;
             first_response = false;
         }
-        for (auto& token : page.tokens) plan.split_tokens.push_back(std::move(token));
+        for (auto& split : page.splits) splits.push_back(std::move(split));
 
-        if (plan.split_tokens.size() > kMaxSplits) {
+        if (splits.size() > kMaxSplits) {
             throw std::runtime_error("table_function_plan returned more than " + std::to_string(kMaxSplits) +
                                       " splits for one scan; refusing to buffer an unbounded split vector");
         }
         for (auto& next : page.next_cursors) pending_cursors.push_back(std::move(next));
     }
+    ValidateSplitMetadata(splits, key_grouping, range_partitioning, output_schema);
+    plan.split_tokens.reserve(splits.size());
+    for (auto& split : splits) plan.split_tokens.push_back(std::move(split.token));
     return plan;
 }
 

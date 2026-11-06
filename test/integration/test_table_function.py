@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import sqlite3
 
+import pytest
+
 
 def _attach(conn: sqlite3.Connection, worker_location: str) -> None:
     conn.execute("SELECT vgi_attach(?, 'example')", (worker_location,))
@@ -44,6 +46,38 @@ def test_literal_call_drains_multiple_splits(conn: sqlite3.Connection, worker_lo
     _attach(conn, worker_location)
     rows = conn.execute("SELECT n FROM example_split_sequence(100, 4) ORDER BY n").fetchall()
     assert rows == [(i,) for i in range(100)]
+
+
+def test_protocol_31_exact_and_range_partition_metadata(conn: sqlite3.Connection, worker_location: str) -> None:
+    """Protocol 3.1 split metadata is validated before SQLite redeems the
+    splits. SQLite remains a sequential consumer, so these optimizer hints
+    do not change its execution plan; the exact keys and range assignments
+    must nevertheless survive as a sound contract rather than being silently
+    accepted when malformed."""
+    _attach(conn, worker_location)
+    rows = conn.execute(
+        "SELECT country, SUM(sales) FROM example_split_partitioned('valid', 2) GROUP BY country ORDER BY country"
+    ).fetchall()
+    assert rows == [("BR", 603), ("DE", 203), ("JP", 403), ("US", 3)]
+
+
+@pytest.mark.parametrize(
+    ("key_mode", "message"),
+    [
+        ("missing", "declared an exact key grouping but split 0 has no key_value"),
+        ("two_rows", "key_value must contain exactly one row"),
+        ("wrong_type", "key_value column 'country' has type int64; expected string"),
+    ],
+)
+def test_protocol_31_rejects_invalid_exact_partition_keys(
+    conn: sqlite3.Connection, worker_location: str, key_mode: str, message: str
+) -> None:
+    _attach(conn, worker_location)
+    with pytest.raises(sqlite3.OperationalError, match=message):
+        conn.execute(
+            "SELECT * FROM example_split_partitioned(?, 2) ORDER BY country, sales",
+            (key_mode,),
+        ).fetchall()
 
 
 def test_correlated_call_one_scan_per_outer_row(conn: sqlite3.Connection, worker_location: str) -> None:

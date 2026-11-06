@@ -43,7 +43,7 @@ Status section before starting new work, and update it as work completes.
 This file (CLAUDE.md) is the current-state reference; that file is the
 narrative history of how it got there.
 
-## Protocol: `vgi.v3` 3.0.0
+## Protocol: `vgi.v3` 3.1.0
 
 - Every application request names its protocol
   (`RpcClientOptions::protocol`, `HttpClientBuilder::protocol`).
@@ -519,6 +519,16 @@ init. A single sequential reader claiming every split one at a time (what
 `TableScanner` does, entirely transparent to `vgi_vtab.cpp`) is a legal,
 degenerate consumer even though the mechanism exists for real distributed
 engines to claim splits concurrently.
+
+Protocol 3.1 adds plan-level exact `key_grouping` and
+`range_partitioning`, plus each split's `key_value`, `range_index`, and
+`column_bounds`. SQLite has no partition-aware physical planner to consume
+these as optimization properties, but accepting an exact claim without
+checking it would be unsound. The driver therefore decodes and validates
+the complete contract before redeeming any token: exact keys are one-row,
+arity/type aligned batches; range indices name one of the split-point
+ranges; bounds are two-row min/max batches. Valid metadata is then discarded
+and the tokens retain SQLite's existing sequential execution semantics.
 
 - **End-of-stream is a `nullopt` tick, never a present-but-0-row batch** -
   a 0-row batch mid-split is legitimate (a filter pruned that split to

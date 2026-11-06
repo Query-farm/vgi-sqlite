@@ -118,6 +118,7 @@ struct TableFunctionPlan {
 // not something to paper over.
 TableFunctionPlan PlanTableFunctionSplits(VgiConnection& connection, const std::vector<uint8_t>& bind_call_bytes,
                                           const std::vector<uint8_t>& bind_opaque_data,
+                                          const std::shared_ptr<arrow::Schema>& output_schema,
                                           const std::vector<int64_t>& projection_ids,
                                           const std::optional<std::string>& pushdown_filters);
 

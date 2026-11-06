@@ -111,7 +111,7 @@ see [`test/sqllogictest/README.md`](test/sqllogictest/README.md).
 | Scalar functions | ✅ registered natively as `<catalog>_<name>` |
 | Aggregate functions | ✅ including `GROUP BY`; windowed (`OVER`) aggregates are not supported — a structurally different RPC family with no incremental step model |
 | Correlated table functions | ✅ `vgi_table_in_out` (row-transform functions) and `vgi_table_function` (plain generator functions), called via `FROM t, fn(t.x)` — no `LATERAL` keyword needed |
-| VGI splits | ✅ sequential single-reader redemption — SQLite has no parallel-scan-worker concept, so splits are claimed one at a time rather than concurrently |
+| VGI splits | ✅ Protocol 3.1 planning, pagination, and sequential single-reader redemption; exact key grouping, range assignment, and column bounds are validated before redemption. SQLite has no parallel scheduler or partition-aware optimizer, so valid hints do not alter its physical plan |
 | Transports | ✅ subprocess, `unix://`, `launch:` discovery (AF_UNIX on POSIX, named pipes on Windows), `http(s)://` with bearer auth |
 | Classic `table_in_out` (relation-valued argument) | ❌ SQLite's table-valued-function calling convention has no equivalent of a whole-relation argument |
 | Multi-branch (union-of-sources) tables | ❌ no natural multi-source union at the SQLite virtual-table level |

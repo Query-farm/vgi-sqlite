@@ -163,8 +163,8 @@ void TableScanner::Init(const std::vector<int64_t>& projection_ids,
         // projection/pushdown this scan already computed: splits doesn't
         // change what xBestIndex/xFilter decided to push down, only how
         // the resulting scan is redeemed.
-        auto plan = PlanTableFunctionSplits(connection_, bind_call_bytes_, bind_.opaque_data, projection_ids,
-                                            pushdown_filters);
+        auto plan = PlanTableFunctionSplits(connection_, bind_call_bytes_, bind_.opaque_data, bind_.output_schema,
+                                            projection_ids, pushdown_filters);
         pending_splits_ = std::move(plan.split_tokens);
         split_init_opaque_data_ = std::move(plan.init_opaque_data);
         next_split_index_ = 0;
