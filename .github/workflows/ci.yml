@@ -252,6 +252,10 @@ jobs:
           uv sync
           uv run pytest -v
 
+  # vgi-rpc-c 0.1.1 is currently POSIX-only (pthread/process/socket/shared-
+  # memory APIs). Keep the Windows job visible as the porting checklist, but
+  # do not claim or gate Windows support until that dependency has a native
+  # MSVC transport implementation.
   # A separate job, not a 4th matrix entry above: Windows needs PowerShell
   # syntax throughout (a mixed bash/pwsh matrix job would need per-step
   # if:/shell: branching on nearly every step, less readable than one job
@@ -260,15 +264,11 @@ jobs:
   # ports build via MSBuild on Windows, confirmed no autoconf/automake/
   # libtool/flex/bison needed there, unlike Linux/macOS).
   #
-  # Verified real, not just "should work": both transports this driver
-  # supports were checked end-to-end on a real Windows 11/MSVC box before
-  # this job was written - plain subprocess spawn (the full existing
-  # pytest suite, 52 passed/7 skipped, 0 failed) and `launch:`/AF_UNIX
-  # (vgi_attach() over launch: against a real worker, real catalog
-  # discovery, real data) - see CLAUDE.md's Windows entries for the full
-  # history, including the vgi-rpc-c fix (Windows AF_UNIX client
-  # transport, previously a stub) `launch:` needed.
+  # This job previously validated the Arrow C++ transport on Windows. It is
+  # retained so the same integration coverage can be re-enabled with one
+  # line when vgi-rpc-c gains its Windows process and pipe backends.
   build-and-test-windows:
+    if: false
     runs-on: windows-2022
 
     steps:

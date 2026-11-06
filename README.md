@@ -41,8 +41,8 @@ It builds a single loadable extension (`vgi.{so,dylib}`) exposing:
   the same way `json_each(t.x)` doesn't.
 - Scalar and aggregate functions, registered natively as
   `<catalog>_<name>`.
-- Subprocess, `unix://`, launcher-discovery (`launch:` — AF_UNIX on POSIX,
-  named pipes on Windows), and HTTP (bearer-auth) transports.
+- Subprocess, `unix://`, launcher-discovery (`launch:`), and HTTP
+  (bearer-auth) transports on Linux and macOS.
 
 - Sibling reference port (Python): [`vgi-python`](https://github.com/Query-farm/vgi-python)
 - DuckDB extension: [`vgi`](https://github.com/Query-farm/vgi)
@@ -73,7 +73,7 @@ Note for Linux and macOS: vcpkg builds `libsodium` through autotools, so
 ## Usage
 
 ```sql
-.load ./build/vgi          -- vgi.so/.dylib on macOS/Linux, build\Debug\vgi.dll on Windows
+.load ./build/vgi          -- vgi.so/.dylib on macOS/Linux
 
 SELECT vgi_attach('uv run --project ~/vgi-python vgi-fixture-worker', 'example');
 
@@ -113,11 +113,11 @@ see [`test/sqllogictest/README.md`](test/sqllogictest/README.md).
 | Aggregate functions | ✅ including `GROUP BY`; windowed (`OVER`) aggregates are not supported — a structurally different RPC family with no incremental step model |
 | Correlated table functions | ✅ `vgi_table_in_out` (row-transform functions) and `vgi_table_function` (plain generator functions), called via `FROM t, fn(t.x)` — no `LATERAL` keyword needed |
 | VGI splits | ✅ Protocol 3.1 planning, pagination, and sequential single-reader redemption; exact key grouping, range assignment, and column bounds are validated before redemption. SQLite has no parallel scheduler or partition-aware optimizer, so valid hints do not alter its physical plan |
-| Transports | ✅ subprocess, `unix://`, `launch:` discovery (AF_UNIX on POSIX, named pipes on Windows), `http(s)://` with bearer auth |
+| Transports | ✅ subprocess, `unix://`, `launch:` discovery, `http(s)://` with bearer auth on Linux/macOS |
 | Classic `table_in_out` (relation-valued argument) | ❌ SQLite's table-valued-function calling convention has no equivalent of a whole-relation argument |
 | Multi-branch (union-of-sources) tables | ❌ no natural multi-source union at the SQLite virtual-table level |
 | Function overloading (same name, different arity) | ✅ each overload gets its own generated SQL name (`<catalog>_<function>_<N>`, `N` = argument count) instead of one silently winning |
-| Windows | ✅ full parity with POSIX, including `launch:` discovery (named pipes) — verified in CI on `windows-2022` |
+| Windows | ⏳ blocked on the native MSVC port of `vgi-rpc-c`; the former Arrow C++ transport is intentionally not retained |
 
 See [`CLAUDE.md`](CLAUDE.md) for the full design, every non-obvious protocol
 contract, and the real bugs found building each of these against live

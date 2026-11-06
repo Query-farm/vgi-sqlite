@@ -3,17 +3,10 @@
 # Builds the loadable extension (vgi.{so,dylib,dll}) for every supported
 # (OS, architecture) pair and publishes them to a GitHub Release.
 #
-# Windows IS now in this matrix (build-windows, a separate job below,
-# structurally the same reason ci.yml's build-and-test-windows is its own
-# job rather than a matrix row: PowerShell throughout, not per-step bash/
-# pwsh branching within one mixed-OS matrix). This was blocked for a
-# while on real portability work, not just a missing matrix row -
-# src/rpc/launcher.{h,cpp}'s `launch:` support needed a genuine Windows
-# implementation (named pipes, not AF_UNIX or fork/exec/flock) - see
-# CLAUDE.md's Windows/launcher entry for the full history. That work is
-# done and verified (ci.yml's own build-and-test-windows job has run it
-# against a real worker), so shipping a Windows binary is no longer
-# blocked on it.
+# The nanoarrow transport dependency, vgi-rpc-c 0.1.1, is currently
+# POSIX-only. The retained build-windows job is the packaging checklist for
+# its eventual native MSVC port, but remains disabled so releases do not
+# advertise an unbuildable Windows artifact.
 #
 # Every dependency vcpkg builds (nanoarrow, OpenSSL, etc.) is statically linked
 # by vcpkg's own default triplet on Linux/macOS (x64-linux/arm64-linux/
@@ -26,17 +19,8 @@
 # limits this doesn't solve (a glibc version floor from the build
 # environment's own libc; no musl/Alpine build).
 #
-# Windows is structurally different here, not a bug: vcpkg's default
-# x64-windows triplet is DYNAMICALLY linked (DLLs), confirmed by
-# ci.yml's own build-and-test-windows job log ("Copying vcpkg runtime
-# DLLs next to vgi.dll" - CMakeLists.txt's own POST_BUILD step, config-
-# aware via $<CONFIG:...>, so it copies the Release DLLs correctly here
-# too). So the Windows release artifact isn't a single self-contained
-# file the way the POSIX ones are - it's vgi.dll plus every DLL that
-# POST_BUILD step copies alongside it, staged and archived together.
-# This is normal for a Windows-distributed native extension (the same
-# shape any redistributable Windows DLL-based app ships in) and doesn't
-# need a static-triplet workaround the way this would on Linux/macOS.
+# Once restored, Windows packaging remains a vgi.dll plus its vcpkg runtime
+# DLLs because the default x64-windows triplet is dynamically linked.
 
 name: Release
 
@@ -256,6 +240,7 @@ jobs:
           if-no-files-found: error
 
   build-windows:
+    if: false
     runs-on: windows-2022
 
     steps:
@@ -386,7 +371,7 @@ jobs:
     # Only on an actual tag push - workflow_dispatch is for validating the
     # build matrix itself without cutting a release.
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build, build-windows]
+    needs: [build]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
