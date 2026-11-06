@@ -3,10 +3,9 @@
 # Builds the loadable extension (vgi.{so,dylib,dll}) for every supported
 # (OS, architecture) pair and publishes them to a GitHub Release.
 #
-# The nanoarrow transport dependency, vgi-rpc-c 0.1.1, is currently
-# POSIX-only. The retained build-windows job is the packaging checklist for
-# its eventual native MSVC port, but remains disabled so releases do not
-# advertise an unbuildable Windows artifact.
+# vgi-rpc-c 0.1.2 provides the native MSVC client runtime used by the Windows
+# artifact: nanoarrow IPC, CreateProcess/named pipes, Winsock, HTTP, and file
+# mappings without the POSIX-only server dependencies.
 #
 # Every dependency vcpkg builds (nanoarrow, OpenSSL, etc.) is statically linked
 # by vcpkg's own default triplet on Linux/macOS (x64-linux/arm64-linux/
@@ -19,7 +18,7 @@
 # limits this doesn't solve (a glibc version floor from the build
 # environment's own libc; no musl/Alpine build).
 #
-# Once restored, Windows packaging remains a vgi.dll plus its vcpkg runtime
+# Windows packaging is a vgi.dll plus its vcpkg runtime
 # DLLs because the default x64-windows triplet is dynamically linked.
 
 name: Release
@@ -34,7 +33,21 @@ env:
   VCPKG_COMMIT: 05442024c3fda64320bd25d2251cc9807b84fb6f
 
 jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check release versions
+        run: |
+          cmake_version=$(sed -n 's/^project(vgi-sqlite VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)
+          manifest_version=$(python3 -c 'import json; print(json.load(open("vcpkg.json"))["version"])')
+          test "$cmake_version" = "$manifest_version"
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            test "$GITHUB_REF_NAME" = "v$cmake_version"
+          fi
+
   build:
+    needs: validate
     strategy:
       fail-fast: false
       matrix:
@@ -64,7 +77,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: Query-farm/vgi-rpc-c
-          ref: v0.1.1
+          ref: v0.1.2
           path: vgi-rpc-c
 
       # See ci.yml's matching step for the full reasoning - gcc-12 does NOT
@@ -202,7 +215,7 @@ jobs:
           -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
       - name: Build
-        run: cmake --build build-release --parallel
+        run: cmake --build build-release --parallel 12
 
       # Prints exactly what the shipped binary dynamically depends on -
       # every run's log is a real record that nothing beyond expected
@@ -240,7 +253,7 @@ jobs:
           if-no-files-found: error
 
   build-windows:
-    if: false
+    needs: validate
     runs-on: windows-2022
 
     steps:
@@ -257,7 +270,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: Query-farm/vgi-rpc-c
-          ref: v0.1.1
+          ref: v0.1.2
           path: vgi-rpc-c
 
       - name: Clone and bootstrap vcpkg
@@ -340,12 +353,12 @@ jobs:
           -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
       - name: Build
-        run: cmake --build build-release --config Release --parallel
+        run: cmake --build build-release --config Release --parallel 12
 
       # Windows has no single self-contained artifact the way .so/.dylib
       # are (see this file's top comment) - stage vgi.dll plus every DLL
       # CMakeLists.txt's own POST_BUILD step already copied next to it
-      # (the vcpkg-built Arrow/OpenSSL/etc. runtime, config-aware so this
+      # (the vcpkg-built nanoarrow/libcurl/etc. runtime, config-aware so this
       # picks up the Release build's DLLs, not Debug's).
       - name: Package
         run: |
@@ -371,7 +384,7 @@ jobs:
     # Only on an actual tag push - workflow_dispatch is for validating the
     # build matrix itself without cutting a release.
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build]
+    needs: [build, build-windows]
     runs-on: ubuntu-24.04
     permissions:
       contents: write

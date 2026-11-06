@@ -54,23 +54,114 @@ def _extension_path() -> Path:
     )
 
 
+def _vgi_python() -> str:
+    return os.environ.get("VGI_PYTHON", str(Path.home() / "Development" / "vgi-python"))
+
+
+def _vgi_rust_worker_binary() -> Path:
+    """The vgi-rust `example`-catalog fixture worker (vgi-example-worker) -
+    VGI_RUST_WORKER overrides, defaulting to the sibling checkout convention
+    every other cross-repo path in this test suite already uses (VGI_PYTHON's
+    own default). A real, native binary (`cargo build --release`), not a
+    `uv run ...` spawn - no interpreter-startup cost at all, which is most of
+    why worker_location moved off vgi-python's own fixture worker for the
+    common (non-write, non-transaction) test files - see worker_location's
+    own comment for the fuller rationale and what stays on vgi-python."""
+    override = os.environ.get("VGI_RUST_WORKER")
+    if override:
+        return Path(override)
+    vgi_rust = Path(os.environ.get("VGI_RUST", str(Path.home() / "Development" / "vgi-rust")))
+    name = "vgi-example-worker.exe" if platform.system() == "Windows" else "vgi-example-worker"
+    return vgi_rust / "target" / "release" / name
+
+
+def _spawn_http_worker(argv: list[str], cwd: str | None, env_extra: dict[str, str] | None = None):
+    """Spawn `argv` with `--http` already appended, wait for its `PORT:<n>`
+    discovery line (vgi-rust's own launcher-protocol-style convention - see
+    src/rpc/launcher.h's ParseDiscoveryLine for the client-side counterpart),
+    and return `(process, base_url, tail_lines)`. `tail_lines` is a live list
+    the caller can read from in a failure message - stdout/stderr are drained
+    on background daemon threads rather than left unread, same reasoning as
+    http_worker_base_url's own fixture below (an unread pipe can freeze a
+    single-threaded server's I/O loop under load)."""
+    env = dict(os.environ)
+    if env_extra:
+        env.update(env_extra)
+    proc = subprocess.Popen(
+        [*argv, "--http"],
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    tail: list[str] = []
+    port_holder: list[int] = []
+
+    def _drain(stream, capture_port: bool) -> None:
+        for line in stream:
+            tail.append(line)
+            del tail[:-50]
+            if capture_port and not port_holder:
+                m = line.strip()
+                if m.startswith("PORT:"):
+                    try:
+                        port_holder.append(int(m[len("PORT:"):]))
+                    except ValueError:
+                        pass
+
+    threads = [
+        threading.Thread(target=_drain, args=(proc.stdout, True), daemon=True),
+        threading.Thread(target=_drain, args=(proc.stderr, False), daemon=True),
+    ]
+    for t in threads:
+        t.start()
+
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline and not port_holder:
+        if proc.poll() is not None:
+            break
+        time.sleep(0.05)
+
+    if not port_holder:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        pytest.skip(
+            f"worker {argv!r} --http didn't announce a PORT: line "
+            f"(rc={proc.returncode}). Last output:\n{''.join(tail)}"
+        )
+
+    return proc, f"http://127.0.0.1:{port_holder[0]}", tail
+
+
 def _default_worker() -> str:
-    vgi_python = os.environ.get("VGI_PYTHON", str(Path.home() / "Development" / "vgi-python"))
-    # launch: (rpc/launcher.h's full AF_UNIX discovery protocol), not a
-    # bare spawn argv: this suite's `conn` fixture is function-scoped (a
-    # fresh ConnectionPool per test), so a bare spawn argv means every one
-    # of the ~50 tests here pays a full `uv run` + Python-interpreter-
-    # startup cost - measured at ~4-5s/test, dominating this suite's
-    # wall-clock time. launch: makes every test's Acquire() discover and
-    # reuse the SAME already-running worker process instead (one real
-    # spawn for the whole session, not one per test) - the identical
-    # spawn-per-connection bottleneck test/sqllogictest/ already solved
-    # this way (see its own README and CLAUDE.md's launcher-protocol
-    # entry). Safe to share across tests for the same reason sharing one
-    # worker across many attach()es/tables already is within a single
-    # test: every attach mints its own attach_opaque_data, and this
-    # driver never assumes worker-process-lifetime state beyond that.
-    return f"launch:uv run --project {vgi_python} vgi-fixture-worker"
+    """The `example` catalog's default worker location - vgi-rust's own
+    fixture worker (a real native binary), not vgi-python's `uv run
+    vgi-fixture-worker`. Two reasons, both real:
+
+    1. Startup cost: `uv run vgi-fixture-worker` pays a full Python-
+       interpreter + pyarrow/numpy import cost (measured at several seconds
+       on a cold CI runner - see CLAUDE.md's Windows-launcher entries for
+       the concrete numbers that motivated the launch: switch in the first
+       place). vgi-example-worker is a native binary with none of that.
+    2. VGI_TEST_TRANSPORT lets this same worker serve either launch:
+       (AF_UNIX/named-pipe discovery, POSIX and Windows both work - see
+       CLAUDE.md's launcher entry) or --http (plain HTTP, no launcher
+       protocol dependency at all) - see worker_location's own fixture for
+       which platforms use which and why.
+
+    Not every test file uses this worker: test_writes.py/test_transactions.py
+    need real write/transaction support vgi-rust's example catalog doesn't
+    have (no supports_insert, no catalog_transaction_begin) and stay on
+    vgi-python's own fixture worker via writable_worker_location/
+    transactional_worker_location; test_table_in_out.py's row_transform-
+    specific tests need this driver's own custom RowTransformFunction
+    fixture (row_transform_worker.py), which only exists under vgi-python.
+    """
+    return f"launch:{_vgi_rust_worker_binary()}"
 
 
 @pytest.fixture(scope="session")
@@ -95,10 +186,69 @@ def extension_path() -> Path:
 
 
 @pytest.fixture(scope="session")
-def worker_location() -> str:
-    """The `example` catalog's worker command - VGI_TEST_WORKER, or the
-    vgi-fixture-worker default (matching vgi/Makefile's convention)."""
-    return os.environ.get("VGI_TEST_WORKER", _default_worker())
+def worker_location():
+    """The `example` catalog's worker command.
+
+    VGI_TEST_WORKER, if set, wins outright (an explicit full override, same
+    as before - useful for pointing at any worker by hand). Otherwise this
+    branches on VGI_TEST_TRANSPORT:
+
+    - "launch" (the default): `launch:<vgi-example-worker>` - the AF_UNIX/
+      named-pipe launcher-discovery protocol (src/rpc/launcher.h), working
+      on both POSIX and Windows (see CLAUDE.md's launcher entry for the
+      named-pipe history).
+    - "http": spawns `<vgi-example-worker> --http` directly (this fixture
+      owns that process's lifecycle - no launcher involved at all, since
+      launch: is a separate, AF_UNIX/named-pipe-specific transport with no
+      HTTP equivalent). Runs the *whole* test/integration suite a second
+      time over a genuinely different transport, not just the narrow
+      test_http_transport.py file's own dedicated bearer-auth checks -
+      see CLAUDE.md's CI entry for why both passes matter (they exercise
+      structurally different code paths in VgiConnection - see its own
+      file comment).
+
+    CI runs this suite twice - VGI_TEST_TRANSPORT=launch and
+    VGI_TEST_TRANSPORT=http - as two separate pytest invocations (env-var
+    driven, not pytest parametrization: simpler, and it reuses this
+    fixture's existing override mechanism instead of a second one).
+    Windows CI runs http only - vgi-rust's own --unix launcher transport is
+    POSIX-only today (confirmed in its own source), so launch: against a
+    vgi-rust worker doesn't work there yet; http sidesteps that gap
+    entirely rather than waiting on it.
+    """
+    override = os.environ.get("VGI_TEST_WORKER")
+    if override:
+        yield override
+        return
+    transport = os.environ.get("VGI_TEST_TRANSPORT", "launch")
+    if transport == "http":
+        proc, base_url, _tail = _spawn_http_worker([str(_vgi_rust_worker_binary())], cwd=None)
+        yield base_url
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        return
+    if transport != "launch":
+        raise ValueError(f"VGI_TEST_TRANSPORT must be 'launch' or 'http', got {transport!r}")
+    yield _default_worker()
+
+
+@pytest.fixture(scope="session")
+def transactional_worker_location() -> str:
+    """The `example` catalog's worker command for transaction-specific tests
+    (test_transactions.py) - vgi-python's own fixture worker specifically,
+    NOT worker_location's vgi-rust default: vgi-rust's example catalog
+    doesn't implement transactions at all (no catalog_transaction_begin
+    handler), only vgi-python's does. VGI_TEST_TRANSACTIONAL_WORKER
+    overrides, matching every other worker fixture's convention here."""
+    vgi_python = _vgi_python()
+    # launch: - same rationale as _default_worker() above.
+    return os.environ.get(
+        "VGI_TEST_TRANSACTIONAL_WORKER", f"launch:uv run --project {vgi_python} vgi-fixture-worker"
+    )
 
 
 @pytest.fixture(scope="session")
@@ -263,11 +413,19 @@ def _verify_worker_available(worker_location: str) -> None:
     leading `launch:` (see _default_worker's comment on why worker
     locations use it now) - this check runs the worker argv directly as
     its own one-shot subprocess, not through rpc/launcher.h's discovery
-    protocol, so it needs the bare argv either way."""
+    protocol, so it needs the bare argv either way.
+
+    A no-op for an http:// location: worker_location's own fixture already
+    spawned that worker and waited for its PORT: readiness line before
+    handing back the URL - by the time this fixture sees it, the worker
+    has already proven it starts. Re-running --help against a URL string
+    (not an argv) wouldn't make sense anyway."""
+    if worker_location.startswith(("http://", "https://")):
+        return
     argv = worker_location.removeprefix("launch:").split()
     try:
         result = subprocess.run(
-            [*argv, "--help"], capture_output=True, timeout=30, text=True
+            [*argv, "--help"], capture_output=True, timeout=30, text=True, check=False
         )
     except (OSError, subprocess.TimeoutExpired) as e:
         pytest.exit(f"worker_location {worker_location!r} did not start: {e}")

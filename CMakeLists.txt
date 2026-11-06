@@ -1,6 +1,6 @@
 # © Copyright 2026 Query Farm LLC - https://query.farm
 cmake_minimum_required(VERSION 3.20)
-project(vgi-sqlite VERSION 0.2.2 LANGUAGES CXX C)
+project(vgi-sqlite VERSION 0.2.3 LANGUAGES CXX C)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -95,6 +95,7 @@ set(VGI_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(VGI_BUILD_WORKER OFF CACHE BOOL "" FORCE)
 set(VGI_RPC_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(VGI_RPC_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(VGI_RPC_CLIENT_ONLY ON CACHE BOOL "" FORCE)
 add_subdirectory("${VGI_C_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/vgi-c" EXCLUDE_FROM_ALL)
 
 # ── The driver: pure VGI client logic, no SQLite dependency ───────────────
@@ -126,9 +127,8 @@ target_include_directories(vgi_sqlite_driver PUBLIC
 # helpers, and the generated application-protocol schemas.
 target_link_libraries(vgi_sqlite_driver PUBLIC vgi::protocol nlohmann_json::nlohmann_json)
 if(WIN32)
-    # src/rpc/launcher.cpp's Windows branch talks genuine AF_UNIX sockets
-    # (WSAStartup/socket/connect/closesocket) - see launcher.h's
-    # kDiscoveryLinePrefix comment for why AF_UNIX, not a named pipe.
+    # The launcher and vgi-rpc-c client use Windows named pipes for launch:
+    # rendezvous and Winsock for explicit tcp:// connections.
     target_link_libraries(vgi_sqlite_driver PRIVATE ws2_32)
 endif()
 

@@ -52,17 +52,40 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: Query-farm/vgi-rpc-c
-          ref: v0.1.1
+          ref: v0.1.2
           path: vgi-rpc-c
 
       # vgi-python (public) - source of the fixture worker test/integration
-      # drives via `launch:` locations (see conftest.py).
+      # drives via `launch:` locations (see conftest.py) for write/
+      # transaction/row_transform-specific tests, since vgi-rust's example
+      # catalog doesn't support those.
       - name: Check out vgi-python
         uses: actions/checkout@v4
         with:
           repository: Query-farm/vgi-python
           ref: v0.49.0
           path: vgi-python
+
+      # vgi-rust (public) - conftest.py's worker_location default: a real
+      # native binary (vgi-example-worker), no interpreter-startup cost -
+      # see that fixture's own comment for the full rationale and what
+      # stays on vgi-python instead.
+      - name: Check out vgi-rust
+        uses: actions/checkout@v4
+        with:
+          repository: Query-farm/vgi-rust
+          ref: v0.49.2
+          path: vgi-rust
+
+      - name: Cache vgi-rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: vgi-rust
+          key: ${{ matrix.platform }}
+
+      - name: Build vgi-example-worker
+        working-directory: vgi-rust
+        run: cargo build --release --bin vgi-example-worker
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
@@ -223,13 +246,8 @@ jobs:
           -DCMAKE_C_COMPILER_LAUNCHER=ccache
           -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
-      # No explicit -j needed: --parallel resolves the core count itself,
-      # regardless of which generator the preset picked (CMakePresets.json
-      # sets none, so this defaults to Unix Makefiles - which otherwise
-      # builds serially with no -j at all, a real, previously-hit-more-
-      # than-once mistake - see CLAUDE.md's EC2-build-box notes).
       - name: Build
-        run: cmake --build build --parallel
+        run: cmake --build build --parallel 12
 
       # Without --extra http, vgi-fixture-http (the HTTP-transport test
       # fixture) fails to start - conftest.py's http_worker_base_url
@@ -243,19 +261,30 @@ jobs:
 
       # test/integration/ is the test source of record (see CLAUDE.md's
       # "Definition of done") - drives the built extension via Python's
-      # stdlib sqlite3 module against a real vgi-fixture-worker, not mocks.
-      - name: Run integration tests
+      # stdlib sqlite3 module. Run twice, once per VGI_TEST_TRANSPORT value
+      # conftest.py's worker_location fixture understands - launch: and
+      # http exercise structurally different VgiConnection code paths (see
+      # its own file comment), and only test_http_transport.py's narrow,
+      # dedicated bearer-auth checks previously got any http coverage at
+      # all; this runs the WHOLE suite over both.
+      - name: "Run integration tests (launch: transport)"
         working-directory: test/integration
         env:
           VGI_PYTHON: ${{ github.workspace }}/vgi-python
+          VGI_RUST_WORKER: ${{ github.workspace }}/vgi-rust/target/release/vgi-example-worker
+          VGI_TEST_TRANSPORT: launch
         run: |
           uv sync
           uv run pytest -v
 
-  # vgi-rpc-c 0.1.1 is currently POSIX-only (pthread/process/socket/shared-
-  # memory APIs). Keep the Windows job visible as the porting checklist, but
-  # do not claim or gate Windows support until that dependency has a native
-  # MSVC transport implementation.
+      - name: Run integration tests (http transport)
+        working-directory: test/integration
+        env:
+          VGI_PYTHON: ${{ github.workspace }}/vgi-python
+          VGI_RUST_WORKER: ${{ github.workspace }}/vgi-rust/target/release/vgi-example-worker
+          VGI_TEST_TRANSPORT: http
+        run: uv run pytest -v
+
   # A separate job, not a 4th matrix entry above: Windows needs PowerShell
   # syntax throughout (a mixed bash/pwsh matrix job would need per-step
   # if:/shell: branching on nearly every step, less readable than one job
@@ -264,11 +293,7 @@ jobs:
   # ports build via MSBuild on Windows, confirmed no autoconf/automake/
   # libtool/flex/bison needed there, unlike Linux/macOS).
   #
-  # This job previously validated the Arrow C++ transport on Windows. It is
-  # retained so the same integration coverage can be re-enabled with one
-  # line when vgi-rpc-c gains its Windows process and pipe backends.
   build-and-test-windows:
-    if: false
     runs-on: windows-2022
 
     steps:
@@ -285,7 +310,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: Query-farm/vgi-rpc-c
-          ref: v0.1.1
+          ref: v0.1.2
           path: vgi-rpc-c
 
       - name: Check out vgi-python
@@ -294,6 +319,28 @@ jobs:
           repository: Query-farm/vgi-python
           ref: v0.49.0
           path: vgi-python
+
+      # vgi-rust's own --unix launcher transport is POSIX-only today
+      # (confirmed in its own source) - so this job's worker_location pass
+      # uses --http only (VGI_TEST_TRANSPORT=http below), never launch:.
+      # Still needed here: it's the worker http-transport tests run
+      # against.
+      - name: Check out vgi-rust
+        uses: actions/checkout@v4
+        with:
+          repository: Query-farm/vgi-rust
+          ref: v0.49.2
+          path: vgi-rust
+
+      - name: Cache vgi-rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: vgi-rust
+          key: windows-x86_64
+
+      - name: Build vgi-example-worker
+        working-directory: vgi-rust
+        run: cargo build --release --bin vgi-example-worker
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
@@ -384,7 +431,7 @@ jobs:
           -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
       - name: Build
-        run: cmake --build build --config Debug --parallel
+        run: cmake --build build --config Debug --parallel 12
 
       # A `launch:` worker's own `uv run --project vgi-python ...` does its
       # OWN implicit dependency install/sync on its first-ever invocation,
@@ -407,10 +454,33 @@ jobs:
       - name: Pre-sync vgi-python dependencies (including the http extra)
         run: uv sync --extra http --project "${{ github.workspace }}\vgi-python"
 
-      - name: Run integration tests
+      # http transport only - vgi-rust's own --unix launcher is POSIX-only
+      # today (see the vgi-rust checkout step's own comment), so this job
+      # never sets VGI_TEST_TRANSPORT=launch. Write/transaction/
+      # row_transform-specific tests are unaffected either way - they use
+      # vgi-python via THIS driver's own launch: (named pipes on Windows,
+      # unrelated to vgi-rust's own launcher gap - see CLAUDE.md's Windows
+      # launcher entry).
+      - name: Run integration tests (http transport)
         working-directory: test/integration
         env:
           VGI_PYTHON: ${{ github.workspace }}\vgi-python
+          VGI_RUST_WORKER: ${{ github.workspace }}\vgi-rust\target\release\vgi-example-worker.exe
+          VGI_TEST_TRANSPORT: http
         run: |
           uv sync
           uv run pytest -v
+
+      # Exercise the native CreateProcess/named-pipe discovery path as well.
+      # These files cover attach, scan, and transaction behavior without
+      # multiplying the already-expensive full Windows suite.
+      - name: "Run integration tests (launch: transport)"
+        working-directory: test/integration
+        env:
+          VGI_PYTHON: ${{ github.workspace }}\vgi-python
+          # vgi-rust's worker cannot accept --unix on Windows. The Python
+          # fixture worker does accept the same flag as a named-pipe address,
+          # so this still exercises the native CreateProcess/named-pipe path.
+          VGI_TEST_WORKER: launch:uv run --project ${{ github.workspace }}\vgi-python vgi-fixture-worker
+          VGI_TEST_TRANSPORT: launch
+        run: uv run pytest -v test_attach.py test_scan.py test_transactions.py

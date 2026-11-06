@@ -1,10 +1,9 @@
 {
   "name": "vgi-sqlite",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "dependencies": [
     "curl",
     "json-c",
-    "libevent",
     "lz4",
     "libsodium",
     "nlohmann-json",

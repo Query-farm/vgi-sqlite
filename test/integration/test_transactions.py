@@ -19,32 +19,32 @@ from __future__ import annotations
 import sqlite3
 
 
-def _attach(conn: sqlite3.Connection, worker_location: str) -> None:
-    conn.execute("SELECT vgi_attach(?, 'example')", (worker_location,))
+def _attach(conn: sqlite3.Connection, transactional_worker_location: str) -> None:
+    conn.execute("SELECT vgi_attach(?, 'example')", (transactional_worker_location,))
 
 
-def test_explicit_transaction_commit(conn: sqlite3.Connection, worker_location: str) -> None:
-    _attach(conn, worker_location)
+def test_explicit_transaction_commit(conn: sqlite3.Connection, transactional_worker_location: str) -> None:
+    _attach(conn, transactional_worker_location)
     conn.execute("BEGIN")
     (total,) = conn.execute('SELECT count(*) FROM "data.numbers"').fetchone()
     conn.execute("COMMIT")
     assert total == 100
 
 
-def test_explicit_transaction_rollback(conn: sqlite3.Connection, worker_location: str) -> None:
+def test_explicit_transaction_rollback(conn: sqlite3.Connection, transactional_worker_location: str) -> None:
     """Reads have no side effects to verify undone, but this still proves
     the catalog_transaction_rollback RPC round trip itself succeeds rather
     than erroring - a real, previously entirely-untested code path (every
     other test either commits or lets SQLite's own implicit per-statement
     transaction close normally)."""
-    _attach(conn, worker_location)
+    _attach(conn, transactional_worker_location)
     conn.execute("BEGIN")
     (total,) = conn.execute('SELECT count(*) FROM "data.numbers"').fetchone()
     conn.execute("ROLLBACK")
     assert total == 100
 
 
-def test_explicit_transaction_spans_multiple_tables(conn: sqlite3.Connection, worker_location: str) -> None:
+def test_explicit_transaction_spans_multiple_tables(conn: sqlite3.Connection, transactional_worker_location: str) -> None:
     """The core scenario ConnectionPool's ref-counted transaction
     coordination exists for: two different vgi_worker tables from the
     *same* catalog, both touched inside one explicit SQL transaction, so
@@ -54,7 +54,7 @@ def test_explicit_transaction_spans_multiple_tables(conn: sqlite3.Connection, wo
     here wouldn't necessarily error - it could just silently open two
     unrelated transactions - so this asserts on the actual data read from
     both tables, not just "no exception was raised"."""
-    _attach(conn, worker_location)
+    _attach(conn, transactional_worker_location)
     conn.execute("BEGIN")
     (numbers_count,) = conn.execute('SELECT count(*) FROM "data.numbers"').fetchone()
     (ten_thousand_count,) = conn.execute('SELECT count(*) FROM "data.ten_thousand_table"').fetchone()
@@ -64,9 +64,9 @@ def test_explicit_transaction_spans_multiple_tables(conn: sqlite3.Connection, wo
 
 
 def test_explicit_transaction_spans_multiple_tables_rollback(
-    conn: sqlite3.Connection, worker_location: str
+    conn: sqlite3.Connection, transactional_worker_location: str
 ) -> None:
-    _attach(conn, worker_location)
+    _attach(conn, transactional_worker_location)
     conn.execute("BEGIN")
     conn.execute('SELECT count(*) FROM "data.numbers"').fetchone()
     conn.execute('SELECT count(*) FROM "data.ten_thousand_table"').fetchone()
@@ -78,13 +78,13 @@ def test_explicit_transaction_spans_multiple_tables_rollback(
     assert total == 100
 
 
-def test_sequential_transactions_on_same_catalog(conn: sqlite3.Connection, worker_location: str) -> None:
+def test_sequential_transactions_on_same_catalog(conn: sqlite3.Connection, transactional_worker_location: str) -> None:
     """Two separate explicit transactions, one after another, on the same
     (location, catalog) - confirms a completed transaction's ref count
     correctly returns to zero so the next one begins its own fresh
     catalog_transaction_begin rather than being (incorrectly) treated as
     still active."""
-    _attach(conn, worker_location)
+    _attach(conn, transactional_worker_location)
     conn.execute("BEGIN")
     conn.execute('SELECT count(*) FROM "data.numbers"').fetchone()
     conn.execute("COMMIT")
