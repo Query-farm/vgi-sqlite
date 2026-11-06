@@ -93,8 +93,6 @@
 #include <string>
 #include <vector>
 
-#include <arrow/record_batch.h>
-
 #include "rpc/vgi_stream.h"
 #include "vtab/connection_pool.h"
 
@@ -113,7 +111,7 @@ public:
     // (routed to bind()'s `arguments` instead) - see the file comment.
     TableInOutCaller(ConnectionPool& pool, std::string location, std::string catalog_name,
                      std::string schema_name, std::string function_name,
-                     std::shared_ptr<arrow::Schema> input_schema);
+                     nano::SchemaPtr input_schema);
 
     // Best-effort stream close + connection release, mirroring
     // TableScanner's destructor - runs even if this caller was only ever
@@ -129,14 +127,14 @@ public:
     // an EMPTY arguments struct - no real named-arg values are available
     // yet at this call site) and returns the worker-resolved output
     // schema - the real one, not FunctionInfo.output_schema (empty/
-    // not-authoritative for a table-shaped function per vgi-c++'s own
+    // not-authoritative for a table-shaped function per vgi-c's own
     // encode_table_function_info comment: "A table function's output
     // schema is settled at bind"). Used by the vtab's xConnect/xCreate to
     // declare its DDL before any cursor/row (and hence no real named-arg
     // values) exists; a cursor's own caller never calls this directly -
     // its first Exchange() call does the REAL bind, threading that row's
     // actual named-arg values through (see Exchange()'s own comment).
-    const std::shared_ptr<arrow::Schema>& Bind();
+    const nano::SchemaPtr& Bind();
 
     // Sends `input_row` (must match the FULL declared input_schema this
     // caller was constructed with - the vtab's xFilter is responsible for
@@ -151,7 +149,7 @@ public:
     // that later row's named-argument values entirely (they can't take
     // effect after bind - also see the file comment). Throws on a
     // protocol violation (the stream closing mid-scan) or an RPC failure.
-    std::shared_ptr<arrow::RecordBatch> Exchange(const std::shared_ptr<arrow::RecordBatch>& input_row);
+    nano::BatchPtr Exchange(const nano::BatchPtr& input_row);
 
 private:
     // Binds (if not already bound) with `args_bytes` as BindRequest's
@@ -159,25 +157,25 @@ private:
     // exchange stream - shared by Bind() (empty args, probe-only) and
     // Exchange()'s first-call path (real args, from the row's own named
     // columns).
-    const std::shared_ptr<arrow::Schema>& EnsureBoundWithArgs(std::vector<uint8_t> args_bytes);
+    const nano::SchemaPtr& EnsureBoundWithArgs(std::vector<uint8_t> args_bytes);
 
     ConnectionPool& pool_;
     std::string location_;
     std::string catalog_name_;
     std::string schema_name_;
     std::string function_name_;
-    std::shared_ptr<arrow::Schema> input_schema_;  // full declared schema (positional + named)
+    nano::SchemaPtr input_schema_;  // full declared schema (positional + named)
 
     // Computed once in the constructor from input_schema_'s own field
     // metadata (VGI_ARG_KEY="vgi_arg"=="named") - see the file comment.
-    std::shared_ptr<arrow::Schema> stream_schema_;  // positional-only subset, in original relative order
+    nano::SchemaPtr stream_schema_;  // positional-only subset, in original relative order
     std::vector<int> stream_field_indices_;         // indices into input_schema_ that are positional
     std::vector<int> named_field_indices_;          // indices into input_schema_ that are named
 
     bool bound_ = false;
     std::optional<ConnectionPool::Checkout> checkout_;
     std::unique_ptr<VgiStream> stream_;
-    std::shared_ptr<arrow::Schema> output_schema_;
+    nano::SchemaPtr output_schema_;
 };
 
 }  // namespace vgi_sqlite

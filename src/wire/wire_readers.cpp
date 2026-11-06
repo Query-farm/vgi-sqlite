@@ -4,292 +4,175 @@
 #include <sstream>
 #include <stdexcept>
 
-#include <arrow/array.h>
-#include <arrow/io/memory.h>
-#include <arrow/ipc/reader.h>
-#include <arrow/ipc/writer.h>
-#include <arrow/result.h>
-#include <arrow/status.h>
-
 namespace vgi_sqlite::wire {
 namespace {
 
-[[noreturn]] void fail(const std::string& what) { throw std::runtime_error(what); }
-
-template <typename T>
-T unwrap(arrow::Result<T> result, const std::string& context) {
-    if (!result.ok()) fail(context + ": " + result.status().ToString());
-    return std::move(result).ValueUnsafe();
+bool has_column(const nano::BatchPtr& batch, const std::string& field) {
+    return batch && batch->column(field).valid();
 }
 
-void check_ok(const arrow::Status& status, const std::string& context) {
-    if (!status.ok()) fail(context + ": " + status.ToString());
+void require_rows(const nano::Column& value, const std::string& field) {
+    if (!value.valid()) throw std::runtime_error("no field '" + field + "'");
+    if (!value.length()) throw std::runtime_error("field '" + field + "' batch has no rows");
 }
 
-template <typename ArrayType>
-std::shared_ptr<ArrayType> typed_column(const std::shared_ptr<arrow::RecordBatch>& batch,
-                                         const std::string& field, const char* expected) {
-    auto arr = column(batch, field);
-    auto typed = std::dynamic_pointer_cast<ArrayType>(arr);
-    if (!typed) {
-        fail("field '" + field + "' is " + arr->type()->ToString() + ", expected " + expected);
+std::string text_value(const nano::Column& value, int64_t row, const std::string& field) {
+    if (value.IsNull(row)) throw std::runtime_error("field '" + field + "' is null but not optional");
+    auto actual = value;
+    if (value.view->dictionary) {
+        row = value.Int(row);
+        actual = value.dictionary();
     }
-    if (typed->length() < 1) fail("field '" + field + "' batch has no rows");
-    return typed;
-}
-
-// A field may be absent, not just null: the protocol adds nullable columns
-// additively, so a peer built against an older protocol surface simply does
-// not send/return them. Treating absence as an error would make every
-// response from such a peer fail, which is exactly what the additive rule
-// exists to prevent.
-bool has_column(const std::shared_ptr<arrow::RecordBatch>& batch, const std::string& field) {
-    return batch && batch->GetColumnByName(field) != nullptr;
+    auto type = actual.type_id();
+    if (type != NANOARROW_TYPE_STRING && type != NANOARROW_TYPE_LARGE_STRING &&
+        type != NANOARROW_TYPE_BINARY && type != NANOARROW_TYPE_LARGE_BINARY &&
+        type != NANOARROW_TYPE_FIXED_SIZE_BINARY)
+        throw std::runtime_error("field '" + field + "' is " + actual.TypeString() +
+                                 ", expected string or binary");
+    return actual.String(row);
 }
 
 }  // namespace
 
-std::shared_ptr<arrow::Array> column(const std::shared_ptr<arrow::RecordBatch>& batch,
-                                      const std::string& field) {
-    if (!batch) fail("field '" + field + "' requested from a null batch");
-    auto arr = batch->GetColumnByName(field);
-    if (!arr) {
-        std::ostringstream have;
-        for (int i = 0; i < batch->num_columns(); ++i) {
-            if (i) have << ", ";
-            have << batch->schema()->field(i)->name();
-        }
-        fail("no field '" + field + "'; batch carries [" + have.str() + "]");
+nano::Column column(const nano::BatchPtr& batch, const std::string& field) {
+    if (!batch) throw std::runtime_error("field '" + field + "' requested from a null batch");
+    auto result = batch->column(field);
+    if (result.valid()) return result;
+    std::ostringstream have;
+    for (int64_t i = 0; i < batch->num_columns(); ++i) {
+        if (i) have << ", ";
+        const auto* schema = batch->raw().schema.children[i];
+        have << (schema->name ? schema->name : "");
     }
-    return arr;
+    throw std::runtime_error("no field '" + field + "'; batch carries [" + have.str() + "]");
 }
 
-std::string get_string(const std::shared_ptr<arrow::RecordBatch>& batch, const std::string& field) {
-    auto arr = typed_column<arrow::StringArray>(batch, field, "string");
-    if (arr->IsNull(0)) fail("field '" + field + "' is null but not optional");
-    return arr->GetString(0);
+std::string get_string(const nano::BatchPtr& batch, const std::string& field) {
+    auto value = column(batch, field);
+    require_rows(value, field);
+    return text_value(value, 0, field);
 }
 
-std::optional<std::string> get_optional_string(const std::shared_ptr<arrow::RecordBatch>& batch,
+std::optional<std::string> get_optional_string(const nano::BatchPtr& batch,
                                                 const std::string& field) {
     if (!has_column(batch, field)) return std::nullopt;
-    auto arr = typed_column<arrow::StringArray>(batch, field, "string");
-    if (arr->IsNull(0)) return std::nullopt;
-    return arr->GetString(0);
+    auto value = column(batch, field);
+    require_rows(value, field);
+    return value.IsNull(0) ? std::nullopt : std::optional<std::string>(text_value(value, 0, field));
 }
 
-std::string get_binary(const std::shared_ptr<arrow::RecordBatch>& batch, const std::string& field) {
-    auto arr = typed_column<arrow::BinaryArray>(batch, field, "binary");
-    if (arr->IsNull(0)) fail("field '" + field + "' is null but not optional");
-    return arr->GetString(0);
+std::string get_binary(const nano::BatchPtr& batch, const std::string& field) {
+    return get_string(batch, field);
 }
 
-std::optional<std::string> get_optional_binary(const std::shared_ptr<arrow::RecordBatch>& batch,
+std::optional<std::string> get_optional_binary(const nano::BatchPtr& batch,
                                                 const std::string& field) {
+    return get_optional_string(batch, field);
+}
+
+bool get_bool(const nano::BatchPtr& batch, const std::string& field) {
+    auto value = column(batch, field);
+    require_rows(value, field);
+    if (value.IsNull(0)) throw std::runtime_error("field '" + field + "' is null but not optional");
+    return value.Bool(0);
+}
+
+std::optional<bool> get_optional_bool(const nano::BatchPtr& batch, const std::string& field) {
     if (!has_column(batch, field)) return std::nullopt;
-    // binary and large_binary alike: the protocol picks the wide form for
-    // fields that can exceed 2 GiB, and they're the same value to every
-    // caller here.
-    auto arr = column(batch, field);
-    if (auto wide = std::dynamic_pointer_cast<arrow::LargeBinaryArray>(arr)) {
-        return wide->IsNull(0) ? std::nullopt : std::optional<std::string>(wide->GetString(0));
-    }
-    // FunctionInfo interns its schema-valued fields as dictionary<int32, binary>.
-    if (auto encoded = std::dynamic_pointer_cast<arrow::DictionaryArray>(arr)) {
-        if (encoded->IsNull(0)) return std::nullopt;
-        auto values = std::dynamic_pointer_cast<arrow::BinaryArray>(encoded->dictionary());
-        if (!values) fail("field '" + field + "' is a dictionary of non-binary values");
-        const int64_t index = encoded->GetValueIndex(0);
-        if (index < 0 || index >= values->length()) {
-            fail("field '" + field + "' dictionary index " + std::to_string(index) + " is out of range");
-        }
-        return values->GetString(index);
-    }
-    auto narrow = typed_column<arrow::BinaryArray>(batch, field, "binary or large_binary");
-    if (narrow->IsNull(0)) return std::nullopt;
-    return narrow->GetString(0);
+    auto value = column(batch, field);
+    require_rows(value, field);
+    return value.IsNull(0) ? std::nullopt : std::optional<bool>(value.Bool(0));
 }
 
-bool get_bool(const std::shared_ptr<arrow::RecordBatch>& batch, const std::string& field) {
-    auto arr = typed_column<arrow::BooleanArray>(batch, field, "boolean");
-    if (arr->IsNull(0)) fail("field '" + field + "' is null but not optional");
-    return arr->Value(0);
+int64_t get_int64(const nano::BatchPtr& batch, const std::string& field) {
+    auto value = column(batch, field);
+    require_rows(value, field);
+    if (value.IsNull(0)) throw std::runtime_error("field '" + field + "' is null but not optional");
+    return value.Int(0);
 }
 
-std::optional<bool> get_optional_bool(const std::shared_ptr<arrow::RecordBatch>& batch,
-                                       const std::string& field) {
-    if (!has_column(batch, field)) return std::nullopt;
-    auto arr = typed_column<arrow::BooleanArray>(batch, field, "boolean");
-    if (arr->IsNull(0)) return std::nullopt;
-    return arr->Value(0);
-}
-
-int64_t get_int64(const std::shared_ptr<arrow::RecordBatch>& batch, const std::string& field) {
-    auto arr = typed_column<arrow::Int64Array>(batch, field, "int64");
-    if (arr->IsNull(0)) fail("field '" + field + "' is null but not optional");
-    return arr->Value(0);
-}
-
-std::optional<int64_t> get_optional_int64(const std::shared_ptr<arrow::RecordBatch>& batch,
+std::optional<int64_t> get_optional_int64(const nano::BatchPtr& batch,
                                            const std::string& field) {
     if (!has_column(batch, field)) return std::nullopt;
-    auto arr = typed_column<arrow::Int64Array>(batch, field, "int64");
-    if (arr->IsNull(0)) return std::nullopt;
-    return arr->Value(0);
+    auto value = column(batch, field);
+    require_rows(value, field);
+    return value.IsNull(0) ? std::nullopt : std::optional<int64_t>(value.Int(0));
 }
 
-std::string get_enum(const std::shared_ptr<arrow::RecordBatch>& batch, const std::string& field) {
-    auto arr = typed_column<arrow::DictionaryArray>(batch, field, "dictionary");
-    if (arr->IsNull(0)) fail("field '" + field + "' is null but not optional");
-    auto values = std::dynamic_pointer_cast<arrow::StringArray>(arr->dictionary());
-    if (!values) fail("field '" + field + "' is a dictionary of non-strings");
-    const auto* indices = dynamic_cast<const arrow::Int16Array*>(arr->indices().get());
-    if (!indices) fail("field '" + field + "' has non-int16 dictionary indices");
-    const auto index = indices->Value(0);
-    if (index < 0 || index >= values->length()) {
-        fail("field '" + field + "' dictionary index " + std::to_string(index) + " is out of range");
-    }
-    return values->GetString(index);
+std::string get_enum(const nano::BatchPtr& batch, const std::string& field) {
+    return get_string(batch, field);
 }
 
-std::optional<std::string> get_optional_enum(const std::shared_ptr<arrow::RecordBatch>& batch,
+std::optional<std::string> get_optional_enum(const nano::BatchPtr& batch,
                                               const std::string& field) {
-    if (!has_column(batch, field)) return std::nullopt;
-    auto arr = typed_column<arrow::DictionaryArray>(batch, field, "dictionary");
-    if (arr->IsNull(0)) return std::nullopt;
-    auto values = std::dynamic_pointer_cast<arrow::StringArray>(arr->dictionary());
-    if (!values) fail("field '" + field + "' is a dictionary of non-strings");
-    const auto* indices = dynamic_cast<const arrow::Int16Array*>(arr->indices().get());
-    if (!indices) fail("field '" + field + "' has non-int16 dictionary indices");
-    const auto index = indices->Value(0);
-    if (index < 0 || index >= values->length()) {
-        fail("field '" + field + "' dictionary index " + std::to_string(index) + " is out of range");
-    }
-    return values->GetString(index);
+    return get_optional_string(batch, field);
 }
 
-std::shared_ptr<arrow::RecordBatch> decode_ipc(const std::string& bytes) {
-    if (bytes.empty()) return nullptr;
-    auto buffer = arrow::Buffer::FromString(bytes);
-    auto source = std::make_shared<arrow::io::BufferReader>(buffer);
-    auto reader =
-        unwrap(arrow::ipc::RecordBatchStreamReader::Open(source), "reading an embedded IPC value");
-    std::shared_ptr<arrow::RecordBatch> batch;
-    check_ok(reader->ReadNext(&batch), "reading an embedded IPC batch");
-    return batch;
-}
+nano::BatchPtr decode_ipc(const std::string& bytes) { return nano::DecodeBatch(bytes); }
 
-std::vector<std::string> get_binary_list(const std::shared_ptr<arrow::RecordBatch>& batch,
+std::vector<std::string> get_binary_list(const nano::BatchPtr& batch,
                                           const std::string& field) {
-    std::vector<std::string> items;
-    if (!has_column(batch, field)) return items;
-    auto list = std::dynamic_pointer_cast<arrow::ListArray>(column(batch, field));
-    if (!list) fail("field '" + field + "' is not a list");
-    if (list->length() == 0 || list->IsNull(0)) return items;
-
-    const int64_t begin = list->value_offset(0);
-    const int64_t end = list->value_offset(1);
-    if (auto wide = std::dynamic_pointer_cast<arrow::LargeBinaryArray>(list->values())) {
-        for (int64_t i = begin; i < end; ++i) {
-            if (!wide->IsNull(i)) items.push_back(wide->GetString(i));
-        }
-        return items;
-    }
-    auto narrow = std::dynamic_pointer_cast<arrow::BinaryArray>(list->values());
-    if (!narrow) fail("field '" + field + "' is not a list of binary");
-    for (int64_t i = begin; i < end; ++i) {
-        if (!narrow->IsNull(i)) items.push_back(narrow->GetString(i));
-    }
-    return items;
+    std::vector<std::string> result;
+    if (!has_column(batch, field)) return result;
+    auto list = column(batch, field);
+    if (!list.length() || list.IsNull(0)) return result;
+    auto values = list.child(0);
+    for (int64_t i = list.Offset(0); i < list.Offset(1); ++i)
+        if (!values.IsNull(i)) result.push_back(values.String(i));
+    return result;
 }
 
-std::vector<int64_t> get_int64_list(const std::shared_ptr<arrow::RecordBatch>& batch,
+std::vector<int64_t> get_int64_list(const nano::BatchPtr& batch,
                                      const std::string& field) {
-    std::vector<int64_t> items;
-    if (!has_column(batch, field)) return items;
-    auto list = std::dynamic_pointer_cast<arrow::ListArray>(column(batch, field));
-    if (!list) fail("field '" + field + "' is not a list");
-    if (list->length() == 0 || list->IsNull(0)) return items;
-    auto values = std::dynamic_pointer_cast<arrow::Int64Array>(list->values());
-    if (!values) fail("field '" + field + "' is not a list of int64");
-    for (int64_t i = list->value_offset(0); i < list->value_offset(1); ++i) {
-        if (!values->IsNull(i)) items.push_back(values->Value(i));
-    }
-    return items;
+    std::vector<int64_t> result;
+    if (!has_column(batch, field)) return result;
+    auto list = column(batch, field);
+    if (!list.length() || list.IsNull(0)) return result;
+    auto values = list.child(0);
+    for (int64_t i = list.Offset(0); i < list.Offset(1); ++i)
+        if (!values.IsNull(i)) result.push_back(values.Int(i));
+    return result;
 }
 
-std::vector<std::string> get_string_list(const std::shared_ptr<arrow::RecordBatch>& batch,
+std::vector<std::string> get_string_list(const nano::BatchPtr& batch,
                                           const std::string& field) {
-    std::vector<std::string> items;
-    if (!has_column(batch, field)) return items;
-    auto list = std::dynamic_pointer_cast<arrow::ListArray>(column(batch, field));
-    if (!list) fail("field '" + field + "' is not a list");
-    if (list->length() == 0 || list->IsNull(0)) return items;
-    auto values = std::dynamic_pointer_cast<arrow::StringArray>(list->values());
-    if (!values) fail("field '" + field + "' is not a list of utf8");
-    for (int64_t i = list->value_offset(0); i < list->value_offset(1); ++i) {
-        if (!values->IsNull(i)) items.push_back(values->GetString(i));
-    }
-    return items;
+    return get_binary_list(batch, field);
 }
 
-std::optional<std::string> get_string_map_value(const std::shared_ptr<arrow::RecordBatch>& batch,
-                                                 const std::string& field, const std::string& key) {
+std::optional<std::string> get_string_map_value(const nano::BatchPtr& batch,
+                                                 const std::string& field,
+                                                 const std::string& key) {
     if (!has_column(batch, field)) return std::nullopt;
-    auto map = std::dynamic_pointer_cast<arrow::MapArray>(column(batch, field));
-    if (!map) fail("field '" + field + "' is not a map");
-    if (map->length() == 0 || map->IsNull(0)) return std::nullopt;
-    auto keys = std::dynamic_pointer_cast<arrow::StringArray>(map->keys());
-    auto items = std::dynamic_pointer_cast<arrow::StringArray>(map->items());
-    if (!keys || !items) fail("field '" + field + "' is not a map of utf8 to utf8");
-    for (int64_t i = map->value_offset(0); i < map->value_offset(1); ++i) {
-        if (keys->GetString(i) == key && !items->IsNull(i)) return items->GetString(i);
-    }
+    auto map = column(batch, field);
+    if (!map.length() || map.IsNull(0)) return std::nullopt;
+    auto entries = map.child(0);
+    auto keys = entries.child(0);
+    auto values = entries.child(1);
+    for (int64_t i = map.Offset(0); i < map.Offset(1); ++i)
+        if (!keys.IsNull(i) && keys.String(i) == key && !values.IsNull(i)) return values.String(i);
     return std::nullopt;
 }
 
-std::shared_ptr<arrow::RecordBatch> get_ipc(const std::shared_ptr<arrow::RecordBatch>& batch,
-                                             const std::string& field) {
+nano::BatchPtr get_ipc(const nano::BatchPtr& batch, const std::string& field) {
     auto bytes = get_optional_binary(batch, field);
-    if (!bytes) return nullptr;
-    return decode_ipc(*bytes);
+    return bytes ? decode_ipc(*bytes) : nullptr;
 }
 
-std::string encode_ipc(const std::shared_ptr<arrow::RecordBatch>& batch) {
-    if (auto status = batch->Validate(); !status.ok()) {
-        throw std::runtime_error("encoding an invalid IPC batch: " + status.ToString());
-    }
-    auto sink = unwrap(arrow::io::BufferOutputStream::Create(), "allocating an IPC sink");
-    auto writer =
-        unwrap(arrow::ipc::MakeStreamWriter(sink, batch->schema()), "opening an IPC writer");
-    check_ok(writer->WriteRecordBatch(*batch), "writing an embedded IPC batch");
-    check_ok(writer->Close(), "closing an embedded IPC stream");
-    auto buffer = unwrap(sink->Finish(), "finishing an IPC sink");
-    return buffer->ToString();
+std::string encode_ipc(const nano::BatchPtr& batch) {
+    if (!batch) throw std::runtime_error("cannot encode a null batch");
+    return nano::EncodeBatch(*batch);
 }
 
-std::shared_ptr<arrow::Schema> decode_schema(const std::string& bytes) {
-    if (bytes.empty()) return nullptr;
-    auto buffer = arrow::Buffer::FromString(bytes);
-    auto source = std::make_shared<arrow::io::BufferReader>(buffer);
-    auto reader =
-        unwrap(arrow::ipc::RecordBatchStreamReader::Open(source), "reading an embedded IPC schema");
-    return reader->schema();
+std::string encode_schema(const nano::SchemaPtr& schema) {
+    if (!schema) throw std::runtime_error("cannot encode a null schema");
+    return nano::EncodeSchema(*schema);
 }
 
-std::shared_ptr<arrow::Schema> get_schema(const std::shared_ptr<arrow::RecordBatch>& batch,
-                                           const std::string& field) {
+nano::SchemaPtr decode_schema(const std::string& bytes) { return nano::DecodeSchema(bytes); }
+
+nano::SchemaPtr get_schema(const nano::BatchPtr& batch, const std::string& field) {
     auto bytes = get_optional_binary(batch, field);
-    if (!bytes) return nullptr;
-    return decode_schema(*bytes);
-}
-
-std::string encode_schema(const std::shared_ptr<arrow::Schema>& schema) {
-    auto sink = unwrap(arrow::io::BufferOutputStream::Create(), "allocating a schema sink");
-    auto writer = unwrap(arrow::ipc::MakeStreamWriter(sink, schema), "opening a schema writer");
-    check_ok(writer->Close(), "closing a schema-only IPC stream");
-    auto buffer = unwrap(sink->Finish(), "finishing a schema sink");
-    return buffer->ToString();
+    return bytes ? decode_schema(*bytes) : nullptr;
 }
 
 }  // namespace vgi_sqlite::wire

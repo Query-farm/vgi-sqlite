@@ -23,7 +23,7 @@
 #include <string>
 #include <vector>
 
-#include <arrow/type.h>
+#include "wire/nanoarrow_types.h"
 
 struct sqlite3_index_info;
 struct sqlite3_value;
@@ -51,7 +51,7 @@ std::vector<PushableConstraint> SelectPushableConstraints(sqlite3_index_info* in
 // column type this encoder doesn't handle). `columns` is the unprojected
 // schema the scan binds to: a v2 column_ref's column_index indexes that
 // schema, not the projected output batch. Call from xFilter.
-std::optional<std::string> EncodePushdownFilters(const std::shared_ptr<arrow::Schema>& columns,
+std::optional<std::string> EncodePushdownFilters(const nano::SchemaPtr& columns,
                                                   const std::vector<PushableConstraint>& constraints,
                                                   sqlite3_value** argv);
 

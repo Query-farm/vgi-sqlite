@@ -65,8 +65,6 @@
 #include <string>
 #include <vector>
 
-#include <arrow/api.h>
-
 #include <sqlite3ext.h>
 SQLITE_EXTENSION_INIT3
 
@@ -115,8 +113,8 @@ struct VgiTableInOutVtab {
     std::string catalog_name;
     std::string schema_name;   // where the FUNCTION is registered
     std::string function_name;
-    std::shared_ptr<arrow::Schema> input_schema;   // declared arg names+types; HIDDEN column order
-    std::shared_ptr<arrow::Schema> output_schema;  // bind()-resolved; real output column order
+    nano::SchemaPtr input_schema;   // declared arg names+types; HIDDEN column order
+    nano::SchemaPtr output_schema;  // bind()-resolved; real output column order
 };
 
 struct VgiTableInOutCursor {
@@ -126,8 +124,8 @@ struct VgiTableInOutCursor {
     // reopened per outer row) - see table_in_out_caller.h's file comment
     // on why that's both correct and the point of this design.
     std::unique_ptr<TableInOutCaller> caller;
-    std::shared_ptr<arrow::RecordBatch> current_batch;   // this row's Exchange() response
-    std::shared_ptr<arrow::RecordBatch> current_input_row;  // for reading a HIDDEN column back
+    nano::BatchPtr current_batch;   // this row's Exchange() response
+    nano::BatchPtr current_input_row;  // for reading a HIDDEN column back
     int64_t row_in_batch = 0;
     int64_t rowid = 0;
     bool eof = true;  // true until the first xFilter runs
@@ -218,7 +216,8 @@ int ConnectImpl(sqlite3* db, void* pAux, int argc, const char* const* argv, sqli
     // every name declared so far.
     std::vector<std::string> declared_names;
     for (int i = 0; i < vtab->output_schema->num_fields(); ++i) {
-        declared_names.push_back(vtab->output_schema->field(i)->name());
+        const auto* field = vtab->output_schema->field(i);
+        declared_names.push_back(field->name ? field->name : "");
     }
     auto disambiguate = [&](const std::string& name) {
         if (std::find(declared_names.begin(), declared_names.end(), name) == declared_names.end()) return name;
@@ -236,21 +235,21 @@ int ConnectImpl(sqlite3* db, void* pAux, int argc, const char* const* argv, sqli
     for (int i = 0; i < vtab->output_schema->num_fields(); ++i) {
         if (!first) ddl << ", ";
         first = false;
-        const auto& field = vtab->output_schema->field(i);
-        ddl << SqlQuoteIdentifier(field->name()) << " " << SqliteDeclaredType(field->type());
+        const auto* field = vtab->output_schema->field(i);
+        ddl << SqlQuoteIdentifier(field->name ? field->name : "") << " " << SqliteDeclaredType(*field);
     }
     for (int i = 0; i < vtab->input_schema->num_fields(); ++i) {
         if (!first) ddl << ", ";
         first = false;
-        const auto& field = vtab->input_schema->field(i);
+        const auto* field = vtab->input_schema->field(i);
         // HIDDEN: bound from the table-valued-function call site's
         // positional arguments (or an explicit WHERE = constraint), never
         // returned by a plain SELECT * - see the file comment on why this
         // is what makes correlated `FROM t, fn(t.x)` work with no extra
         // code.
-        std::string hidden_name = disambiguate(field->name());
+        std::string hidden_name = disambiguate(field->name ? field->name : "");
         declared_names.push_back(hidden_name);
-        ddl << SqlQuoteIdentifier(hidden_name) << " " << SqliteDeclaredType(field->type()) << " HIDDEN";
+        ddl << SqlQuoteIdentifier(hidden_name) << " " << SqliteDeclaredType(*field) << " HIDDEN";
     }
     ddl << ")";
     if (int rc = sqlite3_declare_vtab(db, ddl.str().c_str()); rc != SQLITE_OK) {
@@ -340,23 +339,18 @@ int xFilter(sqlite3_vtab_cursor* base_cursor, int, const char*, int argc, sqlite
         return SetVtabError(base_cursor->pVtab, "vgi_table_in_out: internal error - argument count mismatch");
     }
     try {
-        std::vector<std::shared_ptr<arrow::Array>> columns;
+        std::vector<nano::ScalarPtr> values;
         for (int i = 0; i < num_hidden; ++i) {
-            auto scalar = BuildArrowScalarFromSqliteValue(argv[i], vtab->input_schema->field(i)->type());
+            const auto* field = vtab->input_schema->field(i);
+            auto scalar = BuildArrowScalarFromSqliteValue(argv[i], *field);
             if (!scalar) {
                 return SetVtabError(base_cursor->pVtab, "vgi_table_in_out: argument \"" +
-                                                             vtab->input_schema->field(i)->name() +
+                                                             std::string(field->name ? field->name : "") +
                                                              "\" doesn't match its declared type");
             }
-            auto array_result = arrow::MakeArrayFromScalar(*scalar, 1);
-            if (!array_result.ok()) {
-                return SetVtabError(base_cursor->pVtab, "vgi_table_in_out: building argument \"" +
-                                                             vtab->input_schema->field(i)->name() +
-                                                             "\": " + array_result.status().ToString());
-            }
-            columns.push_back(array_result.ValueUnsafe());
+            values.push_back(scalar);
         }
-        auto input_row = arrow::RecordBatch::Make(vtab->input_schema, 1, columns);
+        auto input_row = nano::Batch::FromScalars(vtab->input_schema, values);
 
         if (!cursor->caller) {
             // Lazily bound on this cursor's first xFilter, then reused
@@ -400,7 +394,7 @@ int xColumn(sqlite3_vtab_cursor* base_cursor, sqlite3_context* ctx, int col_idx)
             sqlite3_result_null(ctx);
             return SQLITE_OK;
         }
-        SetSqliteResultFromArrow(ctx, *cursor->current_batch->column(col_idx), cursor->row_in_batch);
+        SetSqliteResultFromArrow(ctx, cursor->current_batch->column(col_idx), cursor->row_in_batch);
         return SQLITE_OK;
     }
     // A HIDDEN argument column, explicitly selected back (unusual, but
@@ -412,7 +406,7 @@ int xColumn(sqlite3_vtab_cursor* base_cursor, sqlite3_context* ctx, int col_idx)
         sqlite3_result_null(ctx);
         return SQLITE_OK;
     }
-    SetSqliteResultFromArrow(ctx, *cursor->current_input_row->column(hidden_i), 0);
+    SetSqliteResultFromArrow(ctx, cursor->current_input_row->column(hidden_i), 0);
     return SQLITE_OK;
 }
 

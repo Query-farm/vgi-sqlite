@@ -1,6 +1,6 @@
 # © Copyright 2026 Query Farm LLC - https://query.farm
 cmake_minimum_required(VERSION 3.20)
-project(vgi-sqlite VERSION 0.2.0 LANGUAGES CXX C)
+project(vgi-sqlite VERSION 0.2.1 LANGUAGES CXX C)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -10,49 +10,26 @@ if(NOT MSVC)
 endif()
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# Position-independent code, globally, before pulling in vgi-c++ (and,
-# transitively through it, vgi-rpc-c++) below: every static library this
-# repo builds or depends on - vgi_sqlite_driver, vgi-c++'s own vgi target,
-# vgi-rpc-c++'s vgi_rpc target - ends up linked into vgi_extension, a
+# Position-independent code, globally, before pulling in vgi-c (and,
+# transitively through it, vgi-rpc-c) below: every static library this
+# repo builds or depends on ends up linked into vgi_extension, a
 # MODULE (shared) library. Linux's linker refuses non-PIC object code in a
 # shared object outright ("recompile with -fPIC"); macOS's doesn't enforce
 # this the same way for a static library linked into a dylib, so every
 # build of this repo so far (all on macOS) never surfaced it. Set here,
-# globally, rather than per-target: it has to apply to vgi-c++'s and
-# vgi-rpc-c++'s own targets too, and neither of those repos' CMakeLists.txt
+# globally, rather than per-target: it has to apply to vgi-c's and
+# vgi-rpc-c's own targets too, and neither of those repos' CMakeLists.txt
 # needs editing for that - a target created after this is set inherits it
 # unless it explicitly overrides POSITION_INDEPENDENT_CODE itself.
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # <windows.h> defines min, max and (through wingdi.h) ERROR as macros, which
-# breaks vgi-rpc-c++'s std::numeric_limits<...>::max() calls and its
-# LogLevel::ERROR. Set here so it reaches the sibling checkouts added below.
+# can interfere with C and C++ dependencies. Set the standard lean include
+# guards here so they reach the sibling checkouts added below.
 if(WIN32)
     add_compile_definitions(NOMINMAX NOGDI)
 endif()
 
-# ── vgi-c++ (worker SDK, also home of the public generated protocol
-#    schemas this client links against) and, transitively through it,
-#    vgi-rpc-c++ (the Arrow-IPC RPC transport: RpcClient et al.) ──────────
-#
-# Sibling-checkout build by default, same rationale as vgi-c++ takes for
-# vgi-rpc-c++: this driver and the SDK it links move together, so an
-# installed copy that can go stale silently is the opt-in, not the default.
-set(VGI_CPP_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../vgi-c++"
-    CACHE PATH "Sibling vgi-c++ checkout to build against")
-
-if(NOT EXISTS "${VGI_CPP_SOURCE_DIR}/CMakeLists.txt")
-    message(FATAL_ERROR
-        "vgi-c++ not found at ${VGI_CPP_SOURCE_DIR}.\n"
-        "Clone it beside this repo, or set -DVGI_CPP_SOURCE_DIR=<path>.")
-endif()
-# We only want the vgi library target (and, transitively, vgi_rpc) - not
-# vgi-c++'s own example worker or unit tests.
-set(VGI_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-add_subdirectory("${VGI_CPP_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/vgi-cpp" EXCLUDE_FROM_ALL)
-
-find_package(Arrow CONFIG REQUIRED)
-find_package(ArrowCompute CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
 
 # ── SQLite (the local, pinned build scripts/fetch_sqlite.sh produces) ─────
@@ -90,13 +67,41 @@ set_target_properties(sqlite3 PROPERTIES
     IMPORTED_LOCATION "${VGI_SQLITE_THIRD_PARTY_DIR}/${VGI_SQLITE_STATIC_LIB_NAME}"
     INTERFACE_INCLUDE_DIRECTORIES "${VGI_SQLITE_THIRD_PARTY_DIR}"
 )
-add_library(SQLite::SQLite3 ALIAS sqlite3)
+add_library(SQLite3::SQLite3 ALIAS sqlite3)
+
+# ── vgi-c + vgi-rpc-c (nanoarrow protocol schemas and client transport) ──
+#
+# vgi-sqlite is a client, but vgi-c is also the canonical native home of the
+# generated vgi.v3 schemas and the small VgiBatch helpers. vgi-rpc-c provides
+# the transport client and nanoarrow IPC implementation. Building the sibling
+# source trees keeps all three at the same protocol revision without restoring
+# the removed Arrow C++ dependency.
+set(VGI_C_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../vgi-c"
+    CACHE PATH "Sibling vgi-c checkout to build against")
+set(VGI_RPC_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../vgi-rpc-c"
+    CACHE PATH "Sibling vgi-rpc-c checkout to build against")
+if(NOT EXISTS "${VGI_C_SOURCE_DIR}/CMakeLists.txt")
+    message(FATAL_ERROR
+        "vgi-c not found at ${VGI_C_SOURCE_DIR}.\n"
+        "Clone it beside this repo, or set -DVGI_C_SOURCE_DIR=<path>.")
+endif()
+if(NOT EXISTS "${VGI_RPC_SOURCE_DIR}/CMakeLists.txt")
+    message(FATAL_ERROR
+        "vgi-rpc-c not found at ${VGI_RPC_SOURCE_DIR}.\n"
+        "Clone it beside this repo, or set -DVGI_RPC_SOURCE_DIR=<path>.")
+endif()
+set(VGI_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(VGI_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(VGI_BUILD_WORKER OFF CACHE BOOL "" FORCE)
+set(VGI_RPC_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(VGI_RPC_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+add_subdirectory("${VGI_C_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/vgi-c" EXCLUDE_FROM_ALL)
 
 # ── The driver: pure VGI client logic, no SQLite dependency ───────────────
 add_library(vgi_sqlite_driver
     src/rpc/vgi_connection.cpp
     src/rpc/launcher.cpp
-    src/wire/wire_builders.cpp
+    src/wire/nanoarrow_types.cpp
     src/wire/wire_readers.cpp
     src/catalog/catalog_requests.cpp
     src/catalog/catalog_client.cpp
@@ -117,9 +122,9 @@ target_include_directories(vgi_sqlite_driver PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
 )
 
-# vgi::vgi carries vgi-rpc-c++'s RpcClient (transport) and vgi-c++'s public
-# include/vgi/generated/ protocol schemas as PUBLIC transitive dependencies.
-target_link_libraries(vgi_sqlite_driver PUBLIC vgi::vgi nlohmann_json::nlohmann_json)
+# vgi::protocol carries vgi-rpc-c's client transport, nanoarrow IPC, VgiBatch
+# helpers, and the generated application-protocol schemas.
+target_link_libraries(vgi_sqlite_driver PUBLIC vgi::protocol nlohmann_json::nlohmann_json)
 if(WIN32)
     # src/rpc/launcher.cpp's Windows branch talks genuine AF_UNIX sockets
     # (WSAStartup/socket/connect/closesocket) - see launcher.h's
@@ -155,16 +160,15 @@ set_target_properties(vgi_extension PROPERTIES
 )
 
 if(WIN32)
-    # vcpkg's default Windows triplet (unlike Linux/macOS's default, which
-    # is static - see CLAUDE.md's ABI-contract note) builds Arrow and its
-    # own transitive dependencies (abseil, boost, re2, utf8proc, libevent,
-    # ...) as DLLs - vgi.dll needs these to actually LOAD, not just link
+# vcpkg's default Windows triplet (unlike Linux/macOS's default, which
+    # is static - see CLAUDE.md's ABI-contract note) builds the nanoarrow
+    # transport's native dependencies as DLLs - vgi.dll needs these to LOAD,
     # against, and a loadable extension must work from an arbitrary host
     # process's working directory, not just one that happens to be
     # colocated with vcpkg's own output tree. CMake's automatic runtime-DLL
     # copying (the VS-generator feature that copies some dependency DLLs
     # next to a target automatically) only follows the direct/known target
-    # link graph and misses several of Arrow's own transitive dependencies
+    # link graph and can miss native transitive dependencies
     # in practice - confirmed the hard way, a real `.load` failure ("the
     # specified module could not be found") with several vcpkg-built DLLs
     # sitting right next to the ones that DID get copied. Brute-force

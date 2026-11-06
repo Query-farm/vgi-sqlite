@@ -3,7 +3,7 @@
 // Usage: vgi-describe-worker <worker argv...>
 //
 // e.g. against the vgi-python example worker:
-//   vgi-describe-worker uv run --project ~/Development/vgi-python \
+//   vgi-describe-worker uv run --project ~/Development/vgi-python
 //       python examples/calc_worker.py
 //
 // Spawns the worker as a subprocess, opens an RpcClient over its stdio, and

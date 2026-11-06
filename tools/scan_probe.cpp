@@ -10,8 +10,6 @@
 #include <string>
 #include <vector>
 
-#include <arrow/type.h>
-
 #include "catalog/catalog_client.h"
 #include "catalog/table_scanner.h"
 #include "rpc/vgi_connection.h"
@@ -32,8 +30,8 @@ int main(int argc, char** argv) {
 
         auto attach = catalog.Attach(catalog_name);
         auto table = catalog.TableGet(attach.attach_opaque_data, schema_name, table_name);
-        std::printf("table '%s.%s': %d columns\n", schema_name.c_str(), table_name.c_str(),
-                    table.columns ? table.columns->num_fields() : 0);
+        std::printf("table '%s.%s': %lld columns\n", schema_name.c_str(), table_name.c_str(),
+                    static_cast<long long>(table.columns ? table.columns->num_fields() : 0));
         if (!table.scan_function) {
             std::fprintf(stderr, "error: table has no inlined scan_function (fallback RPC not implemented)\n");
             return 1;
@@ -53,7 +51,7 @@ int main(int argc, char** argv) {
             total_rows += (*batch)->num_rows();
             if (batch_count <= 3) {
                 std::printf("batch %d: %lld rows\n%s\n", batch_count, static_cast<long long>((*batch)->num_rows()),
-                            (*batch)->ToString().c_str());
+                            (*batch)->schema()->ToString().c_str());
             }
         }
         std::printf("done: %d batches, %lld total rows\n", batch_count, static_cast<long long>(total_rows));

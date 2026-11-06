@@ -17,7 +17,7 @@
 #include <string>
 #include <vector>
 
-#include <arrow/record_batch.h>
+#include "wire/nanoarrow_types.h"
 
 namespace vgi_sqlite {
 
@@ -28,7 +28,7 @@ namespace vgi_sqlite {
 // convention) - a zero-argument function encodes this as a 1-row batch of
 // zero columns, not an empty/null value (BindRequest.arguments is
 // non-nullable).
-std::shared_ptr<arrow::RecordBatch> BuildBindRequest(
+nano::BatchPtr BuildBindRequest(
     const std::string& function_name, const std::vector<uint8_t>& arguments_ipc_bytes,
     const std::string& function_type,  // "SCALAR", "TABLE", "AGGREGATE"
     const std::optional<std::vector<uint8_t>>& input_schema_bytes = std::nullopt,
@@ -40,12 +40,12 @@ std::shared_ptr<arrow::RecordBatch> BuildBindRequest(
     const std::optional<std::string>& schema_name = std::nullopt);
 
 struct BindResponseResult {
-    std::shared_ptr<arrow::Schema> output_schema;
+    nano::SchemaPtr output_schema;
     std::vector<uint8_t> opaque_data;  // empty if the worker sent null
 };
 
 // Parse BindResponse from the decoded inner result batch (1 row).
-BindResponseResult ParseBindResponse(const std::shared_ptr<arrow::RecordBatch>& batch);
+BindResponseResult ParseBindResponse(const nano::BatchPtr& batch);
 
 // init_request_bytes = wire::encode_ipc(BuildInitRequest(...)), passed to
 // generated::BuildInitParams(init_request_bytes). Every optional field
@@ -77,7 +77,7 @@ BindResponseResult ParseBindResponse(const std::shared_ptr<arrow::RecordBatch>& 
 // use case - see BuildTableFunctionPlanRequest's comment on why this
 // driver's plan requests never invite the worker to produce fewer, larger
 // splits than it would for a client that reads one at a time).
-std::shared_ptr<arrow::RecordBatch> BuildInitRequest(
+nano::BatchPtr BuildInitRequest(
     const std::vector<uint8_t>& bind_call_bytes, const std::vector<uint8_t>& output_schema_bytes,
     const std::optional<std::vector<uint8_t>>& bind_opaque_data = std::nullopt,
     const std::vector<int64_t>& projection_ids = {},
@@ -93,6 +93,6 @@ struct GlobalInitResponseResult {
     std::vector<uint8_t> opaque_data;
 };
 
-GlobalInitResponseResult ParseGlobalInitResponse(const std::shared_ptr<arrow::RecordBatch>& batch);
+GlobalInitResponseResult ParseGlobalInitResponse(const nano::BatchPtr& batch);
 
 }  // namespace vgi_sqlite

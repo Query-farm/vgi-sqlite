@@ -86,9 +86,6 @@
 #include <string>
 #include <vector>
 
-#include <arrow/record_batch.h>
-#include <arrow/type.h>
-
 #include "vtab/connection_pool.h"
 
 namespace vgi_sqlite {
@@ -115,7 +112,7 @@ public:
     // exactly num_args() elements. Argument types are re-inferred fresh
     // from this call's own actual values every time (see the file
     // comment).
-    std::shared_ptr<arrow::RecordBatch> Call(const std::vector<std::shared_ptr<arrow::Scalar>>& args);
+    nano::BatchPtr Call(const std::vector<nano::ScalarPtr>& args);
 
 private:
     ConnectionPool& pool_;

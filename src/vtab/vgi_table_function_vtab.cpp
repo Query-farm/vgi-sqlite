@@ -29,8 +29,6 @@
 #include <string>
 #include <vector>
 
-#include <arrow/api.h>
-
 #include <sqlite3ext.h>
 SQLITE_EXTENSION_INIT3
 
@@ -72,11 +70,8 @@ std::map<std::string, std::string> ParseModuleArgs(int argc, const char* const* 
 // table_in_out_caller.cpp's identical helper/file comment for the full
 // background (this is a general VGI argument-model concept, not specific
 // to either table_in_out or plain table functions).
-bool IsNamedArgument(const std::shared_ptr<arrow::Field>& field) {
-    auto metadata = field->metadata();
-    if (!metadata) return false;
-    auto value = metadata->Get("vgi_arg");
-    return value.ok() && *value == "named";
+bool IsNamedArgument(const ArrowSchema& field) {
+    return nano::MetadataValue(field, "vgi_arg") == "named";
 }
 
 // {args: struct<positional_N | named_<name>, ...>}, one row, built from
@@ -88,39 +83,29 @@ bool IsNamedArgument(const std::shared_ptr<arrow::Field>& field) {
 // (argument_spec.py) always sorts positional args first, by index,
 // before any named ones, so a positional field's declared index already
 // equals its true positional_N number.
-std::vector<uint8_t> BuildScanFunctionArgs(const std::shared_ptr<arrow::Schema>& argument_schema,
-                                           const std::vector<std::shared_ptr<arrow::Scalar>>& values) {
-    arrow::FieldVector fields;
+std::vector<uint8_t> BuildScanFunctionArgs(const nano::SchemaPtr& argument_schema,
+                                           const std::vector<nano::ScalarPtr>& values) {
+    std::vector<nano::SchemaPtr> fields;
+    std::vector<nano::SchemaPtr> value_fields;
     fields.reserve(argument_schema->num_fields());
     for (int i = 0; i < argument_schema->num_fields(); ++i) {
-        const auto& field = argument_schema->field(i);
+        const auto* field = argument_schema->field(i);
         std::string wire_name =
-            (IsNamedArgument(field) ? "named_" : "positional_") + (IsNamedArgument(field) ? field->name() : std::to_string(i));
-        fields.push_back(arrow::field(wire_name, field->type(), field->nullable()));
+            (IsNamedArgument(*field) ? "named_" : "positional_") +
+            (IsNamedArgument(*field) ? std::string(field->name ? field->name : "") : std::to_string(i));
+        fields.push_back(nano::Field(wire_name, nano::Schema::Copy(*field),
+                                     (field->flags & ARROW_FLAG_NULLABLE) != 0));
+        value_fields.push_back(nano::Schema::Copy(*field));
     }
-
-    // Same StructBuilder/AppendScalar construction as
-    // TableScanner::WrapAsArgsStruct and TableInOutCaller::
-    // BuildNamedArgsStruct - always exactly one row, regardless of source.
-    auto struct_type = arrow::struct_(fields);
-    std::unique_ptr<arrow::ArrayBuilder> builder;
-    auto make_status = arrow::MakeBuilder(arrow::default_memory_pool(), struct_type, &builder);
-    if (!make_status.ok()) throw std::runtime_error("building args struct builder: " + make_status.ToString());
-    auto* struct_builder = static_cast<arrow::StructBuilder*>(builder.get());
-    if (auto status = struct_builder->Append(); !status.ok()) {
-        throw std::runtime_error("appending args row: " + status.ToString());
-    }
-    for (size_t i = 0; i < values.size(); ++i) {
-        auto* field_builder = struct_builder->field_builder(static_cast<int>(i));
-        if (auto status = field_builder->AppendScalar(*values[i]); !status.ok()) {
-            throw std::runtime_error("appending argument " + std::to_string(i) + ": " + status.ToString());
-        }
-    }
-    auto finish_result = struct_builder->Finish();
-    if (!finish_result.ok()) throw std::runtime_error("finishing args struct: " + finish_result.status().ToString());
-
-    auto args_schema = arrow::schema({arrow::field("args", struct_type, false)});
-    auto args_batch = arrow::RecordBatch::Make(args_schema, 1, {finish_result.ValueUnsafe()});
+    auto value_batch = nano::Batch::FromScalars(nano::MakeSchema(value_fields), values);
+    std::vector<std::optional<std::pair<nano::Column, int64_t>>> struct_values;
+    for (int i = 0; i < value_batch->num_columns(); ++i)
+        struct_values.push_back(std::make_optional(std::make_pair(value_batch->column(i), int64_t{0})));
+    auto args_schema = nano::MakeSchema(
+        {nano::Field("args", nano::StructType(fields), false)});
+    auto args_batch = nano::Batch::Create(args_schema);
+    args_batch->SetStruct("args", struct_values);
+    args_batch->FinishRow();
     std::string encoded = wire::encode_ipc(args_batch);
     return {encoded.begin(), encoded.end()};
 }
@@ -128,31 +113,28 @@ std::vector<uint8_t> BuildScanFunctionArgs(const std::shared_ptr<arrow::Schema>&
 // A placeholder value for `type`, used only for xConnect's throwaway
 // output-schema probe (see the file comment on why real values aren't
 // needed/available there).
-std::shared_ptr<arrow::Scalar> PlaceholderScalar(const std::shared_ptr<arrow::DataType>& type) {
-    switch (type->id()) {
-        case arrow::Type::BOOL:
-            return arrow::MakeScalar(false);
-        case arrow::Type::INT8:
-        case arrow::Type::INT16:
-        case arrow::Type::INT32:
-        case arrow::Type::INT64:
-            return arrow::MakeScalar(static_cast<int64_t>(0))->CastTo(type).ValueOrDie();
-        case arrow::Type::UINT8:
-        case arrow::Type::UINT16:
-        case arrow::Type::UINT32:
-        case arrow::Type::UINT64:
-            return arrow::MakeScalar(static_cast<uint64_t>(0))->CastTo(type).ValueOrDie();
-        case arrow::Type::FLOAT:
-        case arrow::Type::DOUBLE:
-            return arrow::MakeScalar(0.0)->CastTo(type).ValueOrDie();
-        case arrow::Type::STRING:
-        case arrow::Type::LARGE_STRING:
-            return arrow::MakeScalar(std::string(""));
+nano::ScalarPtr PlaceholderScalar(const ArrowSchema& type_schema) {
+    auto type = nano::Schema::Copy(type_schema);
+    switch (nano::TypeId(type_schema)) {
+        case NANOARROW_TYPE_BOOL: return nano::Scalar::Boolean(false, type);
+        case NANOARROW_TYPE_INT8:
+        case NANOARROW_TYPE_INT16:
+        case NANOARROW_TYPE_INT32:
+        case NANOARROW_TYPE_INT64: return nano::Scalar::Signed(0, type);
+        case NANOARROW_TYPE_UINT8:
+        case NANOARROW_TYPE_UINT16:
+        case NANOARROW_TYPE_UINT32:
+        case NANOARROW_TYPE_UINT64: return nano::Scalar::Unsigned(0, type);
+        case NANOARROW_TYPE_HALF_FLOAT:
+        case NANOARROW_TYPE_FLOAT:
+        case NANOARROW_TYPE_DOUBLE: return nano::Scalar::Real(0.0, type);
+        case NANOARROW_TYPE_STRING:
+        case NANOARROW_TYPE_LARGE_STRING: return nano::Scalar::String("", type);
         default:
             // Best-effort null of the declared type for anything else
             // (binary, temporal, ...) - a probe-only value, never sent to
             // real data logic.
-            return arrow::MakeNullScalar(type);
+            return nano::Scalar::Null(type);
     }
 }
 
@@ -169,8 +151,8 @@ struct VgiTableFunctionVtab {
     std::string catalog_name;
     std::string schema_name;    // where the FUNCTION is registered
     std::string function_name;
-    std::shared_ptr<arrow::Schema> argument_schema;  // declared arg names+types; HIDDEN column order
-    std::shared_ptr<arrow::Schema> output_schema;    // bind()-resolved; real output column order
+    nano::SchemaPtr argument_schema;  // declared arg names+types; HIDDEN column order
+    nano::SchemaPtr output_schema;    // bind()-resolved; real output column order
     bool supports_splits = false;
 };
 
@@ -180,8 +162,8 @@ struct VgiTableFunctionCursor {
     // field-order contract as VgiCursor in vgi_vtab.cpp).
     std::optional<ConnectionPool::Checkout> checkout;
     std::unique_ptr<TableScanner> scanner;
-    std::shared_ptr<arrow::RecordBatch> current_batch;
-    std::shared_ptr<arrow::RecordBatch> current_args_row;  // for reading a HIDDEN column back
+    nano::BatchPtr current_batch;
+    nano::BatchPtr current_args_row;  // for reading a HIDDEN column back
     int64_t row_in_batch = 0;
     int64_t rowid = 0;
     // AdvanceBatch (below) only ever sets this true, on a genuine
@@ -242,9 +224,9 @@ int ConnectImpl(sqlite3* db, void* pAux, int argc, const char* const* argv, sqli
         vtab->argument_schema = fn.argument_schema;
         vtab->supports_splits = fn.supports_splits;
 
-        std::vector<std::shared_ptr<arrow::Scalar>> placeholders;
+        std::vector<nano::ScalarPtr> placeholders;
         for (int i = 0; i < vtab->argument_schema->num_fields(); ++i) {
-            placeholders.push_back(PlaceholderScalar(vtab->argument_schema->field(i)->type()));
+            placeholders.push_back(PlaceholderScalar(*vtab->argument_schema->field(i)));
         }
         ScanFunction scan_function;
         scan_function.function_name = fn.function_name;
@@ -266,7 +248,8 @@ int ConnectImpl(sqlite3* db, void* pAux, int argc, const char* const* argv, sqli
     // handling here.
     std::vector<std::string> declared_names;
     for (int i = 0; i < vtab->output_schema->num_fields(); ++i) {
-        declared_names.push_back(vtab->output_schema->field(i)->name());
+        const auto* field = vtab->output_schema->field(i);
+        declared_names.push_back(field->name ? field->name : "");
     }
     auto disambiguate = [&](const std::string& name) {
         if (std::find(declared_names.begin(), declared_names.end(), name) == declared_names.end()) return name;
@@ -284,16 +267,16 @@ int ConnectImpl(sqlite3* db, void* pAux, int argc, const char* const* argv, sqli
     for (int i = 0; i < vtab->output_schema->num_fields(); ++i) {
         if (!first) ddl << ", ";
         first = false;
-        const auto& field = vtab->output_schema->field(i);
-        ddl << SqlQuoteIdentifier(field->name()) << " " << SqliteDeclaredType(field->type());
+        const auto* field = vtab->output_schema->field(i);
+        ddl << SqlQuoteIdentifier(field->name ? field->name : "") << " " << SqliteDeclaredType(*field);
     }
     for (int i = 0; i < vtab->argument_schema->num_fields(); ++i) {
         if (!first) ddl << ", ";
         first = false;
-        const auto& field = vtab->argument_schema->field(i);
-        std::string hidden_name = disambiguate(field->name());
+        const auto* field = vtab->argument_schema->field(i);
+        std::string hidden_name = disambiguate(field->name ? field->name : "");
         declared_names.push_back(hidden_name);
-        ddl << SqlQuoteIdentifier(hidden_name) << " " << SqliteDeclaredType(field->type()) << " HIDDEN";
+        ddl << SqlQuoteIdentifier(hidden_name) << " " << SqliteDeclaredType(*field) << " HIDDEN";
     }
     ddl << ")";
     if (int rc = sqlite3_declare_vtab(db, ddl.str().c_str()); rc != SQLITE_OK) {
@@ -391,25 +374,18 @@ int xFilter(sqlite3_vtab_cursor* base_cursor, int, const char*, int argc, sqlite
         return SetVtabError(base_cursor->pVtab, "vgi_table_function: internal error - argument count mismatch");
     }
     try {
-        std::vector<std::shared_ptr<arrow::Scalar>> values;
-        std::vector<std::shared_ptr<arrow::Array>> columns;
+        std::vector<nano::ScalarPtr> values;
         for (int i = 0; i < num_hidden; ++i) {
-            auto scalar = BuildArrowScalarFromSqliteValue(argv[i], vtab->argument_schema->field(i)->type());
+            const auto* field = vtab->argument_schema->field(i);
+            auto scalar = BuildArrowScalarFromSqliteValue(argv[i], *field);
             if (!scalar) {
                 return SetVtabError(base_cursor->pVtab, "vgi_table_function: argument \"" +
-                                                             vtab->argument_schema->field(i)->name() +
+                                                             std::string(field->name ? field->name : "") +
                                                              "\" doesn't match its declared type");
             }
             values.push_back(scalar);
-            auto array_result = arrow::MakeArrayFromScalar(*scalar, 1);
-            if (!array_result.ok()) {
-                return SetVtabError(base_cursor->pVtab, "vgi_table_function: building argument \"" +
-                                                             vtab->argument_schema->field(i)->name() +
-                                                             "\": " + array_result.status().ToString());
-            }
-            columns.push_back(array_result.ValueUnsafe());
         }
-        cursor->current_args_row = arrow::RecordBatch::Make(vtab->argument_schema, 1, columns);
+        cursor->current_args_row = nano::Batch::FromScalars(vtab->argument_schema, values);
 
         // Fresh checkout + scanner every call - no persistence needed
         // across xFilter calls on the same cursor (see the header's file
@@ -479,7 +455,7 @@ int xColumn(sqlite3_vtab_cursor* base_cursor, sqlite3_context* ctx, int col_idx)
             sqlite3_result_null(ctx);
             return SQLITE_OK;
         }
-        SetSqliteResultFromArrow(ctx, *cursor->current_batch->column(col_idx), cursor->row_in_batch);
+        SetSqliteResultFromArrow(ctx, cursor->current_batch->column(col_idx), cursor->row_in_batch);
         return SQLITE_OK;
     }
     const int hidden_i = col_idx - num_output;
@@ -487,7 +463,7 @@ int xColumn(sqlite3_vtab_cursor* base_cursor, sqlite3_context* ctx, int col_idx)
         sqlite3_result_null(ctx);
         return SQLITE_OK;
     }
-    SetSqliteResultFromArrow(ctx, *cursor->current_args_row->column(hidden_i), 0);
+    SetSqliteResultFromArrow(ctx, cursor->current_args_row->column(hidden_i), 0);
     return SQLITE_OK;
 }
 

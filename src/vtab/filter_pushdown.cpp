@@ -1,7 +1,6 @@
 // © Copyright 2026 Query Farm LLC - https://query.farm
 #include "vtab/filter_pushdown.h"
 
-#include <arrow/api.h>
 #include <nlohmann/json.hpp>
 
 // See vgi_vtab.cpp's file comment: only ever compiled into vgi_extension,
@@ -39,62 +38,52 @@ bool IsNullCheck(unsigned char op) {
 // combination it doesn't (temporal, decimal, nested, or a value SQLite
 // can't coerce into the column's declared storage class), which the
 // caller treats as "don't push this one".
-std::shared_ptr<arrow::Array> BuildValueArray(sqlite3_value* value,
-                                               const std::shared_ptr<arrow::DataType>& column_type) {
-    switch (column_type->id()) {
-        case arrow::Type::BOOL: {
+nano::ScalarPtr BuildValue(sqlite3_value* value, const ArrowSchema& column_type) {
+    auto type = nano::Schema::Copy(column_type);
+    switch (nano::TypeId(column_type)) {
+        case NANOARROW_TYPE_BOOL: {
             // Bind-compatibility: a BOOLEAN column needs a BOOLEAN literal.
             // SQLite has no boolean class, so only 0 and 1 have a faithful one.
             if (sqlite3_value_type(value) != SQLITE_INTEGER) return nullptr;
             const auto integer = sqlite3_value_int64(value);
             if (integer != 0 && integer != 1) return nullptr;
-            arrow::BooleanBuilder builder;
-            if (!builder.Append(integer == 1).ok()) return nullptr;
-            auto result = builder.Finish();
-            return result.ok() ? result.ValueUnsafe() : nullptr;
+            return nano::Scalar::Boolean(integer == 1, type);
         }
-        case arrow::Type::INT8:
-        case arrow::Type::INT16:
-        case arrow::Type::INT32:
-        case arrow::Type::INT64:
-        case arrow::Type::UINT8:
-        case arrow::Type::UINT16:
-        case arrow::Type::UINT32:
-        case arrow::Type::UINT64: {
+        case NANOARROW_TYPE_INT8:
+        case NANOARROW_TYPE_INT16:
+        case NANOARROW_TYPE_INT32:
+        case NANOARROW_TYPE_INT64: {
             if (sqlite3_value_type(value) != SQLITE_INTEGER) return nullptr;
-            arrow::Int64Builder builder;
-            if (!builder.Append(sqlite3_value_int64(value)).ok()) return nullptr;
-            auto result = builder.Finish();
-            return result.ok() ? result.ValueUnsafe() : nullptr;
+            return nano::Scalar::Signed(sqlite3_value_int64(value), type);
         }
-        case arrow::Type::HALF_FLOAT:
-        case arrow::Type::FLOAT:
-        case arrow::Type::DOUBLE: {
+        case NANOARROW_TYPE_UINT8:
+        case NANOARROW_TYPE_UINT16:
+        case NANOARROW_TYPE_UINT32:
+        case NANOARROW_TYPE_UINT64: {
+            if (sqlite3_value_type(value) != SQLITE_INTEGER || sqlite3_value_int64(value) < 0)
+                return nullptr;
+            return nano::Scalar::Unsigned(static_cast<uint64_t>(sqlite3_value_int64(value)), type);
+        }
+        case NANOARROW_TYPE_HALF_FLOAT:
+        case NANOARROW_TYPE_FLOAT:
+        case NANOARROW_TYPE_DOUBLE: {
             auto vtype = sqlite3_value_type(value);
             if (vtype != SQLITE_FLOAT && vtype != SQLITE_INTEGER) return nullptr;
-            arrow::DoubleBuilder builder;
-            if (!builder.Append(sqlite3_value_double(value)).ok()) return nullptr;
-            auto result = builder.Finish();
-            return result.ok() ? result.ValueUnsafe() : nullptr;
+            return nano::Scalar::Real(sqlite3_value_double(value), type);
         }
-        case arrow::Type::STRING:
-        case arrow::Type::LARGE_STRING: {
+        case NANOARROW_TYPE_STRING:
+        case NANOARROW_TYPE_LARGE_STRING: {
             if (sqlite3_value_type(value) != SQLITE_TEXT) return nullptr;
             const auto* text = reinterpret_cast<const char*>(sqlite3_value_text(value));
-            arrow::StringBuilder builder;
-            if (!builder.Append(text ? text : "").ok()) return nullptr;
-            auto result = builder.Finish();
-            return result.ok() ? result.ValueUnsafe() : nullptr;
+            return nano::Scalar::String(text ? text : "", type);
         }
-        case arrow::Type::BINARY:
-        case arrow::Type::LARGE_BINARY: {
+        case NANOARROW_TYPE_BINARY:
+        case NANOARROW_TYPE_LARGE_BINARY: {
             if (sqlite3_value_type(value) != SQLITE_BLOB) return nullptr;
             const auto* data = reinterpret_cast<const uint8_t*>(sqlite3_value_blob(value));
             int size = sqlite3_value_bytes(value);
-            arrow::BinaryBuilder builder;
-            if (!builder.Append(data, size).ok()) return nullptr;
-            auto result = builder.Finish();
-            return result.ok() ? result.ValueUnsafe() : nullptr;
+            return nano::Scalar::Binary(data ? std::vector<uint8_t>(data, data + size)
+                                             : std::vector<uint8_t>{}, type);
         }
         default:
             return nullptr;  // temporal/decimal/nested: not pushed
@@ -118,38 +107,39 @@ std::vector<PushableConstraint> SelectPushableConstraints(sqlite3_index_info* in
     return selected;
 }
 
-std::optional<std::string> EncodePushdownFilters(const std::shared_ptr<arrow::Schema>& columns,
+std::optional<std::string> EncodePushdownFilters(const nano::SchemaPtr& columns,
                                                   const std::vector<PushableConstraint>& constraints,
                                                   sqlite3_value** argv) {
     if (!columns || constraints.empty()) return std::nullopt;
 
     auto predicates = nlohmann::json::array();
-    arrow::FieldVector value_fields;
-    std::vector<std::shared_ptr<arrow::Array>> value_arrays;
+    std::vector<nano::SchemaPtr> value_fields;
+    std::vector<nano::ScalarPtr> values;
 
     for (size_t i = 0; i < constraints.size(); ++i) {
         const auto& constraint = constraints[i];
         if (constraint.column_index >= columns->num_fields()) continue;
-        const auto& field = columns->field(constraint.column_index);
+        const auto* field = columns->field(constraint.column_index);
 
         const nlohmann::json column_ref = {{"node", "column_ref"},
                                            {"column_index", constraint.column_index},
-                                           {"column_name", field->name()}};
+                                           {"column_name", field->name ? field->name : ""}};
         nlohmann::json expression;
         if (IsNullCheck(constraint.op)) {
             expression = {{"node", "is_null"},
                           {"expression", column_ref},
                           {"negated", constraint.op == SQLITE_INDEX_CONSTRAINT_ISNOTNULL}};
         } else {
-            auto value_array = BuildValueArray(argv[i], field->type());
-            if (!value_array) continue;  // type mismatch/unsupported - skip this one, not the batch
-            const auto value_ref = value_arrays.size();
+            auto value = BuildValue(argv[i], *field);
+            if (!value) continue;  // type mismatch/unsupported - skip this one, not the batch
+            const auto value_ref = values.size();
             expression = {{"node", "comparison"},
                           {"op", *OpName(constraint.op)},
                           {"left", column_ref},
                           {"right", {{"node", "literal"}, {"value_ref", value_ref}}}};
-            value_fields.push_back(arrow::field("value_" + std::to_string(value_ref), value_array->type()));
-            value_arrays.push_back(value_array);
+            value_fields.push_back(nano::Field("value_" + std::to_string(value_ref),
+                                               nano::Schema::Copy(*field)));
+            values.push_back(value);
         }
         predicates.push_back({{"id", "query:" + std::to_string(predicates.size())},
                               {"revision", 0},
@@ -168,22 +158,16 @@ std::optional<std::string> EncodePushdownFilters(const std::shared_ptr<arrow::Sc
     // Schema-level, not field-level, metadata. vgi.none.v1 is the right
     // context: every predicate is a binary comparison or NULL test, and a
     // vtab column has SQLite's default BINARY collation.
-    auto metadata = std::make_shared<arrow::KeyValueMetadata>();
-    metadata->Append("vgi_filter_encoding", "vgi.filters.v2");
-    metadata->Append("vgi_filter_version", "2");
-    metadata->Append("vgi_evaluation_context", "vgi.none.v1");
-    arrow::FieldVector fields = {arrow::field("filter_spec", arrow::utf8(), false)};
+    std::vector<nano::SchemaPtr> fields = {
+        nano::Field("filter_spec", nano::Type(NANOARROW_TYPE_STRING), false)};
     fields.insert(fields.end(), value_fields.begin(), value_fields.end());
-
-    arrow::StringBuilder spec_builder;
-    if (!spec_builder.Append(document.dump()).ok()) return std::nullopt;
-    auto spec_result = spec_builder.Finish();
-    if (!spec_result.ok()) return std::nullopt;
-
-    std::vector<std::shared_ptr<arrow::Array>> arrays = {spec_result.ValueUnsafe()};
-    arrays.insert(arrays.end(), value_arrays.begin(), value_arrays.end());
-
-    auto batch = arrow::RecordBatch::Make(arrow::schema(fields, metadata), 1, arrays);
+    auto schema = nano::MakeSchema(fields);
+    schema->SetMetadata({{"vgi_filter_encoding", "vgi.filters.v2"},
+                         {"vgi_filter_version", "2"},
+                         {"vgi_evaluation_context", "vgi.none.v1"}});
+    std::vector<nano::ScalarPtr> scalars = {nano::Scalar::String(document.dump())};
+    scalars.insert(scalars.end(), values.begin(), values.end());
+    auto batch = nano::Batch::FromScalars(schema, scalars);
     return wire::encode_ipc(batch);
 }
 

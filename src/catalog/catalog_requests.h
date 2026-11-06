@@ -16,7 +16,7 @@
 #include <string>
 #include <vector>
 
-#include <arrow/record_batch.h>
+#include "wire/nanoarrow_types.h"
 
 namespace vgi_sqlite {
 
@@ -27,7 +27,7 @@ namespace vgi_sqlite {
 // of ATTACH-option key/values, itself passed pre-encoded), data_version_spec
 // and implementation_version (semver constraints, unconstrained when
 // nullopt). See the definition for the capabilities it offers.
-std::shared_ptr<arrow::RecordBatch> BuildCatalogAttachRequest(
+nano::BatchPtr BuildCatalogAttachRequest(
     const std::string& name, const std::optional<std::vector<uint8_t>>& options_ipc_bytes,
     const std::optional<std::string>& data_version_spec,
     const std::optional<std::string>& implementation_version);

@@ -3,8 +3,6 @@
 
 #include <stdexcept>
 
-#include <arrow/api.h>
-
 #include "generated/vgi_request_builders.hpp"
 #include "wire/wire_readers.h"
 
@@ -12,154 +10,40 @@ namespace vgi_sqlite {
 namespace {
 namespace gen = ::vgi::generated;
 
-void check_ok(const arrow::Status& status, const char* what) {
-    if (!status.ok()) throw std::runtime_error(std::string(what) + ": " + status.ToString());
-}
-
-template <typename BuilderType>
-std::shared_ptr<arrow::Array> finish(BuilderType& builder, const char* what) {
-    auto result = builder.Finish();
-    if (!result.ok()) throw std::runtime_error(std::string("finishing ") + what + ": " + result.status().ToString());
-    return result.ValueUnsafe();
-}
-
-std::shared_ptr<arrow::Array> binary_scalar(const std::vector<uint8_t>& bytes) {
-    arrow::BinaryBuilder b;
-    check_ok(b.Append(bytes.data(), static_cast<int32_t>(bytes.size())), "append binary");
-    return finish(b, "binary");
-}
-
-std::shared_ptr<arrow::Array> null_binary() {
-    arrow::BinaryBuilder b;
-    check_ok(b.AppendNull(), "append null binary");
-    return finish(b, "null binary");
-}
-
-std::shared_ptr<arrow::Array> null_large_binary() {
-    arrow::LargeBinaryBuilder b;
-    check_ok(b.AppendNull(), "append null large_binary");
-    return finish(b, "null large_binary");
-}
-
-std::shared_ptr<arrow::Array> null_int64() {
-    arrow::Int64Builder b;
-    check_ok(b.AppendNull(), "append null int64");
-    return finish(b, "null int64");
-}
-
-std::shared_ptr<arrow::Array> null_dictionary(const std::shared_ptr<arrow::DataType>& dict_type,
-                                               const std::vector<std::string>& dictionary_values) {
-    arrow::Int16Builder index_builder;
-    check_ok(index_builder.AppendNull(), "append null dict index");
-    auto index_arr = finish(index_builder, "null_dict_index");
-    arrow::StringBuilder dict_builder;
-    for (const auto& v : dictionary_values) check_ok(dict_builder.Append(v), "append dict value");
-    auto dict_arr = finish(dict_builder, "dict_values");
-    auto result = arrow::DictionaryArray::FromArrays(dict_type, index_arr, dict_arr);
-    check_ok(result.status(), "creating null dictionary array");
-    return result.ValueUnsafe();
-}
-
 }  // namespace
 
-std::shared_ptr<arrow::RecordBatch> BuildTableFunctionPlanRequest(
+nano::BatchPtr BuildTableFunctionPlanRequest(
     const std::vector<uint8_t>& bind_call_bytes, const std::vector<uint8_t>& bind_opaque_data,
     const std::vector<int64_t>& projection_ids, const std::optional<std::string>& pushdown_filters,
     const std::vector<uint8_t>& cursor) {
-    auto dict_type = arrow::dictionary(arrow::int16(), arrow::utf8());
-    // Field order/nullability ported verbatim from vgi's own
-    // BuildTableFunctionPlanRequest (vgi_rpc_types.cpp) - see this repo's
-    // scan_requests.h file comment on why that match is load-bearing, not
-    // cosmetic.
-    auto schema = arrow::schema({
-        arrow::field("bind_call", arrow::binary(), false),
-        arrow::field("bind_opaque_data", arrow::binary(), true),
-        arrow::field("projection_ids", arrow::list(arrow::int64()), true),
-        arrow::field("pushdown_filters", arrow::large_binary(), true),
-        arrow::field("join_keys", arrow::list(arrow::large_binary()), true),
-        arrow::field("row_limit", arrow::int64(), true),
-        arrow::field("target_split_bytes", arrow::int64(), true),
-        arrow::field("min_splits", arrow::int64(), true),
-        arrow::field("max_splits_per_response", arrow::int64(), true),
-        arrow::field("cursor", arrow::binary(), true),
-        arrow::field("refined_filters", arrow::large_binary(), true),
-        arrow::field("filters_complete", arrow::boolean(), false),
-        arrow::field("start_position", arrow::binary(), true),
-        arrow::field("end_position", arrow::binary(), true),
-        arrow::field("order_by_column_name", arrow::utf8(), true),
-        arrow::field("order_by_direction", dict_type, true),
-        arrow::field("order_by_null_order", dict_type, true),
-        arrow::field("order_by_limit", arrow::int64(), true),
-        arrow::field("tablesample_percentage", arrow::float64(), true),
-        arrow::field("tablesample_seed", arrow::int64(), true),
-    });
-
-    std::vector<std::shared_ptr<arrow::Array>> arrays;
-    arrays.push_back(binary_scalar(bind_call_bytes));
-    arrays.push_back(bind_opaque_data.empty() ? null_binary() : binary_scalar(bind_opaque_data));
-    {
-        auto values = std::make_shared<arrow::Int64Builder>();
-        arrow::ListBuilder list(arrow::default_memory_pool(), values);
-        if (projection_ids.empty()) {
-            check_ok(list.AppendNull(), "append null projection_ids");
-        } else {
-            check_ok(list.Append(), "start projection_ids");
-            for (auto id : projection_ids) check_ok(values->Append(id), "append projection id");
-        }
-        arrays.push_back(finish(list, "projection_ids"));
-    }
-    {
-        arrow::LargeBinaryBuilder b;
-        if (pushdown_filters) {
-            check_ok(b.Append(pushdown_filters->data(), static_cast<int64_t>(pushdown_filters->size())),
-                     "append pushdown_filters");
-        } else {
-            check_ok(b.AppendNull(), "append null pushdown_filters");
-        }
-        arrays.push_back(finish(b, "pushdown_filters"));
-    }
-    {
-        // join_keys: always null - a plan is built from static filters
-        // only; dynamic join-key pushdown into split planning isn't
-        // implemented (see this file's header comment).
-        auto values = std::make_shared<arrow::LargeBinaryBuilder>();
-        arrow::ListBuilder list(arrow::default_memory_pool(), values);
-        check_ok(list.AppendNull(), "append null join_keys");
-        arrays.push_back(finish(list, "join_keys"));
-    }
-    arrays.push_back(null_int64());  // row_limit - not computed for a plan request (see xBestIndex's LIMIT-pushdown
-                                      // scoping; threading it through split planning is unimplemented)
-    arrays.push_back(null_int64());  // target_split_bytes - this driver has no byte budget to invent
-    arrays.push_back(null_int64());  // min_splits - this driver never reads more than one split at a time,
-                                      // so there's no concurrency-derived floor to send (unlike vgi's own
-                                      // DuckDB client, which sends its thread count)
-    arrays.push_back(null_int64());  // max_splits_per_response - no pagination-size preference; take whatever
-                                      // page size the worker chooses
-    arrays.push_back(cursor.empty() ? null_binary() : binary_scalar(cursor));
-    arrays.push_back(null_large_binary());  // refined_filters - see join_keys
-    {
-        // filters_complete: always true - this driver plans from the same
-        // static, already-fully-resolved filter set an ordinary init
-        // would use; holding splits back awaiting a narrower filter that
-        // will never arrive would stall the scan forever.
-        arrow::BooleanBuilder b;
-        check_ok(b.Append(true), "append filters_complete");
-        arrays.push_back(finish(b, "filters_complete"));
-    }
-    arrays.push_back(null_binary());  // start_position - no streaming/incremental scan support
-    arrays.push_back(null_binary());  // end_position
-    arrays.push_back(arrow::MakeArrayOfNull(arrow::utf8(), 1).ValueOrDie());  // order_by_column_name
-    arrays.push_back(null_dictionary(dict_type, {"ASC", "DESC"}));                  // order_by_direction
-    arrays.push_back(null_dictionary(dict_type, {"NULLS_FIRST", "NULLS_LAST"}));    // order_by_null_order
-    arrays.push_back(null_int64());                                                 // order_by_limit
-    {
-        arrow::DoubleBuilder b;
-        check_ok(b.AppendNull(), "append null tablesample_percentage");
-        arrays.push_back(finish(b, "tablesample_percentage"));
-    }
-    arrays.push_back(null_int64());  // tablesample_seed
-
-    return arrow::RecordBatch::Make(schema, 1, arrays);
+    auto request = nano::Batch::Named("TableFunctionPlanRequest");
+    request->SetBytes("bind_call", bind_call_bytes);
+    request->SetBytes("bind_opaque_data", bind_opaque_data.empty()
+                                                  ? std::optional<std::vector<uint8_t>>{}
+                                                  : std::optional<std::vector<uint8_t>>(bind_opaque_data));
+    request->SetInt64List("projection_ids", projection_ids.empty()
+                                                   ? std::optional<std::vector<int64_t>>{}
+                                                   : std::optional<std::vector<int64_t>>(projection_ids));
+    request->SetBytes("pushdown_filters", pushdown_filters);
+    request->SetNull("join_keys");
+    request->SetNull("row_limit");
+    request->SetNull("target_split_bytes");
+    request->SetNull("min_splits");
+    request->SetNull("max_splits_per_response");
+    request->SetBytes("cursor", cursor.empty() ? std::optional<std::vector<uint8_t>>{}
+                                                : std::optional<std::vector<uint8_t>>(cursor));
+    request->SetNull("refined_filters");
+    request->SetBool("filters_complete", true);
+    request->SetNull("start_position");
+    request->SetNull("end_position");
+    request->SetNull("order_by_column_name");
+    request->SetNull("order_by_direction");
+    request->SetNull("order_by_null_order");
+    request->SetNull("order_by_limit");
+    request->SetNull("tablesample_percentage");
+    request->SetNull("tablesample_seed");
+    request->FinishRow();
+    return request;
 }
 
 namespace {
@@ -187,7 +71,7 @@ struct PlanPage {
     std::optional<std::string> range_partitioning;
 };
 
-PlanPage ParsePlanPage(const std::shared_ptr<arrow::RecordBatch>& batch) {
+PlanPage ParsePlanPage(const nano::BatchPtr& batch) {
     PlanPage page;
     if (!batch || batch->num_rows() == 0) return page;
 
@@ -243,10 +127,10 @@ PlanPage ParsePlanPage(const std::shared_ptr<arrow::RecordBatch>& batch) {
 }
 
 struct TransformKey {
-    std::shared_ptr<arrow::Field> identity_field;
+    const ArrowSchema* identity_field = nullptr;
 };
 
-TransformKey ParseTransform(const std::string& bytes, const std::shared_ptr<arrow::Schema>& output_schema,
+TransformKey ParseTransform(const std::string& bytes, const nano::SchemaPtr& output_schema,
                             const std::string& context) {
     auto transform = wire::decode_ipc(bytes);
     if (!transform || transform->num_rows() != 1) {
@@ -267,7 +151,7 @@ TransformKey ParseTransform(const std::string& bytes, const std::shared_ptr<arro
     auto path = wire::decode_ipc(inputs.front());
     const auto components = wire::get_string_list(path, "components");
     if (components.size() != 1) return result;
-    result.identity_field = output_schema ? output_schema->GetFieldByName(components.front()) : nullptr;
+    result.identity_field = output_schema ? output_schema->field(components.front()) : nullptr;
     if (!result.identity_field) {
         throw std::runtime_error(context + " identity field '" + components.front() + "' is not in the output schema");
     }
@@ -275,7 +159,7 @@ TransformKey ParseTransform(const std::string& bytes, const std::shared_ptr<arro
 }
 
 std::vector<TransformKey> ParseKeyGrouping(const std::string& bytes,
-                                           const std::shared_ptr<arrow::Schema>& output_schema) {
+                                           const nano::SchemaPtr& output_schema) {
     auto grouping = wire::decode_ipc(bytes);
     if (!grouping || grouping->num_rows() != 1) {
         throw std::runtime_error("key_grouping must contain exactly one row");
@@ -294,7 +178,7 @@ struct ParsedRangePartitioning {
 };
 
 ParsedRangePartitioning ParseRangePartitioning(const std::string& bytes,
-                                               const std::shared_ptr<arrow::Schema>& output_schema) {
+                                               const nano::SchemaPtr& output_schema) {
     auto range = wire::decode_ipc(bytes);
     if (!range || range->num_rows() != 1) {
         throw std::runtime_error("range_partitioning must contain exactly one row");
@@ -323,11 +207,12 @@ ParsedRangePartitioning ParseRangePartitioning(const std::string& bytes,
                                  " columns; expected " + std::to_string(parsed.keys.size()));
     }
     for (int i = 0; i < split_points->num_columns(); ++i) {
-        const auto& expected = parsed.keys[static_cast<size_t>(i)].identity_field;
-        const auto& actual = split_points->schema()->field(i);
-        if (expected && !actual->type()->Equals(expected->type())) {
-            throw std::runtime_error("range_partitioning split point column '" + expected->name() + "' has type " +
-                                     actual->type()->ToString() + "; expected " + expected->type()->ToString());
+        const auto* expected = parsed.keys[static_cast<size_t>(i)].identity_field;
+        const auto* actual = split_points->raw().schema.children[i];
+        if (expected && nano::TypeName(*actual) != nano::TypeName(*expected)) {
+            throw std::runtime_error("range_partitioning split point column '" +
+                                     std::string(expected->name ? expected->name : "") + "' has type " +
+                                     nano::TypeName(*actual) + "; expected " + nano::TypeName(*expected));
         }
     }
     parsed.split_point_count = split_points->num_rows();
@@ -336,7 +221,7 @@ ParsedRangePartitioning ParseRangePartitioning(const std::string& bytes,
 
 void ValidateSplitMetadata(const std::vector<PlanPage::Split>& splits, const std::optional<std::string>& key_grouping,
                            const std::optional<std::string>& range_partitioning,
-                           const std::shared_ptr<arrow::Schema>& output_schema) {
+                           const nano::SchemaPtr& output_schema) {
     std::optional<std::vector<TransformKey>> grouping;
     if (key_grouping) grouping = ParseKeyGrouping(*key_grouping, output_schema);
     std::optional<ParsedRangePartitioning> ranges;
@@ -361,12 +246,12 @@ void ValidateSplitMetadata(const std::vector<PlanPage::Split>& splits, const std
                                          std::to_string(grouping->size()));
             }
             for (int i = 0; i < key->num_columns(); ++i) {
-                const auto& expected = (*grouping)[static_cast<size_t>(i)].identity_field;
-                const auto& actual = key->schema()->field(i);
-                if (expected && !actual->type()->Equals(expected->type())) {
+                const auto* expected = (*grouping)[static_cast<size_t>(i)].identity_field;
+                const auto* actual = key->raw().schema.children[i];
+                if (expected && nano::TypeName(*actual) != nano::TypeName(*expected)) {
                     throw std::runtime_error("split " + std::to_string(split_index) + " key_value column '" +
-                                             expected->name() + "' has type " + actual->type()->ToString() +
-                                             "; expected " + expected->type()->ToString());
+                                             std::string(expected->name ? expected->name : "") + "' has type " +
+                                             nano::TypeName(*actual) + "; expected " + nano::TypeName(*expected));
                 }
             }
         } else if (split.key_value) {
@@ -405,7 +290,7 @@ void ValidateSplitMetadata(const std::vector<PlanPage::Split>& splits, const std
 
 TableFunctionPlan PlanTableFunctionSplits(VgiConnection& connection, const std::vector<uint8_t>& bind_call_bytes,
                                           const std::vector<uint8_t>& bind_opaque_data,
-                                          const std::shared_ptr<arrow::Schema>& output_schema,
+                                          const nano::SchemaPtr& output_schema,
                                           const std::vector<int64_t>& projection_ids,
                                           const std::optional<std::string>& pushdown_filters) {
     // Bounds mirror vgi's own InvokeTableFunctionPlan: generous, and exist

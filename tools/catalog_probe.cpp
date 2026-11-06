@@ -12,8 +12,6 @@
 #include <string>
 #include <vector>
 
-#include <arrow/type.h>
-
 #include "catalog/catalog_client.h"
 #include "rpc/vgi_connection.h"
 
@@ -44,10 +42,11 @@ int main(int argc, char** argv) {
                 }
                 std::printf("\n");
                 if (table.columns) {
-                    for (const auto& field : table.columns->fields()) {
-                        std::printf("    %-24s %s%s\n", field->name().c_str(),
-                                    field->type()->ToString().c_str(),
-                                    field->nullable() ? "" : " NOT NULL");
+                    for (int64_t i = 0; i < table.columns->num_fields(); ++i) {
+                        const auto* field = table.columns->field(i);
+                        std::printf("    %-24s %s%s\n", field->name ? field->name : "",
+                                    vgi_sqlite::nano::TypeName(*field).c_str(),
+                                    (field->flags & ARROW_FLAG_NULLABLE) ? "" : " NOT NULL");
                     }
                 }
             }

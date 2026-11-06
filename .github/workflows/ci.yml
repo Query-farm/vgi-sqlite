@@ -14,7 +14,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Pinned to the same commit vgi-c++'s own CI pins, for a consistent port
+  # Pinned to the same commit vgi-c's own CI pins, for a consistent port
   # set across the org's sibling repos - vcpkg.json has no builtin-baseline
   # of its own (a known, separate gap - see CLAUDE.md), so without this the
   # exact ports resolved would otherwise drift between runs and between repos.
@@ -38,22 +38,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # vgi-cpp (public) and, transitively through it, vgi-rpc-cpp (public) -
-      # sibling-checkout build, same pattern vgi-c++'s own CI uses for
-      # vgi-rpc-cpp. No credential needed: both are public repos.
-      - name: Check out vgi-cpp
+      # vgi-c (public) and, transitively through it, vgi-rpc-c (public) -
+      # sibling-checkout build, same pattern vgi-c's own CI uses for
+      # vgi-rpc-c. No credential needed: both are public repos.
+      - name: Check out vgi-c
         uses: actions/checkout@v4
         with:
-          repository: Query-farm/vgi-cpp
-          ref: v0.14.0
-          path: vgi-cpp
+          repository: Query-farm/vgi-c
+          ref: v0.1.1
+          path: vgi-c
 
-      - name: Check out vgi-rpc-cpp
+      - name: Check out vgi-rpc-c
         uses: actions/checkout@v4
         with:
-          repository: Query-farm/vgi-rpc-cpp
-          ref: v0.11.0
-          path: vgi-rpc-c++
+          repository: Query-farm/vgi-rpc-c
+          ref: v0.1.1
+          path: vgi-rpc-c
 
       # vgi-python (public) - source of the fixture worker test/integration
       # drives via `launch:` locations (see conftest.py).
@@ -218,7 +218,8 @@ jobs:
       - name: Configure
         run: >
           cmake --preset default
-          -DVGI_CPP_SOURCE_DIR=${{ github.workspace }}/vgi-cpp
+          -DVGI_C_SOURCE_DIR=${{ github.workspace }}/vgi-c
+          -DVGI_RPC_SOURCE_DIR=${{ github.workspace }}/vgi-rpc-c
           -DCMAKE_C_COMPILER_LAUNCHER=ccache
           -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
@@ -265,7 +266,7 @@ jobs:
   # pytest suite, 52 passed/7 skipped, 0 failed) and `launch:`/AF_UNIX
   # (vgi_attach() over launch: against a real worker, real catalog
   # discovery, real data) - see CLAUDE.md's Windows entries for the full
-  # history, including the vgi-rpc-c++ fix (Windows AF_UNIX client
+  # history, including the vgi-rpc-c fix (Windows AF_UNIX client
   # transport, previously a stub) `launch:` needed.
   build-and-test-windows:
     runs-on: windows-2022
@@ -273,19 +274,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check out vgi-cpp
+      - name: Check out vgi-c
         uses: actions/checkout@v4
         with:
-          repository: Query-farm/vgi-cpp
-          ref: v0.14.0
-          path: vgi-cpp
+          repository: Query-farm/vgi-c
+          ref: v0.1.1
+          path: vgi-c
 
-      - name: Check out vgi-rpc-cpp
+      - name: Check out vgi-rpc-c
         uses: actions/checkout@v4
         with:
-          repository: Query-farm/vgi-rpc-cpp
-          ref: v0.11.0
-          path: vgi-rpc-c++
+          repository: Query-farm/vgi-rpc-c
+          ref: v0.1.1
+          path: vgi-rpc-c
 
       - name: Check out vgi-python
         uses: actions/checkout@v4
@@ -377,7 +378,8 @@ jobs:
       - name: Configure
         run: >
           cmake --preset default -A x64
-          -DVGI_CPP_SOURCE_DIR="$env:GITHUB_WORKSPACE\vgi-cpp"
+          -DVGI_C_SOURCE_DIR="$env:GITHUB_WORKSPACE\vgi-c"
+          -DVGI_RPC_SOURCE_DIR="$env:GITHUB_WORKSPACE\vgi-rpc-c"
           -DCMAKE_C_COMPILER_LAUNCHER=ccache
           -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 

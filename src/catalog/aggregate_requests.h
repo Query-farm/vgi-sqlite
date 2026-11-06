@@ -25,8 +25,7 @@
 #include <string>
 #include <vector>
 
-#include <arrow/record_batch.h>
-#include <arrow/type.h>
+#include "wire/nanoarrow_types.h"
 
 namespace vgi_sqlite {
 
@@ -35,25 +34,25 @@ namespace vgi_sqlite {
 // is the same empty (0-field) const-args struct scalar functions bind with
 // (see scalar_function_caller.cpp's BuildEmptyArgsBytes) - no aggregate
 // this driver calls takes a ConstParam/named argument.
-std::shared_ptr<arrow::RecordBatch> BuildAggregateBindRequest(
+nano::BatchPtr BuildAggregateBindRequest(
     const std::string& function_name, const std::vector<uint8_t>& arguments_ipc_bytes,
     const std::optional<std::vector<uint8_t>>& input_schema_bytes = std::nullopt,
     const std::optional<std::vector<uint8_t>>& attach_opaque_data = std::nullopt,
     const std::optional<std::string>& schema_name = std::nullopt);
 
 struct AggregateBindResponseResult {
-    std::shared_ptr<arrow::Schema> output_schema;
+    nano::SchemaPtr output_schema;
     std::vector<uint8_t> execution_id;
 };
 
-AggregateBindResponseResult ParseAggregateBindResponse(const std::shared_ptr<arrow::RecordBatch>& batch);
+AggregateBindResponseResult ParseAggregateBindResponse(const nano::BatchPtr& batch);
 
 // input_batch_ipc_bytes: full IPC stream of a batch whose first column is
 // "__vgi_group_id" (int64, always a single row here - AggregateCaller
 // calls this once per SQLite xStep) followed by the aggregate's value
 // columns in declaration order (omitted entirely for a nullary aggregate
 // like a COUNT(*)-style function - group_id alone carries the row).
-std::shared_ptr<arrow::RecordBatch> BuildAggregateUpdateRequest(const std::string& function_name,
+nano::BatchPtr BuildAggregateUpdateRequest(const std::string& function_name,
                                                                  const std::vector<uint8_t>& execution_id,
                                                                  const std::vector<uint8_t>& input_batch_ipc_bytes,
                                                                  const std::optional<std::vector<uint8_t>>& attach_opaque_data = std::nullopt,
@@ -63,7 +62,7 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateUpdateRequest(const std::strin
 // {group_id: int64} batch naming which group(s) to produce results for -
 // always a single row (0) here, since AggregateCaller finalizes exactly
 // the one group its execution_id scopes.
-std::shared_ptr<arrow::RecordBatch> BuildAggregateFinalizeRequest(
+nano::BatchPtr BuildAggregateFinalizeRequest(
     const std::string& function_name, const std::vector<uint8_t>& execution_id,
     const std::vector<uint8_t>& group_ids_batch_ipc_bytes, const std::vector<uint8_t>& output_schema_bytes,
     const std::optional<std::vector<uint8_t>>& attach_opaque_data = std::nullopt,
@@ -72,9 +71,9 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateFinalizeRequest(
 // Parses AggregateFinalizeResponse.result_batch (full IPC stream bytes)
 // into the decoded batch - one row per requested group_id, in that order
 // (so row 0 here for AggregateCaller's always-one-group-id call).
-std::shared_ptr<arrow::RecordBatch> ParseAggregateFinalizeResponse(const std::shared_ptr<arrow::RecordBatch>& batch);
+nano::BatchPtr ParseAggregateFinalizeResponse(const nano::BatchPtr& batch);
 
-std::shared_ptr<arrow::RecordBatch> BuildAggregateDestructorRequest(
+nano::BatchPtr BuildAggregateDestructorRequest(
     const std::string& function_name, const std::vector<uint8_t>& execution_id,
     const std::vector<uint8_t>& group_ids_batch_ipc_bytes,
     const std::optional<std::vector<uint8_t>>& attach_opaque_data = std::nullopt,

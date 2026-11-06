@@ -3,8 +3,6 @@
 
 #include <stdexcept>
 
-#include <arrow/api.h>
-
 #include "catalog/catalog_table_plan.h"
 #include "catalog/scan_requests.h"
 #include "generated/vgi_request_builders.hpp"
@@ -16,8 +14,8 @@ namespace gen = ::vgi::generated;
 
 std::vector<uint8_t> to_bytes(const std::string& s) { return {s.begin(), s.end()}; }
 
-std::shared_ptr<arrow::RecordBatch> Call(VgiConnection& connection, const std::string& method,
-                                          const std::shared_ptr<arrow::RecordBatch>& params) {
+nano::BatchPtr Call(VgiConnection& connection, const std::string& method,
+                                          const nano::BatchPtr& params) {
     auto response = connection.CallUnary(method, params);
     return wire::get_ipc(response.batch, "result");
 }
@@ -37,54 +35,22 @@ std::shared_ptr<arrow::RecordBatch> Call(VgiConnection& connection, const std::s
 // found by testing a no-arg table, not documented anywhere read ahead of
 // time). Repackage, rename, AND normalize to exactly one row - never trust
 // flat->num_rows() for the output row count.
-std::vector<uint8_t> WrapAsArgsStruct(const std::shared_ptr<arrow::RecordBatch>& flat) {
-    arrow::FieldVector fields;
+std::vector<uint8_t> WrapAsArgsStruct(const nano::BatchPtr& flat) {
+    std::vector<nano::SchemaPtr> fields;
+    std::vector<std::optional<std::pair<nano::Column, int64_t>>> values;
     for (int i = 0; i < flat->num_columns(); ++i) {
-        fields.push_back(arrow::field("positional_" + std::to_string(i), flat->schema()->field(i)->type(),
-                                       flat->schema()->field(i)->nullable()));
+        const auto* source = flat->raw().schema.children[i];
+        fields.push_back(nano::Field("positional_" + std::to_string(i), nano::Schema::Copy(*source),
+                                     (source->flags & ARROW_FLAG_NULLABLE) != 0));
+        values.push_back(flat->num_rows() == 0
+                             ? std::optional<std::pair<nano::Column, int64_t>>{}
+                             : std::make_optional(std::make_pair(flat->column(i), int64_t{0})));
     }
-
-    // Build the one-row struct directly via StructBuilder/child builders
-    // rather than StructArray::Make(children, fields) (which infers length
-    // from the children and would carry over flat's own - possibly zero -
-    // row count): every path here must produce exactly one struct row,
-    // regardless of how many rows the flat source batch had.
-    auto struct_type = arrow::struct_(fields);
-    std::unique_ptr<arrow::ArrayBuilder> builder;
-    auto make_status = arrow::MakeBuilder(arrow::default_memory_pool(), struct_type, &builder);
-    if (!make_status.ok()) throw std::runtime_error("building args struct builder: " + make_status.ToString());
-    auto* struct_builder = static_cast<arrow::StructBuilder*>(builder.get());
-    if (auto append_status = struct_builder->Append(); !append_status.ok()) {
-        throw std::runtime_error("appending args struct row: " + append_status.ToString());
-    }
-    // Every child builder must end up exactly as long as the struct's own
-    // row count (1) or Finish() produces a struct claiming 1 row over
-    // children that don't agree - append a real value when flat has a row
-    // to read it from, else null (observed empty-args encoding: 0
-    // *columns* and 0 rows together, so this braces for the case those
-    // ever diverge - 0 rows with >0 columns - rather than assuming it away).
-    for (int i = 0; i < flat->num_columns(); ++i) {
-        auto* field_builder = struct_builder->field_builder(i);
-        if (flat->num_rows() == 0) {
-            if (auto status = field_builder->AppendNull(); !status.ok()) {
-                throw std::runtime_error("appending null arg " + std::to_string(i) + ": " + status.ToString());
-            }
-            continue;
-        }
-        auto scalar_result = flat->column(i)->GetScalar(0);
-        if (!scalar_result.ok()) {
-            throw std::runtime_error("reading arg " + std::to_string(i) + ": " + scalar_result.status().ToString());
-        }
-        if (auto append_status = field_builder->AppendScalar(**scalar_result); !append_status.ok()) {
-            throw std::runtime_error("appending arg " + std::to_string(i) + ": " + append_status.ToString());
-        }
-    }
-    auto finish_result = struct_builder->Finish();
-    if (!finish_result.ok()) throw std::runtime_error("finishing args struct: " + finish_result.status().ToString());
-    auto struct_array = finish_result.ValueUnsafe();
-
-    auto args_schema = arrow::schema({arrow::field("args", struct_type, false)});
-    auto args_batch = arrow::RecordBatch::Make(args_schema, /*num_rows=*/1, {struct_array});
+    auto args_schema = nano::MakeSchema(
+        {nano::Field("args", nano::StructType(fields), /*nullable=*/false)});
+    auto args_batch = nano::Batch::Create(args_schema);
+    args_batch->SetStruct("args", values);
+    args_batch->FinishRow();
     return to_bytes(wire::encode_ipc(args_batch));
 }
 
@@ -208,7 +174,7 @@ void TableScanner::OpenNextSplit() {
     ++next_split_index_;
 }
 
-std::optional<std::shared_ptr<arrow::RecordBatch>> TableScanner::Next() {
+std::optional<nano::BatchPtr> TableScanner::Next() {
     if (!inited_) throw std::runtime_error("TableScanner::Next called before Init");
     // tick() returning nullopt is the real end-of-stream signal (the
     // worker closed its response stream, i.e. called out.finish()). A

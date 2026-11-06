@@ -1,26 +1,14 @@
 {
   "name": "vgi-sqlite",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "dependencies": [
-    {
-      "name": "arrow",
-      "default-features": false,
-      "features": [
-        "compute"
-      ]
-    },
     "curl",
+    "json-c",
+    "libevent",
     "libsodium",
     "nlohmann-json",
-    {
-      "name": "cpp-httplib",
-      "features": [
-        "zstd",
-        "zlib",
-        "brotli",
-        "openssl"
-      ]
-    },
+    "zlib",
+    "zstd",
     "catch2"
   ]
 }

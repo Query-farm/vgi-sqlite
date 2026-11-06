@@ -42,8 +42,6 @@
 #include <string>
 #include <vector>
 
-#include <arrow/record_batch.h>
-
 #include "catalog/catalog_client.h"  // ScanFunction
 #include "vtab/connection_pool.h"
 
@@ -62,7 +60,7 @@ public:
     // transaction_opaque_data: see TableScanner::Bind's doc comment - same
     // contract, same ConnectionPool::CurrentTransactionOpaqueData source.
     int64_t Write(const ScanFunction& write_function, const std::optional<std::string>& schema_name,
-                  const std::shared_ptr<arrow::RecordBatch>& input_row,
+                  const nano::BatchPtr& input_row,
                   const std::optional<std::vector<uint8_t>>& transaction_opaque_data = std::nullopt);
 
 private:

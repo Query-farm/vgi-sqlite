@@ -10,8 +10,6 @@
 #include <string>
 #include <vector>
 
-#include <arrow/api.h>
-
 // sqlite3ext.h + INIT3, not plain sqlite3.h: this file is only ever
 // compiled into the vgi_extension loadable module, which must resolve
 // every sqlite3_* call through the host's own function-pointer table
@@ -68,14 +66,14 @@ std::map<std::string, std::string> ParseModuleArgs(int argc, const char* const* 
 // True for a declared column carrying VGI's is_row_id metadata (the
 // worker-chosen per-row identifier column UPDATE/DELETE key writes by -
 // see table_writer.h's file comment and TableWriter::Write).
-bool IsRowIdColumn(const std::shared_ptr<arrow::Field>& field) {
-    return field->metadata() && field->metadata()->Contains("is_row_id");
+bool IsRowIdColumn(const ArrowSchema* field) {
+    return field && nano::MetadataValue(*field, "is_row_id").has_value();
 }
 
 // The declared-column index of the field VGI marked as this table's row
 // identifier, or nullopt if the table has none (no update/delete support,
 // or a scan-only table that never declared one).
-std::optional<int> FindRowIdColumn(const std::shared_ptr<arrow::Schema>& columns) {
+std::optional<int> FindRowIdColumn(const nano::SchemaPtr& columns) {
     if (!columns) return std::nullopt;
     for (int i = 0; i < columns->num_fields(); ++i) {
         if (IsRowIdColumn(columns->field(i))) return i;
@@ -110,7 +108,7 @@ struct VgiCursor {
     // to the next caller.
     std::optional<ConnectionPool::Checkout> checkout;
     std::unique_ptr<TableScanner> scanner;
-    std::shared_ptr<arrow::RecordBatch> current_batch;
+    nano::BatchPtr current_batch;
     int64_t row_in_batch = 0;
     int64_t rowid = 0;
     bool eof = false;
@@ -239,7 +237,7 @@ int ConnectImpl(sqlite3* db, void* pAux, int argc, const char* const* argv, sqli
     if (vtab->table.columns) {
         for (int i = 0; i < vtab->table.columns->num_fields(); ++i) {
             if (i) ddl << ", ";
-            const auto& field = vtab->table.columns->field(i);
+            const auto* field = vtab->table.columns->field(i);
             // field->name() is worker-supplied catalog metadata, not a
             // driver-controlled constant - must go through
             // SqlQuoteIdentifier (see sql_quote.h's file comment), not a
@@ -248,7 +246,7 @@ int ConnectImpl(sqlite3* db, void* pAux, int argc, const char* const* argv, sqli
             // inject arbitrary structure into the DDL sqlite3_declare_vtab
             // parses. Found during this driver's Milestone 5 security
             // review.
-            ddl << SqlQuoteIdentifier(field->name()) << " " << SqliteDeclaredType(field->type());
+            ddl << SqlQuoteIdentifier(field->name ? field->name : "") << " " << SqliteDeclaredType(*field);
         }
     }
     ddl << ")";
@@ -539,7 +537,7 @@ int xColumn(sqlite3_vtab_cursor* base_cursor, sqlite3_context* ctx, int col_idx)
         sqlite3_result_null(ctx);
         return SQLITE_OK;
     }
-    SetSqliteResultFromArrow(ctx, *cursor->current_batch->column(position), cursor->row_in_batch);
+    SetSqliteResultFromArrow(ctx, cursor->current_batch->column(position), cursor->row_in_batch);
     return SQLITE_OK;
 }
 
@@ -558,9 +556,10 @@ int xRowid(sqlite3_vtab_cursor* base_cursor, sqlite3_int64* rowid_out) {
     if (auto row_id_col = FindRowIdColumn(vtab->table.columns)) {
         int position = FetchedPosition(cursor, *row_id_col);
         if (position >= 0) {
-            auto arr = std::dynamic_pointer_cast<arrow::Int64Array>(cursor->current_batch->column(position));
-            if (arr && !arr->IsNull(cursor->row_in_batch)) {
-                *rowid_out = arr->Value(cursor->row_in_batch);
+            auto column = cursor->current_batch->column(position);
+            if (column.valid() && column.type_id() == NANOARROW_TYPE_INT64 &&
+                !column.IsNull(cursor->row_in_batch)) {
+                *rowid_out = column.Int(cursor->row_in_batch);
                 return SQLITE_OK;
             }
         }
@@ -573,23 +572,27 @@ int xRowid(sqlite3_vtab_cursor* base_cursor, sqlite3_int64* rowid_out) {
 // `fields`/`declared_indices` (parallel arrays) - shared by INSERT's
 // "every column but rowid" row and UPDATE's "every column but rowid, plus
 // rowid appended last" row (see xUpdate).
-arrow::Result<std::shared_ptr<arrow::RecordBatch>> BuildRowFromArgv(
-    const arrow::FieldVector& fields, const std::vector<int>& declared_indices, sqlite3_value** argv, int argc) {
-    std::vector<std::shared_ptr<arrow::Array>> columns;
+nano::BatchPtr BuildRowFromArgv(const std::vector<const ArrowSchema*>& fields,
+                                const std::vector<int>& declared_indices,
+                                sqlite3_value** argv, int argc) {
+    std::vector<nano::SchemaPtr> output_fields;
+    std::vector<nano::ScalarPtr> values;
     for (size_t i = 0; i < declared_indices.size(); ++i) {
         int argv_index = 2 + declared_indices[i];
         if (argv_index >= argc) {
-            return arrow::Status::Invalid("missing a value for column \"" + fields[i]->name() + "\"");
+            throw std::runtime_error("missing a value for column \"" +
+                                     std::string(fields[i]->name ? fields[i]->name : "") + "\"");
         }
-        auto scalar = BuildArrowScalarFromSqliteValue(argv[argv_index], fields[i]->type());
+        auto scalar = BuildArrowScalarFromSqliteValue(argv[argv_index], *fields[i]);
         if (!scalar) {
-            return arrow::Status::Invalid("value for column \"" + fields[i]->name() +
-                                           "\" doesn't match its declared type");
+            throw std::runtime_error("value for column \"" +
+                                     std::string(fields[i]->name ? fields[i]->name : "") +
+                                     "\" doesn't match its declared type");
         }
-        ARROW_ASSIGN_OR_RAISE(auto array, arrow::MakeArrayFromScalar(*scalar, 1));
-        columns.push_back(std::move(array));
+        output_fields.push_back(nano::Schema::Copy(*fields[i]));
+        values.push_back(std::move(scalar));
     }
-    return arrow::RecordBatch::Make(arrow::schema(fields), 1, columns);
+    return nano::Batch::FromScalars(nano::MakeSchema(output_fields), values);
 }
 
 // INSERT: every user column except the is_row_id one (VGI's INSERT input
@@ -600,7 +603,7 @@ int DoInsert(VgiVtab* vtab, int argc, sqlite3_value** argv, sqlite3_int64* pRowi
         return SetVtabError(base_vtab, "vgi_worker: table doesn't support INSERT");
     }
     try {
-        arrow::FieldVector fields;
+        std::vector<const ArrowSchema*> fields;
         std::vector<int> declared_indices;
         const int num_columns = vtab->table.columns->num_fields();
         for (int i = 0; i < num_columns; ++i) {
@@ -609,15 +612,14 @@ int DoInsert(VgiVtab* vtab, int argc, sqlite3_value** argv, sqlite3_int64* pRowi
             fields.push_back(field);
             declared_indices.push_back(i);
         }
-        auto row_result = BuildRowFromArgv(fields, declared_indices, argv, argc);
-        if (!row_result.ok()) return SetVtabError(base_vtab, "vgi_worker: INSERT: " + row_result.status().ToString());
+        auto row = BuildRowFromArgv(fields, declared_indices, argv, argc);
 
         auto checkout = vtab->pool->Acquire(vtab->location, vtab->catalog_name);
         VgiCatalogClient catalog(checkout->connection);
         auto insert_fn =
             catalog.TableInsertFunctionGet(checkout->attach_opaque_data, vtab->schema_name, vtab->table_name);
         TableWriter writer(*vtab->pool, vtab->location, vtab->catalog_name);
-        writer.Write(insert_fn, /*schema_name=*/std::nullopt, row_result.ValueUnsafe(),
+        writer.Write(insert_fn, /*schema_name=*/std::nullopt, row,
                      vtab->pool->CurrentTransactionOpaqueData(vtab->location, vtab->catalog_name));
 
         // No real new-rowid to report: result_mode="count" means the
@@ -650,7 +652,7 @@ int DoUpdate(VgiVtab* vtab, int argc, sqlite3_value** argv, sqlite3_vtab* base_v
                              "vgi_worker: table has no declared row-identifier column - can't UPDATE");
     }
     try {
-        arrow::FieldVector fields;
+        std::vector<const ArrowSchema*> fields;
         std::vector<int> declared_indices;
         const int num_columns = vtab->table.columns->num_fields();
         for (int i = 0; i < num_columns; ++i) {
@@ -658,33 +660,30 @@ int DoUpdate(VgiVtab* vtab, int argc, sqlite3_value** argv, sqlite3_vtab* base_v
             fields.push_back(vtab->table.columns->field(i));
             declared_indices.push_back(i);
         }
-        auto row_result = BuildRowFromArgv(fields, declared_indices, argv, argc);
-        if (!row_result.ok()) return SetVtabError(base_vtab, "vgi_worker: UPDATE: " + row_result.status().ToString());
-        auto row = row_result.ValueUnsafe();
+        auto row = BuildRowFromArgv(fields, declared_indices, argv, argc);
 
         // Append the rowid column (old identity, argv[0] - never the
         // proposed new one, argv[1]: this driver doesn't support changing
         // a row's own identity column via UPDATE, see the plan file).
         auto row_id_field = vtab->table.columns->field(*row_id_col);
-        auto row_id_scalar = arrow::MakeScalar(static_cast<int64_t>(sqlite3_value_int64(argv[0])));
-        auto row_id_arr_result = arrow::MakeArrayFromScalar(*row_id_scalar, 1);
-        if (!row_id_arr_result.ok()) {
-            return SetVtabError(base_vtab, "vgi_worker: UPDATE: building rowid column: " +
-                                                row_id_arr_result.status().ToString());
-        }
-        auto with_rowid_result =
-            row->AddColumn(row->num_columns(), row_id_field, row_id_arr_result.ValueUnsafe());
-        if (!with_rowid_result.ok()) {
-            return SetVtabError(base_vtab,
-                                 "vgi_worker: UPDATE: appending rowid column: " + with_rowid_result.status().ToString());
-        }
+        std::vector<nano::SchemaPtr> output_fields;
+        for (int i = 0; i < row->num_columns(); ++i)
+            output_fields.push_back(nano::Schema::Copy(*row->raw().schema.children[i]));
+        output_fields.push_back(nano::Schema::Copy(*row_id_field));
+        auto with_rowid = nano::Batch::Create(nano::MakeSchema(output_fields));
+        for (int i = 0; i < row->num_columns(); ++i)
+            with_rowid->AppendColumnValue(i, row->column(i), 0);
+        auto row_id_scalar = nano::Scalar::Signed(sqlite3_value_int64(argv[0]),
+                                                   nano::Schema::Copy(*row_id_field));
+        with_rowid->AppendScalar(row->num_columns(), *row_id_scalar);
+        with_rowid->FinishRow();
 
         auto checkout = vtab->pool->Acquire(vtab->location, vtab->catalog_name);
         VgiCatalogClient catalog(checkout->connection);
         auto update_fn =
             catalog.TableUpdateFunctionGet(checkout->attach_opaque_data, vtab->schema_name, vtab->table_name);
         TableWriter writer(*vtab->pool, vtab->location, vtab->catalog_name);
-        writer.Write(update_fn, /*schema_name=*/std::nullopt, with_rowid_result.ValueUnsafe(),
+        writer.Write(update_fn, /*schema_name=*/std::nullopt, with_rowid,
                      vtab->pool->CurrentTransactionOpaqueData(vtab->location, vtab->catalog_name));
     } catch (const std::exception& e) {
         return SetVtabError(base_vtab, e.what());
@@ -705,14 +704,10 @@ int DoDelete(VgiVtab* vtab, sqlite3_value** argv, sqlite3_vtab* base_vtab) {
     }
     try {
         auto row_id_field = vtab->table.columns->field(*row_id_col);
-        auto row_id_scalar = arrow::MakeScalar(static_cast<int64_t>(sqlite3_value_int64(argv[0])));
-        auto row_id_arr_result = arrow::MakeArrayFromScalar(*row_id_scalar, 1);
-        if (!row_id_arr_result.ok()) {
-            return SetVtabError(base_vtab, "vgi_worker: DELETE: building rowid column: " +
-                                                row_id_arr_result.status().ToString());
-        }
-        auto row = arrow::RecordBatch::Make(arrow::schema({row_id_field}), 1,
-                                            std::vector<std::shared_ptr<arrow::Array>>{row_id_arr_result.ValueUnsafe()});
+        auto row = nano::Batch::FromScalars(
+            nano::MakeSchema({nano::Schema::Copy(*row_id_field)}),
+            {nano::Scalar::Signed(sqlite3_value_int64(argv[0]),
+                                  nano::Schema::Copy(*row_id_field))});
 
         auto checkout = vtab->pool->Acquire(vtab->location, vtab->catalog_name);
         VgiCatalogClient catalog(checkout->connection);

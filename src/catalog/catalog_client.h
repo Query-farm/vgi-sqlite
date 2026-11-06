@@ -17,8 +17,6 @@
 #include <string>
 #include <vector>
 
-#include <arrow/record_batch.h>
-
 #include "rpc/vgi_connection.h"
 
 namespace vgi_sqlite {
@@ -67,10 +65,10 @@ struct ScanFunction {
     bool arguments_already_wrapped = false;
 };
 
-ScanFunction ParseScanFunction(const std::shared_ptr<arrow::RecordBatch>& scan_function_info);
+ScanFunction ParseScanFunction(const nano::BatchPtr& scan_function_info);
 
 // A worker table, as much of TableInfo as the read-only scan path needs.
-// Deliberately trimmed from vgi-c++'s worker-authoring CatalogTable
+// Deliberately trimmed from vgi-c's worker-authoring CatalogTable
 // (include/vgi/catalog.h): no branches/inline_scan - those are worker-
 // internal wiring a client never populates.
 struct CatalogTable {
@@ -78,7 +76,7 @@ struct CatalogTable {
     std::string schema_name;
     std::optional<std::string> comment;
     // The table's Arrow schema (columns), decoded from TableInfo.columns.
-    std::shared_ptr<arrow::Schema> columns;
+    nano::SchemaPtr columns;
     bool supports_insert = false;
     bool supports_update = false;
     bool supports_delete = false;
@@ -118,7 +116,7 @@ struct CatalogTableInOutFunction {
     // values" shape CatalogFunction::argument_types already uses for
     // scalar/aggregate functions). Field order is positional-call order;
     // field names become this function's HIDDEN column names.
-    std::shared_ptr<arrow::Schema> input_schema;
+    nano::SchemaPtr input_schema;
     // FunctionInfo.projection_pushdown - not yet acted on by this driver
     // (v1 always requests every output column; see
     // vgi_table_in_out_vtab.cpp's file comment on why that's scoped out
@@ -153,7 +151,7 @@ struct CatalogPlainTableFunction {
     // (arguments_already_wrapped=true) - see tools/split_probe.cpp, which
     // already proved this exact call shape works before any vtab existed
     // for it.
-    std::shared_ptr<arrow::Schema> argument_schema;
+    nano::SchemaPtr argument_schema;
     bool supports_splits = false;  // mirrors ScanFunction::supports_splits
 };
 
@@ -168,7 +166,7 @@ struct CatalogFunction {
     // One field per positional argument, decoded from FunctionInfo.arguments
     // (itself a serialized Arrow schema, not values - distinct from
     // ScanFunctionResultSchema.arguments' flat values batch).
-    std::shared_ptr<arrow::Schema> argument_types;
+    nano::SchemaPtr argument_types;
 };
 
 // Result of catalog_attach: the opaque session token every later call on
@@ -291,7 +289,7 @@ public:
     // Write-path function resolution - only called for a table whose
     // CatalogTable::supports_insert/update/delete says the operation is
     // available. `WriteFunctionResult` is wire-identical to
-    // `ScanFunctionResult` (confirmed by reading vgi-c++'s
+    // `ScanFunctionResult` (confirmed by reading vgi-c's
     // VgiWriteFunctionResult, a literal type alias for VgiScanFunctionResult
     // - not documented anywhere read ahead of time), so ScanFunction/
     // ParseScanFunction are reused rather than duplicated. Each is a

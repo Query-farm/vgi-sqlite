@@ -3,9 +3,6 @@
 
 #include <stdexcept>
 
-#include <arrow/api.h>
-#include <arrow/compute/cast.h>
-
 #include "catalog/aggregate_requests.h"
 #include "generated/vgi_request_builders.hpp"
 #include "wire/wire_readers.h"
@@ -16,8 +13,8 @@ namespace gen = ::vgi::generated;
 
 std::vector<uint8_t> to_bytes(const std::string& s) { return {s.begin(), s.end()}; }
 
-std::shared_ptr<arrow::RecordBatch> CallUnary(VgiConnection& connection, const std::string& method,
-                                              const std::shared_ptr<arrow::RecordBatch>& params) {
+nano::BatchPtr CallUnary(VgiConnection& connection, const std::string& method,
+                                              const nano::BatchPtr& params) {
     auto response = connection.CallUnary(method, params);
     return wire::get_ipc(response.batch, "result");
 }
@@ -26,18 +23,11 @@ std::shared_ptr<arrow::RecordBatch> CallUnary(VgiConnection& connection, const s
 // no aggregate this driver calls takes a ConstParam/named argument. Same
 // construction as ScalarFunctionCaller's BuildEmptyArgsBytes.
 std::vector<uint8_t> BuildEmptyArgsBytes() {
-    auto struct_type = arrow::struct_({});
-    std::unique_ptr<arrow::ArrayBuilder> builder;
-    auto make_status = arrow::MakeBuilder(arrow::default_memory_pool(), struct_type, &builder);
-    if (!make_status.ok()) throw std::runtime_error("building empty args struct: " + make_status.ToString());
-    auto* struct_builder = static_cast<arrow::StructBuilder*>(builder.get());
-    if (auto status = struct_builder->Append(); !status.ok()) {
-        throw std::runtime_error("appending empty args row: " + status.ToString());
-    }
-    auto finish_result = struct_builder->Finish();
-    if (!finish_result.ok()) throw std::runtime_error("finishing empty args struct: " + finish_result.status().ToString());
-    auto args_schema = arrow::schema({arrow::field("args", struct_type, false)});
-    auto args_batch = arrow::RecordBatch::Make(args_schema, 1, {finish_result.ValueUnsafe()});
+    auto args_schema = nano::MakeSchema(
+        {nano::Field("args", nano::StructType({}), /*nullable=*/false)});
+    auto args_batch = nano::Batch::Create(args_schema);
+    args_batch->SetStruct("args", {});
+    args_batch->FinishRow();
     return to_bytes(wire::encode_ipc(args_batch));
 }
 
@@ -45,21 +35,21 @@ std::vector<uint8_t> BuildEmptyArgsBytes() {
 // already established for scalar functions - see ScalarFunctionCaller's
 // file comment. Types come from the first Step()'s actual argument
 // scalars, not catalog metadata, for the same reason.
-std::shared_ptr<arrow::Schema> SchemaFromArgs(const std::vector<std::shared_ptr<arrow::Scalar>>& args) {
-    arrow::FieldVector fields;
+nano::SchemaPtr SchemaFromArgs(const std::vector<nano::ScalarPtr>& args) {
+    std::vector<nano::SchemaPtr> fields;
     for (size_t i = 0; i < args.size(); ++i) {
-        fields.push_back(arrow::field("col_" + std::to_string(i), args[i]->type, /*nullable=*/true));
+        fields.push_back(nano::Field("col_" + std::to_string(i), args[i]->type, /*nullable=*/true));
     }
-    return arrow::schema(fields);
+    return nano::MakeSchema(fields);
 }
 
 // {group_id: int64}, exactly 1 row - shared shape for aggregate_finalize's
 // and aggregate_destructor's group_ids_batch, both always addressing this
 // caller's one group (see the header's file comment).
 std::vector<uint8_t> BuildGroupIdBatch(int64_t group_id) {
-    auto schema = arrow::schema({arrow::field("group_id", arrow::int64(), false)});
-    auto arr = arrow::MakeArrayFromScalar(*arrow::MakeScalar(group_id), 1).ValueOrDie();
-    auto batch = arrow::RecordBatch::Make(schema, 1, {arr});
+    auto schema = nano::MakeSchema(
+        {nano::Field("group_id", nano::Type(NANOARROW_TYPE_INT64), false)});
+    auto batch = nano::Batch::FromScalars(schema, {nano::Scalar::Signed(group_id)});
     return to_bytes(wire::encode_ipc(batch));
 }
 
@@ -93,7 +83,7 @@ AggregateCaller::~AggregateCaller() {
     }
 }
 
-void AggregateCaller::EnsureBound(const std::vector<std::shared_ptr<arrow::Scalar>>& args) {
+void AggregateCaller::EnsureBound(const std::vector<nano::ScalarPtr>& args) {
     if (bound_) return;
     arg_types_ = SchemaFromArgs(args);
     checkout_ = pool_.Acquire(location_, catalog_name_);
@@ -115,16 +105,15 @@ void AggregateCaller::EnsureBound(const std::vector<std::shared_ptr<arrow::Scala
     bound_ = true;
 }
 
-void AggregateCaller::Step(const std::vector<std::shared_ptr<arrow::Scalar>>& args) {
+void AggregateCaller::Step(const std::vector<nano::ScalarPtr>& args) {
     if (static_cast<int>(args.size()) != num_args_) {
         throw std::runtime_error("aggregate function '" + function_name_ + "': expected " +
                                   std::to_string(num_args_) + " arguments, got " + std::to_string(args.size()));
     }
     EnsureBound(args);
 
-    arrow::FieldVector fields = {arrow::field("__vgi_group_id", arrow::int64(), false)};
-    std::vector<std::shared_ptr<arrow::Array>> columns = {
-        arrow::MakeArrayFromScalar(*arrow::MakeScalar(int64_t{0}), 1).ValueOrDie()};
+    std::vector<nano::SchemaPtr> fields = {
+        nano::Field("__vgi_group_id", nano::Type(NANOARROW_TYPE_INT64), false)};
     for (size_t i = 0; i < args.size(); ++i) {
         // Cast rather than require an exact type match - unlike
         // ScalarFunctionCaller (which now re-derives arg_types_ fresh on
@@ -134,39 +123,33 @@ void AggregateCaller::Step(const std::vector<std::shared_ptr<arrow::Scalar>>& ar
         // header's file comment on why re-binding mid-group isn't an
         // option), so a later Step() with a differently-typed argument
         // than the row that happened to bind first has no choice but to
-        // coerce into the locked type. arrow::Scalar::CastTo alone isn't
-        // safe for that, though: it succeeds (silently truncating) on a
-        // narrowing numeric cast like double->int64 - exactly the
-        // mechanism that produced this driver's earlier scalar-function
-        // bug (`add_values(1.5, 2.5)` silently computing as 1+2=3). Using
-        // arrow::compute::Cast with its default CastOptions::Safe()
-        // instead - allow_float_truncate/allow_int_overflow/
-        // allow_decimal_truncate all default false - makes a genuinely
-        // lossy cast fail loudly here instead, surfacing a clear
+        // coerce into the locked type. The nanoarrow conversion must reject
+        // narrowing numeric casts like double->int64 - exactly the mechanism
+        // that produced this driver's earlier scalar-function bug
+        // (`add_values(1.5, 2.5)` silently computing as 1+2=3). A genuinely
+        // lossy conversion therefore fails loudly here, surfacing a clear
         // mid-aggregation type-mismatch error to the SQL caller rather
         // than a silently wrong sum/count. A caller mixing incompatible
         // types across rows of one GROUP BY group now gets an explicit
         // error instead of wrong results - a real, documented limitation
         // (unlike ScalarFunctionCaller, this class can't just re-resolve
         // per call), not a silent one.
-        auto cast_result =
-            arrow::compute::Cast(arrow::Datum(args[i]), arg_types_->field(static_cast<int>(i))->type());
-        if (!cast_result.ok()) {
-            throw std::runtime_error("aggregate function '" + function_name_ + "': argument " +
-                                      std::to_string(i) + " (" + args[i]->type->ToString() +
-                                      ") doesn't match the type bound on this caller's first call (" +
-                                      arg_types_->field(static_cast<int>(i))->type()->ToString() +
-                                      "): " + cast_result.status().ToString());
-        }
-        auto array_result = arrow::MakeArrayFromScalar(*cast_result.ValueUnsafe().scalar(), 1);
-        if (!array_result.ok()) {
-            throw std::runtime_error("aggregate function '" + function_name_ + "': argument " +
-                                      std::to_string(i) + ": " + array_result.status().ToString());
-        }
-        fields.push_back(arg_types_->field(static_cast<int>(i)));
-        columns.push_back(array_result.ValueUnsafe());
+        fields.push_back(nano::Schema::Copy(*arg_types_->field(static_cast<int>(i))));
     }
-    auto input_batch = arrow::RecordBatch::Make(arrow::schema(fields), 1, columns);
+    auto input_batch = nano::Batch::Create(nano::MakeSchema(fields));
+    input_batch->AppendScalar(0, *nano::Scalar::Signed(0));
+    for (size_t i = 0; i < args.size(); ++i) {
+        try {
+            input_batch->AppendScalar(static_cast<int64_t>(i + 1), *args[i]);
+        } catch (const std::exception& error) {
+            throw std::runtime_error("aggregate function '" + function_name_ + "': argument " +
+                                     std::to_string(i) + " (" + nano::TypeName(args[i]->type->raw()) +
+                                     ") doesn't match the type bound on this caller's first call (" +
+                                     nano::TypeName(*arg_types_->field(static_cast<int>(i))) +
+                                     "): " + error.what());
+        }
+    }
+    input_batch->FinishRow();
     auto input_bytes = to_bytes(wire::encode_ipc(input_batch));
 
     auto inner = BuildAggregateUpdateRequest(function_name_, execution_id_, input_bytes,
@@ -175,7 +158,7 @@ void AggregateCaller::Step(const std::vector<std::shared_ptr<arrow::Scalar>>& ar
     CallUnary((*checkout_)->connection, "aggregate_update", params);
 }
 
-std::shared_ptr<arrow::RecordBatch> AggregateCaller::Finalize() {
+nano::BatchPtr AggregateCaller::Finalize() {
     if (!bound_) throw std::runtime_error("aggregate function '" + function_name_ + "': Finalize() called with no rows accumulated");
     if (finalized_) throw std::runtime_error("aggregate function '" + function_name_ + "': Finalize() called twice");
     finalized_ = true;

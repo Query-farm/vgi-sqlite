@@ -24,7 +24,7 @@
 // code (`vgi_rpc/rpc/__init__.py`'s run_server, which calls
 // serve_named_pipe on sys.platform=="win32") - this driver targets that
 // worker CLI, so it must match it. The AF_UNIX client-transport work
-// itself was not wasted: vgi-rpc-c++'s connect_unix (genuine Windows
+// itself was not wasted: vgi-rpc-c's connect_unix (genuine Windows
 // AF_UNIX) is real and kept, for the *separate* explicit `unix://`
 // location scheme this driver also supports (verified working against
 // vgi-go, which does implement AF_UNIX there) - only `launch:`'s own
@@ -33,7 +33,7 @@
 // from the vgi reference, none of which touch wire-visible behavior:
 //   - IOException/InvalidInputException -> std::runtime_error, matching
 //     this driver's uniform exception convention (see CLAUDE.md).
-//   - SHA-256 via vgi_rpc::crypto::Sha256 (already linked - vgi-c++'s own
+//   - SHA-256 via vgi_rpc::crypto::Sha256 (already linked - vgi-c's own
 //     split_token.cpp uses it) instead of a direct mbedtls dependency
 //     vgi-sqlite doesn't otherwise need.
 //   - The liveness probe and the worker's stdout-pipe plumbing are raw
@@ -68,7 +68,7 @@
 // No <winsock2.h>/<afunix.h> needed here - this file's Windows rendezvous
 // is a named pipe (CreateFileA/CreateNamedPipe-shaped calls, all in
 // <windows.h>), not AF_UNIX. Genuine Windows AF_UNIX support lives in
-// vgi-rpc-c++'s client_transport.cpp instead, for the separate explicit
+// vgi-rpc-c's client_transport.cpp instead, for the separate explicit
 // unix:// location scheme - see this file's top comment.
 #else
 #include <arpa/inet.h>
@@ -173,9 +173,9 @@ std::string BuildCanonicalJson(const std::vector<std::string>& argv, const std::
 std::string ComputeLauncherHash(const std::vector<std::string>& argv, const std::string& cwd,
                                  const std::map<std::string, std::string>& env_subset) {
     std::string payload = BuildCanonicalJson(argv, cwd, env_subset);
-    vgi_rpc::crypto::Sha256 h;
-    h.update(payload);
-    auto digest = h.digest();
+    uint8_t digest[32];
+    if (VgiSha256(payload.data(), payload.size(), digest) != 0)
+        throw std::runtime_error("computing launcher SHA-256 failed");
     // First 8 bytes as 16 lowercase hex chars - matches the reference
     // (and vgi-rpc-python's launcher.py) exactly.
     char hex[17];

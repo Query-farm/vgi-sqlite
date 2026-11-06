@@ -22,8 +22,6 @@
 #include <sqlite3ext.h>
 SQLITE_EXTENSION_INIT1
 
-#include <arrow/api.h>
-
 #include "catalog/aggregate_caller.h"
 #include "catalog/catalog_client.h"
 #include "catalog/scalar_function_caller.h"
@@ -50,7 +48,7 @@ void ScalarFunctionBridge(sqlite3_context* ctx, int argc, sqlite3_value** argv) 
         return;
     }
     try {
-        std::vector<std::shared_ptr<arrow::Scalar>> scalars;
+        std::vector<nano::ScalarPtr> scalars;
         for (int i = 0; i < argc; ++i) {
             scalars.push_back(BuildArrowScalarFromSqliteValueNatural(argv[i]));
             if (!scalars.back()) {
@@ -61,7 +59,7 @@ void ScalarFunctionBridge(sqlite3_context* ctx, int argc, sqlite3_value** argv) 
             }
         }
         auto result = caller->Call(scalars);
-        SetSqliteResultFromArrow(ctx, *result->column(0), 0);
+        SetSqliteResultFromArrow(ctx, result->column(0), 0);
     } catch (const std::exception& e) {
         sqlite3_result_error(ctx, e.what(), -1);
     }
@@ -105,7 +103,7 @@ void AggregateStepBridge(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
             *slot = new AggregateCaller(*entry->pool, entry->location, entry->catalog_name, entry->function_name,
                                         entry->num_args, entry->schema_name);
         }
-        std::vector<std::shared_ptr<arrow::Scalar>> scalars;
+        std::vector<nano::ScalarPtr> scalars;
         for (int i = 0; i < argc; ++i) {
             scalars.push_back(BuildArrowScalarFromSqliteValueNatural(argv[i]));
             if (!scalars.back()) {
@@ -140,7 +138,7 @@ void AggregateFinalBridge(sqlite3_context* ctx) {
     std::unique_ptr<AggregateCaller> caller(*slot);
     try {
         auto result = caller->Finalize();
-        SetSqliteResultFromArrow(ctx, *result->column(0), 0);
+        SetSqliteResultFromArrow(ctx, result->column(0), 0);
     } catch (const std::exception& e) {
         sqlite3_result_error(ctx, e.what(), -1);
     }
@@ -307,10 +305,11 @@ void VgiAttachFunc(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
                 // its file comment) - it only needs the pool plus which
                 // (location, catalog) to ask it for, not a connection
                 // handed to it here.
+                const int arity = static_cast<int>(fn.argument_types->num_fields());
                 auto* caller = new ScalarFunctionCaller(*pool, location, catalog_name, fn.name,
-                                                         fn.argument_types->num_fields(), fn.schema_name);
+                                                         arity, fn.schema_name);
                 int rc = sqlite3_create_function_v2(
-                    db, sql_name.c_str(), fn.argument_types->num_fields(), SQLITE_UTF8, caller,
+                    db, sql_name.c_str(), arity, SQLITE_UTF8, caller,
                     ScalarFunctionBridge, nullptr, nullptr,
                     [](void* p) { delete reinterpret_cast<ScalarFunctionCaller*>(p); });
                 if (rc != SQLITE_OK) {
@@ -338,10 +337,11 @@ void VgiAttachFunc(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
                     continue;
                 }
                 std::string sql_name = catalog_name + "_" + fn.name;
+                const int arity = static_cast<int>(fn.argument_types->num_fields());
                 auto* entry = new VgiAggregateFunctionEntry{pool, location, catalog_name, fn.name,
-                                                            fn.argument_types->num_fields(), fn.schema_name};
+                                                            arity, fn.schema_name};
                 int rc = sqlite3_create_function_v2(
-                    db, sql_name.c_str(), fn.argument_types->num_fields(), SQLITE_UTF8, entry,
+                    db, sql_name.c_str(), arity, SQLITE_UTF8, entry,
                     /*xFunc=*/nullptr, AggregateStepBridge, AggregateFinalBridge,
                     [](void* p) { delete reinterpret_cast<VgiAggregateFunctionEntry*>(p); });
                 if (rc != SQLITE_OK) {

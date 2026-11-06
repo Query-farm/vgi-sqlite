@@ -4,8 +4,6 @@
 #include <stdexcept>
 #include <utility>
 
-#include <arrow/api.h>
-
 #include "catalog/scan_requests.h"
 #include "generated/vgi_request_builders.hpp"
 #include "wire/wire_readers.h"
@@ -16,8 +14,8 @@ namespace gen = ::vgi::generated;
 
 std::vector<uint8_t> to_bytes(const std::string& s) { return {s.begin(), s.end()}; }
 
-std::shared_ptr<arrow::RecordBatch> CallUnary(VgiConnection& connection, const std::string& method,
-                                              const std::shared_ptr<arrow::RecordBatch>& params) {
+nano::BatchPtr CallUnary(VgiConnection& connection, const std::string& method,
+                                              const nano::BatchPtr& params) {
     auto response = connection.CallUnary(method, params);
     return wire::get_ipc(response.batch, "result");
 }
@@ -28,18 +26,11 @@ std::shared_ptr<arrow::RecordBatch> CallUnary(VgiConnection& connection, const s
 // BuildEmptyArgsBytes (not shared as one helper - each lives in its own
 // translation unit and the construction is a handful of lines).
 std::vector<uint8_t> BuildEmptyArgsBytes() {
-    auto struct_type = arrow::struct_({});
-    std::unique_ptr<arrow::ArrayBuilder> builder;
-    auto make_status = arrow::MakeBuilder(arrow::default_memory_pool(), struct_type, &builder);
-    if (!make_status.ok()) throw std::runtime_error("building empty args struct: " + make_status.ToString());
-    auto* struct_builder = static_cast<arrow::StructBuilder*>(builder.get());
-    if (auto status = struct_builder->Append(); !status.ok()) {
-        throw std::runtime_error("appending empty args row: " + status.ToString());
-    }
-    auto finish_result = struct_builder->Finish();
-    if (!finish_result.ok()) throw std::runtime_error("finishing empty args struct: " + finish_result.status().ToString());
-    auto args_schema = arrow::schema({arrow::field("args", struct_type, false)});
-    auto args_batch = arrow::RecordBatch::Make(args_schema, 1, {finish_result.ValueUnsafe()});
+    auto args_schema = nano::MakeSchema(
+        {nano::Field("args", nano::StructType({}), /*nullable=*/false)});
+    auto args_batch = nano::Batch::Create(args_schema);
+    args_batch->SetStruct("args", {});
+    args_batch->FinishRow();
     return to_bytes(wire::encode_ipc(args_batch));
 }
 
@@ -52,91 +43,70 @@ std::vector<uint8_t> BuildEmptyArgsBytes() {
 // contract regardless of `row`'s own row count (mirrors WrapAsArgsStruct's
 // same normalization, for the same reason: the source must never dictate
 // this batch's row count).
-std::vector<uint8_t> BuildNamedArgsStruct(const std::shared_ptr<arrow::RecordBatch>& row,
+std::vector<uint8_t> BuildNamedArgsStruct(const nano::BatchPtr& row,
                                           const std::vector<int>& indices) {
     if (indices.empty()) return BuildEmptyArgsBytes();
-    arrow::FieldVector fields;
+    std::vector<nano::SchemaPtr> fields;
+    std::vector<std::optional<std::pair<nano::Column, int64_t>>> values;
     fields.reserve(indices.size());
     for (int idx : indices) {
-        const auto& field = row->schema()->field(idx);
-        fields.push_back(arrow::field("named_" + field->name(), field->type(), field->nullable()));
+        const auto* field = row->raw().schema.children[idx];
+        fields.push_back(nano::Field("named_" + std::string(field->name ? field->name : ""),
+                                     nano::Schema::Copy(*field),
+                                     (field->flags & ARROW_FLAG_NULLABLE) != 0));
+        values.push_back(std::make_optional(std::make_pair(row->column(idx), int64_t{0})));
     }
-
-    // Same construction as WrapAsArgsStruct (table_scanner.cpp) - a
-    // StructBuilder with one AppendScalar() per child field, not
-    // StructArray::Make(children, fields) (which would infer the struct's
-    // row count from the children instead of always producing exactly 1).
-    auto struct_type = arrow::struct_(fields);
-    std::unique_ptr<arrow::ArrayBuilder> builder;
-    auto make_status = arrow::MakeBuilder(arrow::default_memory_pool(), struct_type, &builder);
-    if (!make_status.ok()) throw std::runtime_error("building named args struct builder: " + make_status.ToString());
-    auto* struct_builder = static_cast<arrow::StructBuilder*>(builder.get());
-    if (auto status = struct_builder->Append(); !status.ok()) {
-        throw std::runtime_error("appending named args row: " + status.ToString());
-    }
-    for (size_t i = 0; i < indices.size(); ++i) {
-        int idx = indices[i];
-        auto scalar_result = row->column(idx)->GetScalar(0);
-        if (!scalar_result.ok()) {
-            throw std::runtime_error("reading named argument '" + row->schema()->field(idx)->name() +
-                                      "': " + scalar_result.status().ToString());
-        }
-        auto* field_builder = struct_builder->field_builder(static_cast<int>(i));
-        if (auto status = field_builder->AppendScalar(**scalar_result); !status.ok()) {
-            throw std::runtime_error("appending named argument '" + row->schema()->field(idx)->name() +
-                                      "': " + status.ToString());
-        }
-    }
-    auto finish_result = struct_builder->Finish();
-    if (!finish_result.ok()) {
-        throw std::runtime_error("finishing named args struct: " + finish_result.status().ToString());
-    }
-    auto args_schema = arrow::schema({arrow::field("args", struct_type, false)});
-    auto args_batch = arrow::RecordBatch::Make(args_schema, 1, {finish_result.ValueUnsafe()});
+    auto args_schema = nano::MakeSchema(
+        {nano::Field("args", nano::StructType(fields), /*nullable=*/false)});
+    auto args_batch = nano::Batch::Create(args_schema);
+    args_batch->SetStruct("args", values);
+    args_batch->FinishRow();
     return to_bytes(wire::encode_ipc(args_batch));
 }
 
 // True iff `field` carries VGI's "vgi_arg: named" metadata (a DuckDB
 // `:=`-style keyword argument) - see this file's header comment.
-bool IsNamedArgument(const std::shared_ptr<arrow::Field>& field) {
-    auto metadata = field->metadata();
-    if (!metadata) return false;
-    auto value = metadata->Get("vgi_arg");
-    return value.ok() && *value == "named";
+bool IsNamedArgument(const ArrowSchema& field) {
+    return nano::MetadataValue(field, "vgi_arg") == "named";
 }
 
 // A subset RecordBatch over `row` at `indices`, in that order - used to
 // build the stream-only (positional-only) row Exchange() actually sends.
-std::shared_ptr<arrow::RecordBatch> ProjectColumns(const std::shared_ptr<arrow::RecordBatch>& row,
-                                                    const std::shared_ptr<arrow::Schema>& projected_schema,
+nano::BatchPtr ProjectColumns(const nano::BatchPtr& row,
+                                                    const nano::SchemaPtr& projected_schema,
                                                     const std::vector<int>& indices) {
-    std::vector<std::shared_ptr<arrow::Array>> columns;
-    columns.reserve(indices.size());
-    for (int idx : indices) columns.push_back(row->column(idx));
-    return arrow::RecordBatch::Make(projected_schema, row->num_rows(), std::move(columns));
+    auto projected = nano::Batch::Create(projected_schema);
+    for (int64_t input_row = 0; input_row < row->num_rows(); ++input_row) {
+        for (size_t output_column = 0; output_column < indices.size(); ++output_column)
+            projected->AppendColumnValue(static_cast<int64_t>(output_column),
+                                         row->column(indices[output_column]), input_row);
+        projected->FinishRow();
+    }
+    return projected;
 }
 
 }  // namespace
 
 TableInOutCaller::TableInOutCaller(ConnectionPool& pool, std::string location, std::string catalog_name,
                                    std::string schema_name, std::string function_name,
-                                   std::shared_ptr<arrow::Schema> input_schema)
+                                   nano::SchemaPtr input_schema)
     : pool_(pool),
       location_(std::move(location)),
       catalog_name_(std::move(catalog_name)),
       schema_name_(std::move(schema_name)),
       function_name_(std::move(function_name)),
       input_schema_(std::move(input_schema)) {
-    arrow::FieldVector stream_fields;
+    std::vector<nano::SchemaPtr> stream_fields;
     for (int i = 0; i < input_schema_->num_fields(); ++i) {
-        if (IsNamedArgument(input_schema_->field(i))) {
+        const auto* field = input_schema_->field(i);
+        if (IsNamedArgument(*field)) {
             named_field_indices_.push_back(i);
         } else {
             stream_field_indices_.push_back(i);
-            stream_fields.push_back(input_schema_->field(i));
+            stream_fields.push_back(nano::Schema::Copy(*field));
         }
     }
-    stream_schema_ = arrow::schema(std::move(stream_fields));
+    stream_schema_ = nano::MakeSchema(stream_fields);
 }
 
 TableInOutCaller::~TableInOutCaller() {
@@ -159,7 +129,7 @@ TableInOutCaller::~TableInOutCaller() {
     }
 }
 
-const std::shared_ptr<arrow::Schema>& TableInOutCaller::EnsureBoundWithArgs(std::vector<uint8_t> args_bytes) {
+const nano::SchemaPtr& TableInOutCaller::EnsureBoundWithArgs(std::vector<uint8_t> args_bytes) {
     if (bound_) return output_schema_;
     checkout_ = pool_.Acquire(location_, catalog_name_);
 
@@ -201,12 +171,12 @@ const std::shared_ptr<arrow::Schema>& TableInOutCaller::EnsureBoundWithArgs(std:
     return output_schema_;
 }
 
-const std::shared_ptr<arrow::Schema>& TableInOutCaller::Bind() {
+const nano::SchemaPtr& TableInOutCaller::Bind() {
     return EnsureBoundWithArgs(BuildEmptyArgsBytes());
 }
 
-std::shared_ptr<arrow::RecordBatch> TableInOutCaller::Exchange(
-    const std::shared_ptr<arrow::RecordBatch>& input_row) {
+nano::BatchPtr TableInOutCaller::Exchange(
+    const nano::BatchPtr& input_row) {
     if (!bound_) {
         // Real bind, using THIS row's actual named-argument values - see
         // the header's file comment on why Bind() (empty args) isn't

@@ -15,11 +15,11 @@
 # against a real worker), so shipping a Windows binary is no longer
 # blocked on it.
 #
-# Every dependency vcpkg builds (Arrow, OpenSSL, etc.) is statically linked
+# Every dependency vcpkg builds (nanoarrow, OpenSSL, etc.) is statically linked
 # by vcpkg's own default triplet on Linux/macOS (x64-linux/arm64-linux/
 # x64-osx/arm64-osx are all VCPKG_LIBRARY_LINKAGE=static) - this is what
 # makes a single .so/.dylib actually redistributable: a dynamically-linked
-# Arrow/OpenSSL would require the loading machine to already have
+# nanoarrow/OpenSSL would require the loading machine to already have
 # compatible shared libraries installed at the right versions, which
 # defeats the point of shipping a binary at all. See the "ABI contract"
 # note in CLAUDE.md for the full reasoning, including the real, accepted
@@ -69,19 +69,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check out vgi-cpp
+      - name: Check out vgi-c
         uses: actions/checkout@v4
         with:
-          repository: Query-farm/vgi-cpp
-          ref: v0.14.0
-          path: vgi-cpp
+          repository: Query-farm/vgi-c
+          ref: v0.1.1
+          path: vgi-c
 
-      - name: Check out vgi-rpc-cpp
+      - name: Check out vgi-rpc-c
         uses: actions/checkout@v4
         with:
-          repository: Query-farm/vgi-rpc-cpp
-          ref: v0.11.0
-          path: vgi-rpc-c++
+          repository: Query-farm/vgi-rpc-c
+          ref: v0.1.1
+          path: vgi-rpc-c
 
       # See ci.yml's matching step for the full reasoning - gcc-12 does NOT
       # fix this (tried and confirmed still broken); GCC's own suggested
@@ -202,27 +202,20 @@ jobs:
         if: runner.os == 'Linux'
         run: >
           cmake --preset release
-          -DVGI_CPP_SOURCE_DIR=${{ github.workspace }}/vgi-cpp
+          -DVGI_C_SOURCE_DIR=${{ github.workspace }}/vgi-c
+          -DVGI_RPC_SOURCE_DIR=${{ github.workspace }}/vgi-rpc-c
           -DCMAKE_C_COMPILER_LAUNCHER=ccache
           -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
           -DCMAKE_MODULE_LINKER_FLAGS="-static-libgcc -static-libstdc++"
 
-      # 13.3, not a rounder-looking 12.0/13.0: vgi-cpp's arg_schema.cpp uses
-      # std::to_chars's floating-point overload, which Apple's libc++ only
-      # marks available from macOS 13.3 onward (an Apple-specific libc++
-      # availability gate, not a real language/library-version requirement)
-      # - a real build failure this same job's first attempt hit at 12.0,
-      # not a guess. This is exactly the macOS deployment-target floor this
-      # dependency actually needs, not an arbitrarily safe-sounding round
-      # number.
       - name: Configure (Release, macOS)
         if: runner.os == 'macOS'
         run: >
           cmake --preset release
-          -DVGI_CPP_SOURCE_DIR=${{ github.workspace }}/vgi-cpp
+          -DVGI_C_SOURCE_DIR=${{ github.workspace }}/vgi-c
+          -DVGI_RPC_SOURCE_DIR=${{ github.workspace }}/vgi-rpc-c
           -DCMAKE_C_COMPILER_LAUNCHER=ccache
           -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
-          -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3
 
       - name: Build
         run: cmake --build build-release --parallel
@@ -268,19 +261,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check out vgi-cpp
+      - name: Check out vgi-c
         uses: actions/checkout@v4
         with:
-          repository: Query-farm/vgi-cpp
-          ref: v0.14.0
-          path: vgi-cpp
+          repository: Query-farm/vgi-c
+          ref: v0.1.1
+          path: vgi-c
 
-      - name: Check out vgi-rpc-cpp
+      - name: Check out vgi-rpc-c
         uses: actions/checkout@v4
         with:
-          repository: Query-farm/vgi-rpc-cpp
-          ref: v0.11.0
-          path: vgi-rpc-c++
+          repository: Query-farm/vgi-rpc-c
+          ref: v0.1.1
+          path: vgi-rpc-c
 
       - name: Clone and bootstrap vcpkg
         run: |
@@ -356,7 +349,8 @@ jobs:
       - name: Configure (Release)
         run: >
           cmake --preset release -A x64
-          -DVGI_CPP_SOURCE_DIR="$env:GITHUB_WORKSPACE\vgi-cpp"
+          -DVGI_C_SOURCE_DIR="$env:GITHUB_WORKSPACE\vgi-c"
+          -DVGI_RPC_SOURCE_DIR="$env:GITHUB_WORKSPACE\vgi-rpc-c"
           -DCMAKE_C_COMPILER_LAUNCHER=ccache
           -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 

@@ -26,6 +26,9 @@ a fork of it. SQLite has no Arrow bridge, no native `ATTACH` extension point,
 and a much simpler constraint-pushdown model than DuckDB, so nothing here is
 a straight port.
 
+The extension implements Arrow IPC with `nanoarrow` through `vgi-c` and
+`vgi-rpc-c`; it does not depend on the Apache Arrow C++ runtime.
+
 It builds a single loadable extension (`vgi.{so,dylib}`) exposing:
 
 - **`vgi_attach(location, catalog)`** — a SQL function that discovers every
@@ -47,8 +50,8 @@ It builds a single loadable extension (`vgi.{so,dylib}`) exposing:
 ## Build
 
 ```bash
-git clone https://github.com/Query-farm/vgi-cpp.git ../vgi-cpp
-git clone https://github.com/Query-farm/vgi-rpc-cpp.git ../vgi-rpc-c++
+git clone https://github.com/Query-farm/vgi-c.git ../vgi-c
+git clone https://github.com/Query-farm/vgi-rpc-c.git ../vgi-rpc-c
 export VCPKG_ROOT=/path/to/vcpkg
 
 scripts/fetch_sqlite.sh          # once: pins/builds SQLite from source
@@ -56,18 +59,16 @@ cmake --preset default
 cmake --build build
 ```
 
-`vgi-cpp` (and, transitively, `vgi-rpc-cpp`) is built from a sibling checkout
-by default, since the two move together and an installed copy goes stale
-silently — override with `-DVGI_CPP_SOURCE_DIR=<path>`.
+`vgi-c` and `vgi-rpc-c` are built from sibling checkouts by default. Override
+them with `-DVGI_C_SOURCE_DIR=<path>` and `-DVGI_RPC_SOURCE_DIR=<path>`.
 
 Not `find_package(SQLite3)`: the driver needs a recent SQLite built with
 `SQLITE_ENABLE_LOAD_EXTENSION`/`SQLITE_ENABLE_COLUMN_METADATA`, which the
 system/package-manager SQLite usually isn't — `scripts/fetch_sqlite.sh`
 pins/downloads/verifies/builds it from the amalgamation.
 
-Note for Linux and macOS: vcpkg builds `libsodium` through its autotools
-script and `thrift` through flex/bison, so `autoconf automake libtool
-autoconf-archive flex bison` need to be installed first.
+Note for Linux and macOS: vcpkg builds `libsodium` through autotools, so
+`autoconf automake libtool autoconf-archive` need to be installed first.
 
 ## Usage
 
@@ -126,5 +127,5 @@ workers.
 
 Query Farm Source-Available License, Version 1.0 — see [LICENSE](LICENSE).
 The same license as [`vgi`](https://github.com/Query-farm/vgi),
-[`vgi-cpp`](https://github.com/Query-farm/vgi-cpp), and
+[`vgi-c`](https://github.com/Query-farm/vgi-c), and
 [`vgi-python`](https://github.com/Query-farm/vgi-python).

@@ -12,8 +12,6 @@
 #include <string>
 #include <vector>
 
-#include <arrow/api.h>
-
 #include "catalog/catalog_client.h"
 #include "catalog/scalar_function_caller.h"
 #include "rpc/vgi_connection.h"
@@ -54,19 +52,17 @@ int main(int argc, char** argv) {
 
         vgi_sqlite::ScalarFunctionCaller caller(pool, location, catalog_name, function_name,
                                                  static_cast<int>(args.size()), schema_name);
-        std::vector<std::shared_ptr<arrow::Scalar>> scalars;
-        for (auto v : args) scalars.push_back(arrow::MakeScalar(v));
+        std::vector<vgi_sqlite::nano::ScalarPtr> scalars;
+        for (auto v : args) scalars.push_back(vgi_sqlite::nano::Scalar::Signed(v));
 
         auto result = caller.Call(scalars);
-        std::printf("result batch: rows=%lld cols=%d schema=%s\n", (long long)result->num_rows(),
-                    result->num_columns(), result->schema()->ToString().c_str());
+        std::printf("result batch: rows=%lld cols=%lld schema=%s\n", (long long)result->num_rows(),
+                    static_cast<long long>(result->num_columns()), result->schema()->ToString().c_str());
         auto col = result->column(0);
-        std::printf("col length=%lld null_count=%lld type=%s\n", (long long)col->length(),
-                    (long long)col->null_count(), col->type()->ToString().c_str());
-        if (col->length() > 0) {
-            auto int_col = std::static_pointer_cast<arrow::Int64Array>(col);
-            std::printf("is_null(0)=%d value(0)=%lld\n", int_col->IsNull(0) ? 1 : 0,
-                        int_col->IsNull(0) ? 0 : (long long)int_col->Value(0));
+        std::printf("col length=%lld type=%s\n", (long long)col.length(), col.TypeString().c_str());
+        if (col.length() > 0) {
+            std::printf("is_null(0)=%d value(0)=%lld\n", col.IsNull(0) ? 1 : 0,
+                        col.IsNull(0) ? 0 : (long long)col.Int(0));
         }
         return 0;
     } catch (const std::exception& e) {

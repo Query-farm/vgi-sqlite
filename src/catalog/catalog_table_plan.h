@@ -88,7 +88,7 @@ namespace vgi_sqlite {
 // DuckDB client - dynamic filter pushdown into split planning isn't
 // implemented on either the filter-encoding or the splits side of this
 // driver).
-std::shared_ptr<arrow::RecordBatch> BuildTableFunctionPlanRequest(
+nano::BatchPtr BuildTableFunctionPlanRequest(
     const std::vector<uint8_t>& bind_call_bytes, const std::vector<uint8_t>& bind_opaque_data,
     const std::vector<int64_t>& projection_ids, const std::optional<std::string>& pushdown_filters,
     const std::vector<uint8_t>& cursor);
@@ -118,7 +118,7 @@ struct TableFunctionPlan {
 // not something to paper over.
 TableFunctionPlan PlanTableFunctionSplits(VgiConnection& connection, const std::vector<uint8_t>& bind_call_bytes,
                                           const std::vector<uint8_t>& bind_opaque_data,
-                                          const std::shared_ptr<arrow::Schema>& output_schema,
+                                          const nano::SchemaPtr& output_schema,
                                           const std::vector<int64_t>& projection_ids,
                                           const std::optional<std::string>& pushdown_filters);
 

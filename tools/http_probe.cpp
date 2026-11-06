@@ -11,8 +11,6 @@
 #include <exception>
 #include <string>
 
-#include <arrow/type.h>
-
 #include "catalog/catalog_client.h"
 #include "rpc/vgi_connection.h"
 

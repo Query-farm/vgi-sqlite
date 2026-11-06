@@ -19,7 +19,7 @@
 // connection_pool.h's file comment), this driver doesn't rely on
 // execution_id being safe to replay against a different physical
 // connection/process than the one bind produced it on, even though VGI's
-// own design intent (per vgi-c++'s CLAUDE.md: "Execution ids must be
+// own design intent (per vgi-c's CLAUDE.md: "Execution ids must be
 // unique across processes, since that store is shared by every worker of
 // the uid") suggests it's meant to be portable in a distributed
 // deployment - staying on one connection for the whole accumulation
@@ -45,9 +45,6 @@
 #include <string>
 #include <vector>
 
-#include <arrow/record_batch.h>
-#include <arrow/type.h>
-
 #include "vtab/connection_pool.h"
 
 namespace vgi_sqlite {
@@ -70,17 +67,17 @@ public:
     // locking in argument types from `args`' actual values - same
     // reasoning as ScalarFunctionCaller (FunctionInfo.arguments can't be
     // trusted). `args` must have exactly num_args() elements.
-    void Step(const std::vector<std::shared_ptr<arrow::Scalar>>& args);
+    void Step(const std::vector<nano::ScalarPtr>& args);
 
     // Produces the final result for this caller's one group. Must be
     // called at most once, after at least one Step() (an aggregate over
     // zero rows never binds at all - see extension.cpp's
     // AggregateFinalBridge for how that's handled: no caller exists yet
     // to call this on).
-    std::shared_ptr<arrow::RecordBatch> Finalize();
+    nano::BatchPtr Finalize();
 
 private:
-    void EnsureBound(const std::vector<std::shared_ptr<arrow::Scalar>>& args);
+    void EnsureBound(const std::vector<nano::ScalarPtr>& args);
 
     ConnectionPool& pool_;
     std::string location_;
@@ -91,10 +88,10 @@ private:
 
     bool bound_ = false;
     bool finalized_ = false;
-    std::shared_ptr<arrow::Schema> arg_types_;  // locked in on first Step(); "col_N" names
+    nano::SchemaPtr arg_types_;  // locked in on first Step(); "col_N" names
     std::optional<ConnectionPool::Checkout> checkout_;
     std::vector<uint8_t> execution_id_;
-    std::shared_ptr<arrow::Schema> output_schema_;
+    nano::SchemaPtr output_schema_;
 };
 
 }  // namespace vgi_sqlite

@@ -27,7 +27,7 @@ std::string JoinPath(const std::vector<std::string>& path) {
     return joined;
 }
 
-std::string SchemaNameOf(const std::shared_ptr<arrow::RecordBatch>& item, const std::string& fallback) {
+std::string SchemaNameOf(const nano::BatchPtr& item, const std::string& fallback) {
     auto path = wire::get_string_list(item, "schema_path");
     return path.empty() ? fallback : JoinPath(path);
 }
@@ -38,16 +38,16 @@ std::string SchemaNameOf(const std::shared_ptr<arrow::RecordBatch>& item, const 
 // method's *ResultSchema() batch. call_unary() itself throws
 // vgi_rpc::RpcException on a protocol-level error response, so a normal
 // return here means a well-formed result.
-std::shared_ptr<arrow::RecordBatch> Call(VgiConnection& connection, const std::string& method,
-                                          const std::shared_ptr<arrow::RecordBatch>& params) {
+nano::BatchPtr Call(VgiConnection& connection, const std::string& method,
+                                          const nano::BatchPtr& params) {
     auto response = connection.CallUnary(method, params);
     return wire::get_ipc(response.batch, "result");
 }
 
 // Unwrap a {items: list<binary>} result into each item's decoded batch.
-std::vector<std::shared_ptr<arrow::RecordBatch>> Items(
-    const std::shared_ptr<arrow::RecordBatch>& result) {
-    std::vector<std::shared_ptr<arrow::RecordBatch>> items;
+std::vector<nano::BatchPtr> Items(
+    const nano::BatchPtr& result) {
+    std::vector<nano::BatchPtr> items;
     for (const auto& raw : wire::get_binary_list(result, "items")) {
         if (auto decoded = wire::decode_ipc(raw)) items.push_back(std::move(decoded));
     }
@@ -55,7 +55,7 @@ std::vector<std::shared_ptr<arrow::RecordBatch>> Items(
 }
 
 CatalogTable ParseTableInfo(const std::string& schema_name_fallback,
-                            const std::shared_ptr<arrow::RecordBatch>& info) {
+                            const nano::BatchPtr& info) {
     CatalogTable table;
     table.name = wire::get_string(info, "name");
     table.schema_name = SchemaNameOf(info, schema_name_fallback);
@@ -74,7 +74,7 @@ CatalogTable ParseTableInfo(const std::string& schema_name_fallback,
 
 }  // namespace
 
-ScanFunction ParseScanFunction(const std::shared_ptr<arrow::RecordBatch>& scan_function_info) {
+ScanFunction ParseScanFunction(const nano::BatchPtr& scan_function_info) {
     ScanFunction fn;
     fn.function_name = wire::get_string(scan_function_info, "function_name");
     fn.arguments_ipc_bytes = to_bytes(wire::get_binary(scan_function_info, "arguments"));
@@ -261,7 +261,7 @@ namespace {
 // split_sequence, no input relation at all) and table_in_out functions
 // (both the classic TABLE-arg shape and the blended/RowTransformFunction
 // shape this driver targets) all come back tagged the same
-// function_type="table" (confirmed by reading vgi-c++'s
+// function_type="table" (confirmed by reading vgi-c's
 // encode_table_function_info/encode_table_in_out_info - both call the
 // shared common_function_info helper with enums::function_type::kTable).
 // input_from_args is the only field that distinguishes "this function's
@@ -275,7 +275,7 @@ namespace {
 // anything out in practice, but a stale/older worker isn't something to
 // trust blindly.
 std::vector<CatalogTableInOutFunction> ParseTableInOutFunctions(
-    const std::vector<std::shared_ptr<arrow::RecordBatch>>& items, const std::string& schema_name_fallback) {
+    const std::vector<nano::BatchPtr>& items, const std::string& schema_name_fallback) {
     std::vector<CatalogTableInOutFunction> functions;
     for (const auto& item : items) {
         bool input_from_args = wire::get_optional_bool(item, "input_from_args").value_or(false);
@@ -327,19 +327,16 @@ namespace {
 // trying to represent the one table_in_out shape SQLite's calling
 // convention genuinely can't express (see CatalogPlainTableFunction's
 // file comment).
-bool HasTableTypedArgument(const std::shared_ptr<arrow::Schema>& argument_schema) {
+bool HasTableTypedArgument(const nano::SchemaPtr& argument_schema) {
     if (!argument_schema) return false;
     for (int i = 0; i < argument_schema->num_fields(); ++i) {
-        auto metadata = argument_schema->field(i)->metadata();
-        if (!metadata) continue;
-        auto value = metadata->Get("vgi_type");
-        if (value.ok() && *value == "table") return true;
+        if (nano::MetadataValue(*argument_schema->field(i), "vgi_type") == "table") return true;
     }
     return false;
 }
 
 std::vector<CatalogPlainTableFunction> ParsePlainTableFunctions(
-    const std::vector<std::shared_ptr<arrow::RecordBatch>>& items, const std::string& schema_name_fallback) {
+    const std::vector<nano::BatchPtr>& items, const std::string& schema_name_fallback) {
     std::vector<CatalogPlainTableFunction> functions;
     for (const auto& item : items) {
         bool input_from_args = wire::get_optional_bool(item, "input_from_args").value_or(false);

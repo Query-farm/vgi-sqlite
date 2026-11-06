@@ -19,8 +19,6 @@
 #include <string>
 #include <vector>
 
-#include <arrow/api.h>
-
 #include "catalog/catalog_client.h"
 #include "catalog/table_scanner.h"
 #include "rpc/vgi_connection.h"
@@ -52,15 +50,23 @@ int main(int argc, char** argv) {
         // struct<named_n, named_splits>} batch - and hand it to Bind()
         // via arguments_already_wrapped rather than the flat encoding
         // WrapAsArgsStruct would turn into positional_0/positional_1.
-        auto struct_type = arrow::struct_({
-            arrow::field("named_n", arrow::int64(), false),
-            arrow::field("named_splits", arrow::int64(), false),
+        auto values = vgi_sqlite::nano::Batch::FromScalars(
+            vgi_sqlite::nano::MakeSchema({
+                vgi_sqlite::nano::Field("named_n", vgi_sqlite::nano::Type(NANOARROW_TYPE_INT64), false),
+                vgi_sqlite::nano::Field("named_splits", vgi_sqlite::nano::Type(NANOARROW_TYPE_INT64), false),
+            }),
+            {vgi_sqlite::nano::Scalar::Signed(n), vgi_sqlite::nano::Scalar::Signed(splits)});
+        auto args_schema = vgi_sqlite::nano::MakeSchema({vgi_sqlite::nano::Field(
+            "args", vgi_sqlite::nano::StructType({
+                        vgi_sqlite::nano::Field("named_n", vgi_sqlite::nano::Type(NANOARROW_TYPE_INT64), false),
+                        vgi_sqlite::nano::Field("named_splits", vgi_sqlite::nano::Type(NANOARROW_TYPE_INT64), false),
+                    }), false)});
+        auto args_batch = vgi_sqlite::nano::Batch::Create(args_schema);
+        args_batch->SetStruct("args", {
+            std::make_optional(std::make_pair(values->column(0), int64_t{0})),
+            std::make_optional(std::make_pair(values->column(1), int64_t{0})),
         });
-        auto n_arr = arrow::MakeArrayFromScalar(*arrow::MakeScalar(n), 1).ValueOrDie();
-        auto splits_arr = arrow::MakeArrayFromScalar(*arrow::MakeScalar(splits), 1).ValueOrDie();
-        auto struct_arr = arrow::StructArray::Make({n_arr, splits_arr}, struct_type->fields()).ValueOrDie();
-        auto args_schema = arrow::schema({arrow::field("args", struct_type, false)});
-        auto args_batch = arrow::RecordBatch::Make(args_schema, 1, {struct_arr});
+        args_batch->FinishRow();
         auto args_ipc = vgi_sqlite::wire::encode_ipc(args_batch);
 
         vgi_sqlite::ScanFunction fn;

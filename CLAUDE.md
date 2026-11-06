@@ -22,8 +22,8 @@ this file is the deeper design/gotcha reference for anyone changing the code.
 | path | what it is | how it matters here |
 |---|---|---|
 | `~/Development/vgi-python` | the **canonical** implementation, protocol source of truth, and codegen | `scripts/regenerate_protocol.sh` generates this repo's own client-only request builders from it; the fixture worker (`vgi-fixture-worker`) is this repo's primary test target |
-| `~/Development/vgi-c++` (GitHub: `Query-farm/vgi-cpp`, public) | the C++ **worker SDK** (server-side) | this repo links its `vgi::vgi` target for the public generated protocol schemas (`include/vgi/generated/`) - not for anything worker-shaped |
-| `~/Development/vgi-rpc-c++` (GitHub: `Query-farm/vgi-rpc-cpp`, public) | the Arrow-IPC RPC transport | `vgi_rpc::RpcClient` (spawn/unix/tcp) and `vgi_rpc::HttpClient` are both wrapped by `VgiConnection` - see "Transports" below |
+| `~/Development/vgi-c` (GitHub: `Query-farm/vgi-c`, public) | the C worker SDK and canonical native protocol schemas | this repo links only its `vgi::protocol` client target, not the worker SDK; schemas and batches use the Arrow C Data interface via nanoarrow |
+| `~/Development/vgi-rpc-c` (GitHub: `Query-farm/vgi-rpc-c`, public) | the nanoarrow IPC RPC transport | its C client API is wrapped by `VgiConnection` for subprocess, Unix/TCP, launcher, and HTTP transports |
 | `~/Development/vgi` | the DuckDB C++ extension (client-side reference) | design/wire-format reference only, never linked; several of this repo's hand-ported helpers (`wire/wire_builders.h`, inner bind/init request builders) were ported from its `vgi_rpc_types.{hpp,cpp}` field layout, with the DuckDB dependency stripped |
 
 ## Definition of done

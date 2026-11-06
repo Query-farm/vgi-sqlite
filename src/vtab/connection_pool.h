@@ -69,7 +69,7 @@
 // (DuckDB's extension) is documented to work: attach_opaque_data is
 // minted once per ATTACH and threaded through every subsequent call
 // regardless of which of the engine's own worker-pool processes ends up
-// serving it - see vgi-c++'s CLAUDE.md ("A worker pool hands out a
+// serving it - see vgi-c's CLAUDE.md ("A worker pool hands out a
 // different process per RPC, so...per-attachment state...belongs in
 // FunctionStorage, not in a member") and the design intent documented on
 // InitRequest.execution_id/substream_id (explicitly built to survive an

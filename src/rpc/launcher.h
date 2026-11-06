@@ -14,7 +14,7 @@
 // has the detail) - the two use genuinely different rendezvous mechanisms
 // (AF_UNIX vs. named pipes), not just different syscalls for the same
 // concept, since Windows has no AF_UNIX equivalent this driver's transport
-// layer (vgi-rpc-c++) can rendezvous through the same way.
+// layer (vgi-rpc-c) can rendezvous through the same way.
 //
 // Ported from vgi (the DuckDB C++ extension)'s own launcher
 // (src/vgi_launcher{,_internal}.{hpp,cpp}), the reference C++

@@ -3,8 +3,6 @@
 
 #include <stdexcept>
 
-#include <arrow/api.h>
-
 #include "catalog/scan_requests.h"
 #include "catalog/write_requests.h"
 #include "generated/vgi_request_builders.hpp"
@@ -16,8 +14,8 @@ namespace gen = ::vgi::generated;
 
 std::vector<uint8_t> to_bytes(const std::string& s) { return {s.begin(), s.end()}; }
 
-std::shared_ptr<arrow::RecordBatch> CallUnary(VgiConnection& connection, const std::string& method,
-                                              const std::shared_ptr<arrow::RecordBatch>& params) {
+nano::BatchPtr CallUnary(VgiConnection& connection, const std::string& method,
+                                              const nano::BatchPtr& params) {
     auto response = connection.CallUnary(method, params);
     return wire::get_ipc(response.batch, "result");
 }
@@ -29,7 +27,7 @@ TableWriter::TableWriter(ConnectionPool& pool, std::string location, std::string
 
 int64_t TableWriter::Write(const ScanFunction& write_function,
                            const std::optional<std::string>& schema_name,
-                           const std::shared_ptr<arrow::RecordBatch>& input_row,
+                           const nano::BatchPtr& input_row,
                            const std::optional<std::vector<uint8_t>>& transaction_opaque_data) {
     auto checkout = pool_.Acquire(location_, catalog_name_);
 
@@ -40,7 +38,8 @@ int64_t TableWriter::Write(const ScanFunction& write_function,
     // surfaces a conflict as an error either way).
     auto write_options_bytes = BuildWriteOptionsBytes(/*result_mode=*/"count", /*on_conflict=*/"throw");
     auto args_bytes = BuildWriteArgsStruct(write_function.arguments_ipc_bytes, write_options_bytes);
-    auto input_schema_bytes = to_bytes(wire::encode_schema(input_row->schema()));
+    auto input_schema = input_row->schema();
+    auto input_schema_bytes = to_bytes(wire::encode_schema(input_schema));
 
     auto bind_inner = BuildBindRequest(write_function.function_name, args_bytes, /*function_type=*/"TABLE",
                                        input_schema_bytes, /*settings_bytes=*/std::nullopt,
@@ -52,7 +51,7 @@ int64_t TableWriter::Write(const ScanFunction& write_function,
     auto bind_result = CallUnary(checkout->connection, "bind", bind_params);
     auto parsed = ParseBindResponse(bind_result);
     if (!parsed.output_schema || parsed.output_schema->num_fields() != 1 ||
-        parsed.output_schema->field(0)->name() != "count") {
+        std::string(parsed.output_schema->field(0)->name ? parsed.output_schema->field(0)->name : "") != "count") {
         throw std::runtime_error("write function '" + write_function.function_name +
                                   "': bind() returned an unexpected output schema (expected a plain "
                                   "{count: int64} response - RETURNING isn't requested/supported here)");
@@ -67,7 +66,7 @@ int64_t TableWriter::Write(const ScanFunction& write_function,
                                        /*join_keys=*/{}, /*row_limit=*/std::nullopt, /*phase=*/"INPUT");
     auto init_bytes = to_bytes(wire::encode_ipc(init_inner));
     auto init_params = gen::BuildInitParams(init_bytes);
-    auto stream = checkout->connection.OpenExchange("init", init_params, input_row->schema(),
+    auto stream = checkout->connection.OpenExchange("init", init_params, input_schema,
                                                      parsed.output_schema, /*has_header=*/true);
     auto response = stream->Exchange(input_row);
     if (!response || !response->batch) {
@@ -78,12 +77,13 @@ int64_t TableWriter::Write(const ScanFunction& write_function,
     auto result_batch = response->batch;
     stream->Close();
 
-    auto count_col = std::dynamic_pointer_cast<arrow::Int64Array>(result_batch->GetColumnByName("count"));
-    if (!count_col || count_col->length() == 0 || count_col->IsNull(0)) {
+    auto count_col = result_batch->column("count");
+    if (!count_col.valid() || count_col.length() == 0 || count_col.IsNull(0) ||
+        count_col.type_id() != NANOARROW_TYPE_INT64) {
         throw std::runtime_error("write function '" + write_function.function_name +
                                   "': response batch missing a valid 'count' value");
     }
-    return count_col->Value(0);
+    return count_col.Int(0);
 }
 
 }  // namespace vgi_sqlite

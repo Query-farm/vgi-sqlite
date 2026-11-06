@@ -17,8 +17,6 @@
 #include <string>
 #include <vector>
 
-#include <arrow/api.h>
-
 #include "catalog/catalog_client.h"
 #include "catalog/table_in_out_caller.h"
 #include "vtab/connection_pool.h"
@@ -90,29 +88,30 @@ int main(int argc, char** argv) {
         int row_num = 0;
         for (const auto& row_args : rows) {
             if (static_cast<int>(row_args.size()) != fn.input_schema->num_fields()) {
-                std::fprintf(stderr, "error: row %d has %zu args, function expects %d\n", row_num,
-                            row_args.size(), fn.input_schema->num_fields());
+                std::fprintf(stderr, "error: row %d has %zu args, function expects %lld\n", row_num,
+                            row_args.size(), static_cast<long long>(fn.input_schema->num_fields()));
                 return 1;
             }
-            std::vector<std::shared_ptr<arrow::Array>> columns;
+            std::vector<vgi_sqlite::nano::ScalarPtr> values;
             for (size_t k = 0; k < row_args.size(); ++k) {
-                auto scalar = arrow::MakeScalar(row_args[k]);
-                auto casted = scalar->CastTo(fn.input_schema->field(static_cast<int>(k))->type());
-                if (!casted.ok()) throw std::runtime_error("casting arg " + std::to_string(k) + ": " +
-                                                             casted.status().ToString());
-                auto array = arrow::MakeArrayFromScalar(*casted.ValueUnsafe(), 1);
-                if (!array.ok()) throw std::runtime_error(array.status().ToString());
-                columns.push_back(array.ValueUnsafe());
+                values.push_back(vgi_sqlite::nano::Scalar::Signed(
+                    row_args[k], vgi_sqlite::nano::Schema::Copy(
+                                     *fn.input_schema->field(static_cast<int>(k)))));
             }
-            auto input_row = arrow::RecordBatch::Make(fn.input_schema, 1, columns);
+            auto input_row = vgi_sqlite::nano::Batch::FromScalars(fn.input_schema, values);
             auto result = caller.Exchange(input_row);
             std::printf("row %d: exchange -> %lld output row(s)\n", row_num, (long long)result->num_rows());
             for (int64_t r = 0; r < result->num_rows(); ++r) {
                 std::ostringstream oss;
                 for (int c = 0; c < result->num_columns(); ++c) {
                     if (c) oss << ", ";
-                    auto scalar_result = result->column(c)->GetScalar(r);
-                    oss << result->schema()->field(c)->name() << "=" << (scalar_result.ok() ? (*scalar_result)->ToString() : "<err>");
+                    auto column = result->column(c);
+                    const auto* field = result->raw().schema.children[c];
+                    oss << (field->name ? field->name : "") << "=";
+                    if (column.IsNull(r)) oss << "NULL";
+                    else if (column.type_id() == NANOARROW_TYPE_STRING) oss << column.String(r);
+                    else if (column.type_id() == NANOARROW_TYPE_DOUBLE) oss << column.Double(r);
+                    else oss << column.Int(r);
                 }
                 std::printf("  [%lld] %s\n", (long long)r, oss.str().c_str());
             }

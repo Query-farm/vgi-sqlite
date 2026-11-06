@@ -22,8 +22,6 @@
 #include <string>
 #include <vector>
 
-#include <arrow/record_batch.h>
-
 #include "catalog/catalog_client.h"  // ScanFunction
 #include "rpc/vgi_connection.h"
 
@@ -34,7 +32,7 @@ public:
     TableScanner(VgiConnection& connection, std::string attach_opaque_data);
     // Explicitly closes any live stream (see the .cpp: an abandoned,
     // never-closed stream aborts the whole shared connection on
-    // destruction, per vgi-rpc-c++'s contract - even one that already
+    // destruction, per vgi-rpc-c's contract - even one that already
     // reached natural end-of-stream via Next() returning nullopt).
     ~TableScanner();
     TableScanner(const TableScanner&) = delete;
@@ -50,7 +48,7 @@ public:
     void Bind(const ScanFunction& scan_function, const std::optional<std::string>& schema_name = std::nullopt,
               const std::optional<std::vector<uint8_t>>& transaction_opaque_data = std::nullopt);
 
-    const std::shared_ptr<arrow::Schema>& output_schema() const { return bind_.output_schema; }
+    const nano::SchemaPtr& output_schema() const { return bind_.output_schema; }
 
     // init: opens the producer stream. projection_ids, if non-empty, asks
     // the worker to emit only those column indices (into output_schema());
@@ -69,7 +67,7 @@ public:
               std::optional<int64_t> row_limit = std::nullopt);
 
     // Pull the next output batch, or nullopt when the scan is exhausted.
-    std::optional<std::shared_ptr<arrow::RecordBatch>> Next();
+    std::optional<nano::BatchPtr> Next();
 
 private:
     // Opens the producer stream for pending_splits_[next_split_index_] and
@@ -82,7 +80,7 @@ private:
     std::string attach_opaque_data_;
     std::vector<uint8_t> bind_call_bytes_;
     struct {
-        std::shared_ptr<arrow::Schema> output_schema;
+        nano::SchemaPtr output_schema;
         std::vector<uint8_t> opaque_data;
     } bind_;
     bool supports_splits_ = false;

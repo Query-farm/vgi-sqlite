@@ -14,8 +14,6 @@
 #include <string>
 #include <vector>
 
-#include <arrow/api.h>
-
 #include "catalog/catalog_client.h"
 #include "catalog/table_scanner.h"
 #include "catalog/table_writer.h"
@@ -50,13 +48,13 @@ int main(int argc, char** argv) {
         auto insert_fn = catalog.TableInsertFunctionGet(checkout->attach_opaque_data, schema_name, table_name);
         std::printf("insert function: %s\n", insert_fn.function_name.c_str());
 
-        auto input_schema = arrow::schema({
-            arrow::field("id", arrow::int64(), false),
-            arrow::field("name", arrow::utf8(), false),
+        auto input_schema = vgi_sqlite::nano::MakeSchema({
+            vgi_sqlite::nano::Field("id", vgi_sqlite::nano::Type(NANOARROW_TYPE_INT64), false),
+            vgi_sqlite::nano::Field("name", vgi_sqlite::nano::Type(NANOARROW_TYPE_STRING), false),
         });
-        auto id_arr = arrow::MakeArrayFromScalar(*arrow::MakeScalar(id), 1).ValueOrDie();
-        auto name_arr = arrow::MakeArrayFromScalar(*arrow::MakeScalar(name), 1).ValueOrDie();
-        auto input_row = arrow::RecordBatch::Make(input_schema, 1, {id_arr, name_arr});
+        auto input_row = vgi_sqlite::nano::Batch::FromScalars(
+            input_schema, {vgi_sqlite::nano::Scalar::Signed(id),
+                           vgi_sqlite::nano::Scalar::String(name)});
 
         vgi_sqlite::TableWriter writer(pool, location, catalog_name);
         auto count = writer.Write(insert_fn, /*schema_name=*/std::nullopt, input_row);
@@ -72,12 +70,12 @@ int main(int argc, char** argv) {
         bool found = false;
         while (auto batch = scanner.Next()) {
             total_rows += (*batch)->num_rows();
-            auto id_col = std::dynamic_pointer_cast<arrow::Int64Array>((*batch)->GetColumnByName("id"));
-            auto name_col = std::dynamic_pointer_cast<arrow::StringArray>((*batch)->GetColumnByName("name"));
-            if (id_col && name_col) {
+            auto id_col = (*batch)->column("id");
+            auto name_col = (*batch)->column("name");
+            if (id_col.valid() && name_col.valid()) {
                 for (int64_t i = 0; i < (*batch)->num_rows(); ++i) {
-                    if (!id_col->IsNull(i) && id_col->Value(i) == id && !name_col->IsNull(i) &&
-                        name_col->GetString(i) == name) {
+                    if (!id_col.IsNull(i) && id_col.Int(i) == id && !name_col.IsNull(i) &&
+                        name_col.String(i) == name) {
                         found = true;
                     }
                 }
