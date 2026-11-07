@@ -58,23 +58,6 @@ def _vgi_python() -> str:
     return os.environ.get("VGI_PYTHON", str(Path.home() / "Development" / "vgi-python"))
 
 
-def _vgi_rust_worker_binary() -> Path:
-    """The vgi-rust `example`-catalog fixture worker (vgi-example-worker) -
-    VGI_RUST_WORKER overrides, defaulting to the sibling checkout convention
-    every other cross-repo path in this test suite already uses (VGI_PYTHON's
-    own default). A real, native binary (`cargo build --release`), not a
-    `uv run ...` spawn - no interpreter-startup cost at all, which is most of
-    why worker_location moved off vgi-python's own fixture worker for the
-    common (non-write, non-transaction) test files - see worker_location's
-    own comment for the fuller rationale and what stays on vgi-python."""
-    override = os.environ.get("VGI_RUST_WORKER")
-    if override:
-        return Path(override)
-    vgi_rust = Path(os.environ.get("VGI_RUST", str(Path.home() / "Development" / "vgi-rust")))
-    name = "vgi-example-worker.exe" if platform.system() == "Windows" else "vgi-example-worker"
-    return vgi_rust / "target" / "release" / name
-
-
 def _spawn_http_worker(argv: list[str], cwd: str | None, env_extra: dict[str, str] | None = None):
     """Spawn `argv`, wait for its `PORT:<n>` discovery line, and return
     `(process, base_url, tail_lines)`. `tail_lines`
@@ -136,29 +119,15 @@ def _spawn_http_worker(argv: list[str], cwd: str | None, env_extra: dict[str, st
 
 
 def _default_worker() -> str:
-    """The `example` catalog's default worker location - vgi-rust's own
-    fixture worker (a real native binary), not vgi-python's `uv run
-    vgi-fixture-worker`. Two reasons, both real:
+    """The `example` catalog's canonical protocol fixture worker.
 
-    1. Startup cost: `uv run vgi-fixture-worker` pays a full Python-
-       interpreter + pyarrow/numpy import cost (measured at several seconds
-       on a cold CI runner - see CLAUDE.md's Windows-launcher entries for
-       the concrete numbers that motivated the launch: switch in the first
-       place). vgi-example-worker is a native binary with none of that.
-    2. VGI_TEST_TRANSPORT uses this worker for the POSIX launch: pass. The HTTP
-       pass deliberately uses vgi-python's fixture worker: that is the
-       protocol-compatible reference for vgi-rpc-c's HTTP transport, while
-       vgi-rust's independently versioned HTTP router is not interchangeable.
-
-    Not every test file uses this worker: test_writes.py/test_transactions.py
-    need real write/transaction support vgi-rust's example catalog doesn't
-    have (no supports_insert, no catalog_transaction_begin) and stay on
-    vgi-python's own fixture worker via writable_worker_location/
-    transactional_worker_location; test_table_in_out.py's row_transform-
-    specific tests need this driver's own custom RowTransformFunction
-    fixture (row_transform_worker.py), which only exists under vgi-python.
+    Keep the launch and HTTP passes on the same pinned vgi-python reference
+    implementation so they differ only in transport. Other SDK example
+    workers are useful interoperability targets, but their independently
+    versioned fixture catalogs and behavior are not substitutes for the
+    protocol fixture this suite asserts against.
     """
-    return f"launch:{_vgi_rust_worker_binary()}"
+    return f"launch:uv run --project {_vgi_python()} vgi-fixture-worker"
 
 
 @pytest.fixture(scope="session")
@@ -190,7 +159,7 @@ def worker_location():
     as before - useful for pointing at any worker by hand). Otherwise this
     branches on VGI_TEST_TRANSPORT:
 
-    - "launch" (the default): `launch:<vgi-example-worker>` - the AF_UNIX/
+    - "launch" (the default): `launch:<vgi-fixture-worker>` - the AF_UNIX/
       named-pipe launcher-discovery protocol (src/rpc/launcher.h), working
       on both POSIX and Windows (see CLAUDE.md's launcher entry for the
       named-pipe history).
@@ -238,11 +207,9 @@ def worker_location():
 @pytest.fixture(scope="session")
 def transactional_worker_location() -> str:
     """The `example` catalog's worker command for transaction-specific tests
-    (test_transactions.py) - vgi-python's own fixture worker specifically,
-    NOT worker_location's vgi-rust default: vgi-rust's example catalog
-    doesn't implement transactions at all (no catalog_transaction_begin
-    handler), only vgi-python's does. VGI_TEST_TRANSACTIONAL_WORKER
-    overrides, matching every other worker fixture's convention here."""
+    (test_transactions.py) - vgi-python's fixture worker specifically.
+    VGI_TEST_TRANSACTIONAL_WORKER overrides, matching every other worker
+    fixture's convention here."""
     vgi_python = _vgi_python()
     # launch: - same rationale as _default_worker() above.
     return os.environ.get(

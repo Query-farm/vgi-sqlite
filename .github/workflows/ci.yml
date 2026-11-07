@@ -55,37 +55,16 @@ jobs:
           ref: v0.1.2
           path: vgi-rpc-c
 
-      # vgi-python (public) - source of the fixture worker test/integration
-      # drives via `launch:` locations (see conftest.py) for write/
-      # transaction/row_transform-specific tests, since vgi-rust's example
-      # catalog doesn't support those.
+      # vgi-python (public) - canonical protocol fixture implementation used
+      # by both launch: and HTTP integration passes. Keeping the worker fixed
+      # means the two passes isolate transport behavior rather than comparing
+      # independently versioned SDK fixture catalogs.
       - name: Check out vgi-python
         uses: actions/checkout@v4
         with:
           repository: Query-farm/vgi-python
           ref: v0.49.0
           path: vgi-python
-
-      # vgi-rust (public) - conftest.py's worker_location default: a real
-      # native binary (vgi-example-worker), no interpreter-startup cost -
-      # see that fixture's own comment for the full rationale and what
-      # stays on vgi-python instead.
-      - name: Check out vgi-rust
-        uses: actions/checkout@v4
-        with:
-          repository: Query-farm/vgi-rust
-          ref: v0.49.2
-          path: vgi-rust
-
-      - name: Cache vgi-rust build
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: vgi-rust
-          key: ${{ matrix.platform }}
-
-      - name: Build vgi-example-worker
-        working-directory: vgi-rust
-        run: cargo build --release --bin vgi-example-worker
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
@@ -271,7 +250,6 @@ jobs:
         working-directory: test/integration
         env:
           VGI_PYTHON: ${{ github.workspace }}/vgi-python
-          VGI_RUST_WORKER: ${{ github.workspace }}/vgi-rust/target/release/vgi-example-worker
           VGI_TEST_TRANSPORT: launch
         run: |
           uv sync
@@ -281,7 +259,6 @@ jobs:
         working-directory: test/integration
         env:
           VGI_PYTHON: ${{ github.workspace }}/vgi-python
-          VGI_RUST_WORKER: ${{ github.workspace }}/vgi-rust/target/release/vgi-example-worker
           VGI_TEST_TRANSPORT: http
         run: uv run pytest -v
 
