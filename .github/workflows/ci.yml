@@ -320,28 +320,6 @@ jobs:
           ref: v0.49.0
           path: vgi-python
 
-      # vgi-rust's own --unix launcher transport is POSIX-only today
-      # (confirmed in its own source) - so this job's worker_location pass
-      # uses --http only (VGI_TEST_TRANSPORT=http below), never launch:.
-      # Still needed here: it's the worker http-transport tests run
-      # against.
-      - name: Check out vgi-rust
-        uses: actions/checkout@v4
-        with:
-          repository: Query-farm/vgi-rust
-          ref: v0.49.2
-          path: vgi-rust
-
-      - name: Cache vgi-rust build
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: vgi-rust
-          key: windows-x86_64
-
-      - name: Build vgi-example-worker
-        working-directory: vgi-rust
-        run: cargo build --release --bin vgi-example-worker
-
       - name: Install uv
         uses: astral-sh/setup-uv@v5
 
@@ -454,18 +432,13 @@ jobs:
       - name: Pre-sync vgi-python dependencies (including the http extra)
         run: uv sync --extra http --project "${{ github.workspace }}\vgi-python"
 
-      # http transport only - vgi-rust's own --unix launcher is POSIX-only
-      # today (see the vgi-rust checkout step's own comment), so this job
-      # never sets VGI_TEST_TRANSPORT=launch. Write/transaction/
-      # row_transform-specific tests are unaffected either way - they use
-      # vgi-python via THIS driver's own launch: (named pipes on Windows,
-      # unrelated to vgi-rust's own launcher gap - see CLAUDE.md's Windows
-      # launcher entry).
+      # The full HTTP pass uses vgi-python's fixture worker, the reference
+      # implementation paired with vgi-rpc-c's HTTP routes. The focused
+      # launch: pass below uses that same worker over Windows named pipes.
       - name: Run integration tests (http transport)
         working-directory: test/integration
         env:
           VGI_PYTHON: ${{ github.workspace }}\vgi-python
-          VGI_RUST_WORKER: ${{ github.workspace }}\vgi-rust\target\release\vgi-example-worker.exe
           VGI_TEST_TRANSPORT: http
         run: |
           uv sync

@@ -76,19 +76,17 @@ def _vgi_rust_worker_binary() -> Path:
 
 
 def _spawn_http_worker(argv: list[str], cwd: str | None, env_extra: dict[str, str] | None = None):
-    """Spawn `argv` with `--http` already appended, wait for its `PORT:<n>`
-    discovery line (vgi-rust's own launcher-protocol-style convention - see
-    src/rpc/launcher.h's ParseDiscoveryLine for the client-side counterpart),
-    and return `(process, base_url, tail_lines)`. `tail_lines` is a live list
-    the caller can read from in a failure message - stdout/stderr are drained
-    on background daemon threads rather than left unread, same reasoning as
-    http_worker_base_url's own fixture below (an unread pipe can freeze a
-    single-threaded server's I/O loop under load)."""
+    """Spawn `argv`, wait for its `PORT:<n>` discovery line, and return
+    `(process, base_url, tail_lines)`. `tail_lines`
+    is a live list the caller can read from in a failure message - stdout/
+    stderr are drained on background daemon threads rather than left unread,
+    same reasoning as http_worker_base_url's own fixture below (an unread pipe
+    can freeze a single-threaded server's I/O loop under load)."""
     env = dict(os.environ)
     if env_extra:
         env.update(env_extra)
     proc = subprocess.Popen(
-        [*argv, "--http"],
+        argv,
         cwd=cwd,
         env=env,
         stdout=subprocess.PIPE,
@@ -130,7 +128,7 @@ def _spawn_http_worker(argv: list[str], cwd: str | None, env_extra: dict[str, st
         except subprocess.TimeoutExpired:
             proc.kill()
         pytest.skip(
-            f"worker {argv!r} --http didn't announce a PORT: line "
+            f"HTTP worker {argv!r} didn't announce a PORT: line "
             f"(rc={proc.returncode}). Last output:\n{''.join(tail)}"
         )
 
@@ -147,11 +145,10 @@ def _default_worker() -> str:
        on a cold CI runner - see CLAUDE.md's Windows-launcher entries for
        the concrete numbers that motivated the launch: switch in the first
        place). vgi-example-worker is a native binary with none of that.
-    2. VGI_TEST_TRANSPORT lets this same worker serve either launch:
-       (AF_UNIX/named-pipe discovery, POSIX and Windows both work - see
-       CLAUDE.md's launcher entry) or --http (plain HTTP, no launcher
-       protocol dependency at all) - see worker_location's own fixture for
-       which platforms use which and why.
+    2. VGI_TEST_TRANSPORT uses this worker for the POSIX launch: pass. The HTTP
+       pass deliberately uses vgi-python's fixture worker: that is the
+       protocol-compatible reference for vgi-rpc-c's HTTP transport, while
+       vgi-rust's independently versioned HTTP router is not interchangeable.
 
     Not every test file uses this worker: test_writes.py/test_transactions.py
     need real write/transaction support vgi-rust's example catalog doesn't
@@ -197,24 +194,20 @@ def worker_location():
       named-pipe launcher-discovery protocol (src/rpc/launcher.h), working
       on both POSIX and Windows (see CLAUDE.md's launcher entry for the
       named-pipe history).
-    - "http": spawns `<vgi-example-worker> --http` directly (this fixture
-      owns that process's lifecycle - no launcher involved at all, since
-      launch: is a separate, AF_UNIX/named-pipe-specific transport with no
-      HTTP equivalent). Runs the *whole* test/integration suite a second
-      time over a genuinely different transport, not just the narrow
-      test_http_transport.py file's own dedicated bearer-auth checks -
-      see CLAUDE.md's CI entry for why both passes matter (they exercise
-      structurally different code paths in VgiConnection - see its own
-      file comment).
+    - "http": spawns vgi-python's `vgi-fixture-http --port 0` directly (this
+      fixture owns that process's lifecycle - no launcher involved at all).
+      It is the reference HTTP implementation paired with vgi-rpc-c; the Rust
+      SDK's independently versioned HTTP routes are intentionally not used as
+      an accidental cross-version compatibility test. This runs the *whole*
+      test/integration suite a second time over a genuinely different
+      transport, not just test_http_transport.py's bearer-auth checks.
 
     CI runs this suite twice - VGI_TEST_TRANSPORT=launch and
     VGI_TEST_TRANSPORT=http - as two separate pytest invocations (env-var
     driven, not pytest parametrization: simpler, and it reuses this
     fixture's existing override mechanism instead of a second one).
-    Windows CI runs http only - vgi-rust's own --unix launcher transport is
-    POSIX-only today (confirmed in its own source), so launch: against a
-    vgi-rust worker doesn't work there yet; http sidesteps that gap
-    entirely rather than waiting on it.
+    Windows CI runs the full HTTP pass plus a focused launch: pass against the
+    Python worker, whose --unix flag maps to the named-pipe launcher contract.
     """
     override = os.environ.get("VGI_TEST_WORKER")
     if override:
@@ -222,7 +215,13 @@ def worker_location():
         return
     transport = os.environ.get("VGI_TEST_TRANSPORT", "launch")
     if transport == "http":
-        proc, base_url, _tail = _spawn_http_worker([str(_vgi_rust_worker_binary())], cwd=None)
+        proc, base_url, _tail = _spawn_http_worker(
+            [
+                "uv", "run", "--project", _vgi_python(), "vgi-fixture-http",
+                "--host", "127.0.0.1", "--port", "0", "--prefix", "/vgi",
+            ],
+            cwd=None,
+        )
         yield base_url
         proc.terminate()
         try:
